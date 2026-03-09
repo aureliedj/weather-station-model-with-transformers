@@ -27,8 +27,8 @@ VARIABLE_NAMES = [
     "pressure",
     "humidity",
     "wind_speed",
-    "wind_u",
-    "wind_v",
+    "wind_gust",
+    "wind_direction",
     "precipitation",
 ]
 NUM_VARIABLES = len(VARIABLE_NAMES)
