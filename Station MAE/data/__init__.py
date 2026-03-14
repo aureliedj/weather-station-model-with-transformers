@@ -1,1 +1,1 @@
-from .visualize import plot_stations_on_dem, StationMarker, markers_from_stations_table
+from .visualize import plot_stations_on_dem, markers_from_stations_table
