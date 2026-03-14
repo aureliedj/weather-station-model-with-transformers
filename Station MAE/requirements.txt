@@ -1,0 +1,3 @@
+peakweather @ git+https://github.com/MeteoSwiss/PeakWeather.git@28a28c2d17f47b8bf33f22ee62fc92adac9b4778
+torch==2.10.0
+torchvision==0.25.0
