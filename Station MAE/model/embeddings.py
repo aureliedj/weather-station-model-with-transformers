@@ -1,15 +1,23 @@
 """
 model/embeddings.py
 
-All embedding modules for Station-MAE:
-  - SpatialEmbedding     : static station metadata (lat/lon/topo) → d_model
-  - TemporalEmbedding    : cyclic timestamp features              → d_model
-  - DeltaTimeEmbedding   : forecast lead-time steps               → d_model  [decoder only]
-  - VariableProjection   : per-variable measurement values        → d_model
+Embedding modules for Station-MAE.
 
-Spatial features are static per station and should be precomputed and cached.
-Temporal features are shared across all stations at a given timestep.
-DeltaTimeEmbedding is only used in the decoder.
+  - SpatialEmbedding    : static station metadata (lat/lon/topo) → d_model
+  - TemporalEmbedding   : multi-scale Fourier time encoding       → d_model
+  - DeltaTimeEmbedding  : forecast lead-time steps                → d_model  [decoder only]
+  - VariableProjection  : per-variable measurement values         → d_model
+
+Temporal encoding design (inspired by Aurora, Price et al. 2024 Section B.4):
+    Time is represented as hours since the Unix epoch (a single float).  The
+    TemporalEmbedding module expands this scalar into log-spaced Fourier features
+    spanning λ_min (10 min) to λ_max (1 year), then projects to d_model via a
+    2-layer MLP.  This lets the model jointly discover sub-daily, weekly, monthly
+    and seasonal patterns without hard-coding the relevant periods.
+
+    Formula:  Emb(x) = [cos(2πx/λ_i), sin(2πx/λ_i)]  for i = 0 … D/2 − 1
+              λ_i = exp(log λ_min + i·(log λ_max − log λ_min) / (D/2 − 1))
+              x   = hours elapsed since 1970-01-01 00:00 UTC
 """
 
 import math
@@ -23,9 +31,7 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 
 # Ordered list of meteorological variables used in this project.
-# wind_speed, wind_direction, wind_gust excluded:
-#   - wind_speed / wind_direction replaced by wind_u / wind_v (compute_uv=True)
-#   - wind_gust dropped by design choice
+# wind_speed / wind_direction replaced by wind_u / wind_v (compute_uv=True).
 VARIABLE_NAMES = [
     "temperature",
     "pressure",
@@ -37,7 +43,7 @@ VARIABLE_NAMES = [
 NUM_VARIABLES = len(VARIABLE_NAMES)   # 6
 
 # Names of the static station metadata fields (in the order used by encode_spatial_static).
-# Aspects are stored as raw degrees here; sin/cos encoding is done inside encode_spatial_static.
+# Aspects are stored as raw degrees; sin/cos encoding is applied inside encode_spatial_static.
 SPATIAL_FEATURE_NAMES = [
     "swiss_easting",
     "swiss_northing",
@@ -54,21 +60,19 @@ SPATIAL_FEATURE_NAMES = [
 ]
 
 # Output dimension of encode_spatial_static:
-#   lat        → 2 (sin/cos of radians)
-#   lon        → 2 (sin/cos of radians)
-#   aspect_2k  → 2 (sin/cos of degrees)
-#   aspect_10k → 2 (sin/cos of degrees)
-#   scalars    → 8 (station_height, dem, tpi, slope_2k, slope_10k, sn_2k, sn_10k, we_2k)
+#   lat / lon        → 2 each (sin/cos)
+#   aspect 2km/10km  → 2 each (sin/cos)
+#   scalars          → 8 (station_height, dem, tpi, 2×slope, 2×sn_deriv, we_deriv)
 SPATIAL_INPUT_DIM = 18
 
-# Output dimension of encode_temporal:
-#   sin/cos 24h cycle  → 2
-#   sin/cos 365d cycle → 2
-TEMPORAL_INPUT_DIM = 4
+# Fourier feature dimension for TemporalEmbedding.
+# Must be even: TEMPORAL_FOURIER_DIM // 2 wavelengths are used.
+# 32 → 16 wavelengths spanning ~10 min to ~1 year.
+TEMPORAL_FOURIER_DIM = 32
 
 
 # ---------------------------------------------------------------------------
-# Static encoding helpers  (CPU / preprocessing time, not nn.Module)
+# Static encoding helpers  (preprocessing / CPU, not nn.Module)
 # ---------------------------------------------------------------------------
 
 def encode_spatial_static(station_info: dict) -> torch.Tensor:
@@ -94,15 +98,11 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
     def _sincos_rad(rad: float):
         return math.sin(rad), math.cos(rad)
 
-    # Geographic position
     sin_lat, cos_lat   = _sincos_rad(math.radians(station_info["swiss_easting"]))
     sin_lon, cos_lon   = _sincos_rad(math.radians(station_info["swiss_northing"]))
-
-    # Aspect — cyclic in [0, 360] degrees
     sin_asp2k,  cos_asp2k  = _sincos_deg(station_info["ASPECT_2000M_SIGRATIO1"])
     sin_asp10k, cos_asp10k = _sincos_deg(station_info["ASPECT_10000M_SIGRATIO1"])
 
-    # Scalar topographic features (normalise externally)
     features = [
         sin_lat,    cos_lat,                                        # 2 — geographic position
         sin_lon,    cos_lon,                                        # 2
@@ -110,7 +110,7 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
         sin_asp10k, cos_asp10k,                                     # 2 — regional aspect
         float(station_info["station_height"]),                      # 1 — sensor elevation
         float(station_info["dem"]),                                 # 1 — DEM elevation
-        float(station_info["TPI_2000M"]),                           # 1 — valley(-) vs ridge(+)
+        float(station_info["TPI_2000M"]),                           # 1 — valley(−) vs ridge(+)
         float(station_info["SLOPE_2000M_SIGRATIO1"]),               # 1 — local slope steepness
         float(station_info["SLOPE_10000M_SIGRATIO1"]),              # 1 — regional slope steepness
         float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),       # 1 — S-N gradient local
@@ -121,36 +121,23 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
     return torch.tensor(features, dtype=torch.float32)
 
 
-def encode_temporal(ts: pd.Timestamp) -> torch.Tensor:
+def encode_temporal(ts: pd.Timestamp) -> float:
     """
-    Encode a UTC-aware pandas Timestamp into a 4-dimensional cyclic feature vector.
+    Encode a timestamp as hours elapsed since 1970-01-01 00:00 UTC.
 
-    Two cycles are captured:
-      - 24h  diurnal cycle  (sin/cos) — captures hour-of-day including day/night
-      - 365d seasonal cycle (sin/cos) — captures time of year
-
-    The minute component is included so 10-minute resolution timestamps
-    within the same hour produce distinct encodings.
+    This scalar is the input to TemporalEmbedding, which expands it into
+    multi-scale Fourier features spanning 10 min → 1 year wavelengths.
 
     Args:
-        ts: pd.Timestamp with timezone info (UTC expected).
+        ts: pd.Timestamp — timezone-aware (UTC) or naive (assumed UTC).
 
     Returns:
-        torch.Tensor of shape (4,), dtype float32.
+        float: hours since Unix epoch.
     """
-    hour_of_day = ts.hour + ts.minute / 60.0   # fractional hour in [0, 24)
-    day_of_year = float(ts.day_of_year)
-
-    two_pi = 2.0 * math.pi
-
-    features = [
-        math.sin(two_pi * hour_of_day / 24.0),     # diurnal
-        math.cos(two_pi * hour_of_day / 24.0),
-        math.sin(two_pi * day_of_year / 365.25),    # seasonal
-        math.cos(two_pi * day_of_year / 365.25),
-    ]   # total: 4
-
-    return torch.tensor(features, dtype=torch.float32)
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return float((ts - epoch).total_seconds() / 3600.0)
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +171,7 @@ class SpatialEmbedding(nn.Module):
         """
         Args:
             spatial_features: (N, 18) or (B, N, 18)
-                              Should be normalised (zero-mean, unit-variance
-                              for scalar features) before calling.
+                              Should be normalised before calling.
         Returns:
             (N, d_model) or (B, N, d_model)
         """
@@ -194,33 +180,75 @@ class SpatialEmbedding(nn.Module):
 
 class TemporalEmbedding(nn.Module):
     """
-    Projects cyclic timestamp features (4-dim) into d_model space via a 2-layer MLP.
+    Multi-scale Fourier temporal embedding (inspired by Aurora, Price et al. 2024).
 
-    At a given timestep all stations share the same temporal context, so the
-    4-dim vector is computed once per timestep and broadcast across stations
-    before being passed here.
+    Encodes time as *hours since the Unix epoch* using log-spaced sinusoidal
+    features, then projects to d_model via a 2-layer MLP.
+
+    Using `fourier_dim // 2` wavelengths log-spaced between λ_min and λ_max,
+    the model can jointly learn sub-daily, weekly, monthly, and seasonal
+    patterns without any hard-coded time cycles.
+
+    Reference (Supplementary B.4):
+        Emb(x) = [cos(2πx/λ_i), sin(2πx/λ_i)]  for i = 0..D/2-1
+        λ_i log-spaced in [λ_min, λ_max]
+        x = hours since 1970-01-01 00:00 UTC
 
     Args:
-        d_model:    Transformer model dimension.
-        input_dim:  Dimensionality of encode_temporal output (default 4).
+        d_model:     Transformer model dimension.
+        fourier_dim: Total Fourier feature dimension (must be even; default 32).
+                     Gives fourier_dim // 2 distinct wavelengths.
+        lambda_min:  Shortest wavelength in hours (default 1/6 ≈ 10 min).
+        lambda_max:  Longest  wavelength in hours (default 365.25 × 24 ≈ 1 year).
     """
 
-    def __init__(self, d_model: int, input_dim: int = TEMPORAL_INPUT_DIM):
+    def __init__(
+        self,
+        d_model:     int   = 128,
+        fourier_dim: int   = TEMPORAL_FOURIER_DIM,
+        lambda_min:  float = 1.0 / 6.0,          # 10 minutes in hours
+        lambda_max:  float = 365.25 * 24.0,       # 1 year in hours
+    ):
         super().__init__()
+        assert fourier_dim % 2 == 0, "fourier_dim must be even"
+        self.fourier_dim = fourier_dim
+
+        # Non-trainable log-spaced wavelengths: (fourier_dim // 2,)
+        n_wl = fourier_dim // 2
+        lambdas = torch.exp(
+            torch.linspace(math.log(lambda_min), math.log(lambda_max), n_wl)
+        )
+        self.register_buffer("lambdas", lambdas)
+
+        # MLP: fourier_dim → d_model → d_model
         self.proj = nn.Sequential(
-            nn.Linear(input_dim, d_model),
+            nn.Linear(fourier_dim, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model),
         )
 
-    def forward(self, temporal_features: torch.Tensor) -> torch.Tensor:
+    def _fourier(self, hours: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Fourier features for arbitrary-shape input.
+
+        Args:
+            hours: (...) float tensor of hours-since-epoch.
+        Returns:
+            (..., fourier_dim) float tensor.
+        """
+        x      = hours.unsqueeze(-1)                        # (..., 1)
+        angles = 2.0 * math.pi * x / self.lambdas           # (..., n_wl)
+        return torch.cat([torch.cos(angles),
+                          torch.sin(angles)], dim=-1)       # (..., fourier_dim)
+
+    def forward(self, hours: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            temporal_features: (B, 4) or (B, W, N, 4)
+            hours: (B,) or (B, W) float tensor of hours since Unix epoch.
         Returns:
-            (B, d_model) or (B, W, N, d_model)
+            (B, d_model) or (B, W, d_model) — same leading shape as input.
         """
-        return self.proj(temporal_features)
+        return self.proj(self._fourier(hours))              # (..., d_model)
 
 
 class DeltaTimeEmbedding(nn.Module):
@@ -228,13 +256,13 @@ class DeltaTimeEmbedding(nn.Module):
     Learned embedding table for discrete forecast lead-time steps.
 
     step = 0  →  reconstruction  (target time == input time t)
-    step = k  →  forecast k * 10 minutes ahead of t
+    step = k  →  forecast k × 10 minutes ahead of t
 
     Used exclusively in the decoder. The encoder never uses this.
 
     Args:
         d_model:    Transformer model dimension.
-        max_steps:  Maximum forecast horizon in 10-minute steps (default 36 = 6h).
+        max_steps:  Maximum forecast horizon in 10-minute steps (default 36 = 6 h).
     """
 
     def __init__(self, d_model: int, max_steps: int = 36):

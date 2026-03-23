@@ -31,7 +31,7 @@ from .embeddings import (
     TemporalEmbedding,
     VariableProjection,
     SPATIAL_INPUT_DIM,
-    TEMPORAL_INPUT_DIM,
+    TEMPORAL_FOURIER_DIM,
     NUM_VARIABLES,
 )
 
@@ -121,7 +121,7 @@ class StationMAEEncoder(nn.Module):
         mask_ratio:    Fraction of stations to mask (default 0.5).
         num_vars:      Number of meteorological variables (default 6).
         spatial_dim:   Spatial feature dimension (default 18).
-        temporal_dim:  Temporal feature dimension (default 4).
+        fourier_dim:   Fourier feature dimension for TemporalEmbedding (default 32).
     """
 
     def __init__(
@@ -134,7 +134,7 @@ class StationMAEEncoder(nn.Module):
         mask_ratio:   float = 0.5,
         num_vars:     int   = NUM_VARIABLES,
         spatial_dim:  int   = SPATIAL_INPUT_DIM,
-        temporal_dim: int   = TEMPORAL_INPUT_DIM,
+        fourier_dim:  int   = TEMPORAL_FOURIER_DIM,
     ):
         super().__init__()
 
@@ -142,9 +142,9 @@ class StationMAEEncoder(nn.Module):
         self.mask_ratio = mask_ratio
 
         # --- Embedding modules ---
-        self.var_proj    = VariableProjection(num_vars=num_vars, d_model=d_model)
-        self.spatial_emb = SpatialEmbedding(d_model=d_model, input_dim=spatial_dim)
-        self.temporal_emb = TemporalEmbedding(d_model=d_model, input_dim=temporal_dim)
+        self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
+        self.spatial_emb  = SpatialEmbedding(d_model=d_model, input_dim=spatial_dim)
+        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim)
 
         # --- Transformer blocks ---
         self.blocks = nn.ModuleList([
@@ -159,35 +159,34 @@ class StationMAEEncoder(nn.Module):
         x:       torch.Tensor,   # (B, W, N, V)
         x_mask:  torch.Tensor,   # (B, W, N, V)
         spatial: torch.Tensor,   # (N, 18)  or  (B, N, 18)
-        x_temps: torch.Tensor,   # (B, W, 4)
+        x_hours: torch.Tensor,   # (B, W)   hours-since-epoch per input step
     ) -> torch.Tensor:
         """
         Build full token representations of shape (B, W, N, d_model).
 
-        token[b, w, n] = var_proj(x[b,w,n], x_mask[b,w,n])
-                       + spatial_emb(spatial[n])
-                       + temporal_emb(x_temps[b,w])
+        token[b, w, n] = var_proj(x[b,w,n], x_mask[b,w,n])    — what was measured
+                       + spatial_emb(spatial[n])                — where the station is
+                       + temporal_emb(x_hours[b,w])             — when (Aurora Fourier)
         """
         B, W, N, V = x.shape
 
         # --- Variable projection ---
-        # Merge batch and window dims for efficient projection
         x_flat      = x.view(B * W, N, V)
         mask_flat   = x_mask.view(B * W, N, V)
         var_tokens  = self.var_proj(x_flat, mask_flat)          # (B*W, N, d_model)
         var_tokens  = var_tokens.view(B, W, N, self.d_model)    # (B, W, N, d_model)
 
-        # --- Spatial embedding: (N, 18) → (N, d_model) → broadcast ---
+        # --- Spatial embedding: (N, 18) → (N, d_model) → broadcast (B, 1, N, d_model) ---
         if spatial.dim() == 2:
             spatial = spatial.unsqueeze(0)                       # (1, N, 18)
         spatial_emb = self.spatial_emb(spatial)                  # (1/B, N, d_model)
         spatial_emb = spatial_emb.unsqueeze(1)                   # (1/B, 1, N, d_model)
 
-        # --- Temporal embedding: (B, W, 4) → (B, W, d_model) → broadcast ---
-        temp_emb = self.temporal_emb(x_temps)                    # (B, W, d_model)
+        # --- Temporal embedding (Aurora Fourier): (B, W) → (B, W, d_model) → broadcast ---
+        temp_emb = self.temporal_emb(x_hours)                    # (B, W, d_model)
         temp_emb = temp_emb.unsqueeze(2)                         # (B, W, 1, d_model)
 
-        # Sum all three — broadcasts cleanly
+        # Sum three embeddings — broadcasts cleanly over (B, W, N, d_model)
         tokens = var_tokens + spatial_emb + temp_emb            # (B, W, N, d_model)
         return tokens
 
@@ -238,7 +237,7 @@ class StationMAEEncoder(nn.Module):
         x:       torch.Tensor,   # (B, W, N, V)
         x_mask:  torch.Tensor,   # (B, W, N, V)
         spatial: torch.Tensor,   # (N, 18) or (B, N, 18)
-        x_temps: torch.Tensor,   # (B, W, 4)
+        x_hours: torch.Tensor,   # (B, W)  hours-since-epoch per input timestep
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Encode visible station tokens.
@@ -247,7 +246,8 @@ class StationMAEEncoder(nn.Module):
             x:        (B, W, N, V)  normalised observations
             x_mask:   (B, W, N, V)  sensor availability mask
             spatial:  (N, 18)       normalised static station features
-            x_temps:  (B, W, 4)     cyclic temporal features per timestep
+            x_hours:  (B, W)        hours since epoch for each input timestep
+                                    (feeds TemporalEmbedding)
 
         Returns:
             encoded         : (B, W * N_vis, d_model)  encoded visible tokens
@@ -255,7 +255,7 @@ class StationMAEEncoder(nn.Module):
             visible_indices : (B, N_vis)                which stations were visible
         """
         # 1. Build full token representations
-        tokens = self._build_tokens(x, x_mask, spatial, x_temps)  # (B, W, N, d_model)
+        tokens = self._build_tokens(x, x_mask, spatial, x_hours)  # (B, W, N, d_model)
 
         # 2. Mask stations
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)

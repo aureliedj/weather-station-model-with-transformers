@@ -5,14 +5,14 @@ PyTorch Dataset for the Station-MAE project, built on top of PeakWeather.
 
 Design:
     Each sample contains a multi-step input window and a single target snapshot:
-        x        : (W, N, V)   — input window of W timesteps
-        x_mask   : (W, N, V)   — sensor availability mask for input (1=present, 0=absent)
-        x_temps  : (W, 4)      — temporal encodings for each input timestep
-        y        : (N, V)      — target snapshot at t + delta_steps
-        y_mask   : (N, V)      — sensor availability mask for target
-        y_temp   : (4,)        — temporal encoding of the target timestep
-        spatial  : (N, 18)     — normalised static station features (same for all samples)
-        delta_steps : int      — forecast lead time in 10-min steps (0 = reconstruction)
+        x           : (W, N, V)  — input window of W timesteps
+        x_mask      : (W, N, V)  — sensor availability mask for input (1=present, 0=absent)
+        x_hours     : (W,)       — hours-since-epoch per input step (→ TemporalEmbedding)
+        y           : (N, V)     — target snapshot at t + delta_steps
+        y_mask      : (N, V)     — sensor availability mask for target
+        y_hours     : ()         — hours-since-epoch for target step (→ TemporalEmbedding)
+        spatial     : (N, 18)    — normalised static station features (same for all samples)
+        delta_steps : int        — forecast lead time in 10-min steps (0 = reconstruction)
 
     Where:
         W = window_size  (number of input timesteps)
@@ -39,6 +39,28 @@ import pandas as pd
 
 from torch.utils.data import Dataset
 from peakweather.dataset import PeakWeatherDataset
+
+
+# ---------------------------------------------------------------------------
+# Temporal helper (mirrored from model/embeddings.py to avoid circular import)
+# ---------------------------------------------------------------------------
+
+def _hours_since_epoch(ts: pd.Timestamp) -> float:
+    """
+    Return hours elapsed since 1970-01-01 00:00 UTC.
+
+    This scalar feeds TemporalEmbedding, which expands it into
+    multi-scale Fourier features spanning 10 min → 1 year wavelengths.
+
+    Args:
+        ts: pd.Timestamp — UTC-aware or naive (assumed UTC).
+    Returns:
+        float: hours since Unix epoch.
+    """
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return float((ts - epoch).total_seconds() / 3600.0)
 
 
 # ---------------------------------------------------------------------------
@@ -114,36 +136,6 @@ def load_peakweather(root: str) -> PeakWeatherDataset:
 # ---------------------------------------------------------------------------
 # Preprocessing helpers
 # ---------------------------------------------------------------------------
-
-def _encode_temporal_batch(timestamps: list[pd.Timestamp]) -> torch.Tensor:
-    """
-    Encode a list of UTC timestamps into a (T, 4) cyclic feature tensor.
-
-    Features per timestep:
-        sin/cos of diurnal  cycle (24h)
-        sin/cos of seasonal cycle (365.25d)
-
-    The minute component is preserved so 10-min resolution is reflected.
-
-    Args:
-        timestamps: list of T pd.Timestamp objects (UTC-aware).
-
-    Returns:
-        torch.Tensor of shape (T, 4), dtype float32.
-    """
-    two_pi = 2.0 * math.pi
-    rows = []
-    for ts in timestamps:
-        h = ts.hour + ts.minute / 60.0
-        d = float(ts.day_of_year)
-        rows.append([
-            math.sin(two_pi * h / 24.0),
-            math.cos(two_pi * h / 24.0),
-            math.sin(two_pi * d / 365.25),
-            math.cos(two_pi * d / 365.25),
-        ])
-    return torch.tensor(rows, dtype=torch.float32)   # (T, 4)
-
 
 def build_spatial_features(
     ds: PeakWeatherDataset,
@@ -281,14 +273,14 @@ class StationMAEDataset(Dataset):
     Sliding-window dataset over PeakWeather observations for Station-MAE.
 
     Each sample packages:
-        x          (W, N, V)  normalised input window
-        x_mask     (W, N, V)  sensor availability for input
-        x_temps    (W, 4)     cyclic temporal encoding per input step
-        y          (N, V)     normalised target snapshot
-        y_mask     (N, V)     sensor availability for target
-        y_temp     (4,)       cyclic temporal encoding of target step
-        spatial    (N, 18)    normalised static station features
-        delta_steps int       forecast lead time in 10-min steps
+        x           (W, N, V)  normalised input window
+        x_mask      (W, N, V)  sensor availability for input
+        x_hours     (W,)       hours-since-epoch per input step (→ TemporalEmbedding)
+        y           (N, V)     normalised target snapshot
+        y_mask      (N, V)     sensor availability for target
+        y_hours     ()         hours-since-epoch for target step (→ TemporalEmbedding)
+        spatial     (N, 18)    normalised static station features
+        delta_steps int        forecast lead time in 10-min steps
 
     The encoder receives the full window [W, N, V], attending across both
     stations and timesteps (multi-step mode). The decoder receives the
@@ -372,9 +364,14 @@ class StationMAEDataset(Dataset):
         self.timestamps = timestamps  # list of T_split pd.Timestamp
 
         # ------------------------------------------------------------------
-        # 5. Pre-compute temporal encodings for every timestep
+        # 5. Pre-compute hours-since-epoch for every timestep
+        #    TemporalEmbedding internally expands this scalar into
+        #    multi-scale Fourier features (10 min → 1 year wavelengths).
         # ------------------------------------------------------------------
-        self.temporal = _encode_temporal_batch(timestamps)   # (T_split, 4)
+        self.hours = torch.tensor(
+            [_hours_since_epoch(ts) for ts in timestamps],
+            dtype=torch.float32,
+        )   # (T_split,)
 
         # ------------------------------------------------------------------
         # 6. Valid window start indices
@@ -405,23 +402,23 @@ class StationMAEDataset(Dataset):
         dt  = self.delta_steps
 
         # Input window indices: [i, i+W)
-        x       = self.obs[i : i + W]           # (W, N, V)
-        x_mask  = self.mask[i : i + W]          # (W, N, V)
-        x_temps = self.temporal[i : i + W]      # (W, 4)
+        x       = self.obs[i : i + W]       # (W, N, V)
+        x_mask  = self.mask[i : i + W]      # (W, N, V)
+        x_hours = self.hours[i : i + W]     # (W,)  — hours-since-epoch per step
 
         # Target snapshot index: i + W - 1 + delta_steps
         t_idx   = i + W - 1 + dt
-        y       = self.obs[t_idx]               # (N, V)
-        y_mask  = self.mask[t_idx]              # (N, V)
-        y_temp  = self.temporal[t_idx]          # (4,)
+        y       = self.obs[t_idx]            # (N, V)
+        y_mask  = self.mask[t_idx]           # (N, V)
+        y_hours = self.hours[t_idx]          # ()   — scalar for target step
 
         return {
-            "x":           x,                            # (W, N, V)
-            "x_mask":      x_mask,                       # (W, N, V)
-            "x_temps":     x_temps,                      # (W, 4)
-            "y":           y,                            # (N, V)
-            "y_mask":      y_mask,                       # (N, V)
-            "y_temp":      y_temp,                       # (4,)
-            "spatial":     self.spatial,                 # (N, 18)
+            "x":           x,                             # (W, N, V)
+            "x_mask":      x_mask,                        # (W, N, V)
+            "x_hours":     x_hours,                       # (W,)
+            "y":           y,                             # (N, V)
+            "y_mask":      y_mask,                        # (N, V)
+            "y_hours":     y_hours,                       # ()
+            "spatial":     self.spatial,                  # (N, 18)
             "delta_steps": torch.tensor(dt, dtype=torch.long),
         }
