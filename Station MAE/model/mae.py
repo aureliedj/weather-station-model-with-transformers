@@ -81,7 +81,7 @@ class StationMAE(nn.Module):
         dropout:          Dropout applied in attention and FFN.
         mask_ratio:       Fraction of stations masked per sample (0–1).
         num_vars:         Number of meteorological variables.
-        spatial_dim:      Static feature dimension (18).
+        spatial_dim:      Static feature dimension (14).
         fourier_dim:      Fourier feature dimension for temporal embedding (32).
         max_delta_steps:  Maximum forecast lead-time in 10-min steps (36 = 6 h).
     """
@@ -138,7 +138,7 @@ class StationMAE(nn.Module):
         self,
         x:           torch.Tensor,   # (B, W, N, V)   normalised input window
         x_mask:      torch.Tensor,   # (B, W, N, V)   sensor availability (1=present)
-        spatial:     torch.Tensor,   # (N, 18) or (B, N, 18)
+        spatial:     torch.Tensor,   # (N, 14) or (B, N, 14)
         x_hours:     torch.Tensor,   # (B, W)          hours-since-epoch per input step
         y:           torch.Tensor,   # (B, N, V)       normalised target snapshot
         y_mask:      torch.Tensor,   # (B, N, V)       target sensor availability

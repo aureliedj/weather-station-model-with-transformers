@@ -155,23 +155,24 @@ def train_one_epoch(
         # ---- Move to device ----------------------------------------
         x           = batch["x"].to(device)            # (B, W, N, V)
         x_mask      = batch["x_mask"].to(device)       # (B, W, N, V)
-        spatial     = batch["spatial"].to(device)      # (N, 18) or (B, N, 18)
+        spatial     = batch["spatial"].to(device)      # (N, 14) or (B, N, 14)
         x_hours     = batch["x_hours"].to(device)      # (B, W)
         y           = batch["y"].to(device)             # (B, N, V)
         y_mask      = batch["y_mask"].to(device)        # (B, N, V)
         y_hours     = batch["y_hours"].to(device)       # (B,)
         delta_steps = batch["delta_steps"].to(device)   # (B,)
 
-        # spatial may be (N, 18) when collated from samples sharing the same
+        # spatial may be (N, 14) when collated from samples sharing the same
         # station set — squeeze the batch dim if accidentally added
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
-            spatial = spatial[0]  # (N, 18)
+            spatial = spatial[0]  # (N, 14)
 
         # ---- Forward + loss ----------------------------------------
         optimizer.zero_grad()
 
         if scaler is not None:
-            with torch.cuda.amp.autocast():
+            # CUDA path: GradScaler + autocast
+            with torch.autocast(device_type=device.type):
                 loss, _, _ = model(
                     x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
                 )
@@ -180,6 +181,15 @@ def train_one_epoch(
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
             scaler.step(optimizer)
             scaler.update()
+        elif device.type == "mps":
+            # MPS path: autocast without GradScaler
+            with torch.autocast(device_type="mps"):
+                loss, _, _ = model(
+                    x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
+                )
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+            optimizer.step()
         else:
             loss, _, _ = model(
                 x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
@@ -246,7 +256,7 @@ def train(
     grad_clip     = cfg.get("grad_clip",     1.0)
     log_interval  = cfg.get("log_interval",  50)
     save_dir      = cfg.get("save_dir",      "checkpoints")
-    use_amp       = cfg.get("amp",           True) and device.type == "cuda"
+    use_amp       = cfg.get("amp",           True) and device.type in ("cuda", "mps")
 
     os.makedirs(save_dir, exist_ok=True)
 
@@ -256,7 +266,8 @@ def train(
     warmup_steps = warmup_epochs * len(train_loader)
     scheduler    = build_scheduler(optimizer, warmup_steps, total_steps)
 
-    scaler   = torch.cuda.amp.GradScaler() if use_amp else None
+    # GradScaler is CUDA-only; MPS uses autocast without a scaler
+    scaler   = torch.cuda.amp.GradScaler() if (use_amp and device.type == "cuda") else None
     best_val = float("inf")
 
     for epoch in range(1, epochs + 1):

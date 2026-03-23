@@ -45,8 +45,8 @@ Arguments
     --weight_decay FLT  AdamW weight decay (default 0.05)
     --warmup_epochs INT Warmup epochs (default 5)
     --grad_clip   FLT   Gradient clipping max norm (default 1.0)
-    --amp               Enable automatic mixed precision (flag, CUDA only)
-    --device      STR   'cpu' or 'cuda' (default: auto)
+    --amp               Enable automatic mixed precision (flag, CUDA/MPS)
+    --device      STR   'cpu', 'cuda', or 'mps' (default: auto)
     --seed        INT   Random seed (default 42)
 
   Checkpointing
@@ -128,7 +128,11 @@ def main() -> None:
 
     # ---- Device & seed -------------------------------------------------
     if args.device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(
+            "mps"  if torch.backends.mps.is_available() and torch.backends.mps.is_built() else
+            "cuda" if torch.cuda.is_available() else
+            "cpu"
+        )
     else:
         device = torch.device(args.device)
 

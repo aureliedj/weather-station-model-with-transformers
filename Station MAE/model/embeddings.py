@@ -60,10 +60,15 @@ SPATIAL_FEATURE_NAMES = [
 ]
 
 # Output dimension of encode_spatial_static:
-#   lat / lon        → 2 each (sin/cos)
-#   aspect 2km/10km  → 2 each (sin/cos)
-#   scalars          → 8 (station_height, dem, tpi, 2×slope, 2×sn_deriv, we_deriv)
-SPATIAL_INPUT_DIM = 18
+#   swiss_easting / swiss_northing → 1 each (plain scalar, normalised)
+#   aspect 2km / 10km              → 2 each (sin/cos — genuinely cyclic angles)
+#   scalars                        → 8 (station_height, dem, tpi, 2×slope, 2×sn_deriv, we_deriv)
+# Total: 2 + 4 + 8 = 14
+#
+# NOTE: Swiss LV95/LV03 coordinates are Cartesian (metres), not angles.
+# Sin/cos encoding would be meaningless at that scale (~2.6M m easting → ~45k rad).
+# Simple zero-mean unit-variance normalisation is the correct treatment.
+SPATIAL_INPUT_DIM = 14
 
 # Fourier feature dimension for TemporalEmbedding.
 # Must be even: TEMPORAL_FOURIER_DIM // 2 wavelengths are used.
@@ -89,25 +94,27 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
                       (e.g. a row from ds.stations_table).
 
     Returns:
-        torch.Tensor of shape (18,), dtype float32.
+        torch.Tensor of shape (14,), dtype float32.
     """
     def _sincos_deg(deg: float):
-        rad = math.radians(deg)
+        rad = math.radians(float(deg))
         return math.sin(rad), math.cos(rad)
 
-    def _sincos_rad(rad: float):
-        return math.sin(rad), math.cos(rad)
-
-    sin_lat, cos_lat   = _sincos_rad(math.radians(station_info["swiss_easting"]))
-    sin_lon, cos_lon   = _sincos_rad(math.radians(station_info["swiss_northing"]))
+    # Aspect angles are genuinely cyclic (compass direction → sin/cos correct)
     sin_asp2k,  cos_asp2k  = _sincos_deg(station_info["ASPECT_2000M_SIGRATIO1"])
     sin_asp10k, cos_asp10k = _sincos_deg(station_info["ASPECT_10000M_SIGRATIO1"])
 
     features = [
-        sin_lat,    cos_lat,                                        # 2 — geographic position
-        sin_lon,    cos_lon,                                        # 2
+        # Geographic position — Swiss LV95/LV03 Cartesian coordinates in metres.
+        # These are NOT angles: sin/cos would be meaningless at ~2.6 M metre scale.
+        # Kept as plain scalars; normalised (zero-mean, unit-var) across the station
+        # population by the caller (build_spatial_features / compute_spatial_normalization).
+        float(station_info["swiss_easting"]),                       # 1 — CH1903 easting  (m)
+        float(station_info["swiss_northing"]),                      # 1 — CH1903 northing (m)
+        # Aspect angles — sin/cos encoding is correct for cyclic compass directions
         sin_asp2k,  cos_asp2k,                                      # 2 — local aspect
         sin_asp10k, cos_asp10k,                                     # 2 — regional aspect
+        # Scalar topographic features (all normalised by caller)
         float(station_info["station_height"]),                      # 1 — sensor elevation
         float(station_info["dem"]),                                 # 1 — DEM elevation
         float(station_info["TPI_2000M"]),                           # 1 — valley(−) vs ridge(+)
@@ -116,7 +123,7 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
         float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),       # 1 — S-N gradient local
         float(station_info["SN_DERIVATIVE_10000M_SIGRATIO1"]),      # 1 — S-N gradient regional
         float(station_info["WE_DERIVATIVE_2000M_SIGRATIO1"]),       # 1 — W-E gradient (Föhn)
-    ]   # total: 18
+    ]   # total: 2 + 4 + 8 = 14
 
     return torch.tensor(features, dtype=torch.float32)
 
@@ -156,7 +163,7 @@ class SpatialEmbedding(nn.Module):
 
     Args:
         d_model:    Transformer model dimension.
-        input_dim:  Dimensionality of encode_spatial_static output (default 18).
+        input_dim:  Dimensionality of encode_spatial_static output (default 14).
     """
 
     def __init__(self, d_model: int, input_dim: int = SPATIAL_INPUT_DIM):
@@ -170,7 +177,7 @@ class SpatialEmbedding(nn.Module):
     def forward(self, spatial_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            spatial_features: (N, 18) or (B, N, 18)
+            spatial_features: (N, 14) or (B, N, 14)
                               Should be normalised before calling.
         Returns:
             (N, d_model) or (B, N, d_model)
@@ -350,7 +357,7 @@ def compute_spatial_normalization(
     Compute per-feature mean and std across all stations for normalisation.
 
     Args:
-        all_spatial_features: (N_stations, 18) from encode_spatial_static.
+        all_spatial_features: (N_stations, 14) from encode_spatial_static.
 
     Returns:
         mean: (18,)

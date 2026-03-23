@@ -11,7 +11,7 @@ Design:
         y           : (N, V)     — target snapshot at t + delta_steps
         y_mask      : (N, V)     — sensor availability mask for target
         y_hours     : ()         — hours-since-epoch for target step (→ TemporalEmbedding)
-        spatial     : (N, 18)    — normalised static station features (same for all samples)
+        spatial     : (N, 14)    — normalised static station features (same for all samples)
         delta_steps : int        — forecast lead time in 10-min steps (0 = reconstruction)
 
     Where:
@@ -143,33 +143,34 @@ def build_spatial_features(
     """
     Encode and normalise static station metadata into a spatial feature tensor.
 
-    Cyclic variables (lat, lon, aspects) are sin/cos encoded.
-    Scalar features are normalised to zero-mean unit-variance across stations.
+    Swiss LV95/LV03 coordinates are Cartesian (metres) — they are kept as plain
+    scalars and normalised together with the other scalar features.  Sin/cos
+    encoding is only applied to aspect angles, which are genuinely cyclic
+    compass directions.
 
     Args:
         ds: PeakWeatherDataset instance (must have extended_topo_vars="DEM").
 
     Returns:
-        spatial_norm : (N, 18) normalised float32 tensor
-        stats        : {"mean": (18,), "std": (18,)} — keep for inference normalisation
+        spatial_norm : (N, 14) normalised float32 tensor
+        stats        : {"mean": (14,), "std": (14,)} — keep for inference normalisation
     """
     stations = ds.stations_table
     rows = []
 
-    for _, row in stations.iterrows():
-        def sd(deg):
-            r = math.radians(float(deg)); return math.sin(r), math.cos(r)
+    def _sincos_deg(deg):
+        r = math.radians(float(deg))
+        return math.sin(r), math.cos(r)
 
-        sl, cl   = sd(row["swiss_easting"])
-        slo, clo = sd(row["swiss_northing"])
-        sa2, ca2 = sd(row["ASPECT_2000M_SIGRATIO1"])
-        sa10,ca10= sd(row["ASPECT_10000M_SIGRATIO1"])
+    for _, row in stations.iterrows():
+        sa2,  ca2  = _sincos_deg(row["ASPECT_2000M_SIGRATIO1"])
+        sa10, ca10 = _sincos_deg(row["ASPECT_10000M_SIGRATIO1"])
 
         rows.append([
-            sl,   cl,                                           # lat  (2)
-            slo,  clo,                                          # lon  (2)
-            sa2,  ca2,                                          # aspect 2km  (2)
-            sa10, ca10,                                         # aspect 10km (2)
+            float(row["swiss_easting"]),                        # easting  (1) — scalar, m
+            float(row["swiss_northing"]),                       # northing (1) — scalar, m
+            sa2,  ca2,                                          # aspect 2km  (2) — cyclic
+            sa10, ca10,                                         # aspect 10km (2) — cyclic
             float(row["station_height"]),                       # elevation   (1)
             float(row["dem"]),                                  # DEM         (1)
             float(row["TPI_2000M"]),                            # TPI         (1)
@@ -178,9 +179,9 @@ def build_spatial_features(
             float(row["SN_DERIVATIVE_2000M_SIGRATIO1"]),        # S-N 2km     (1)
             float(row["SN_DERIVATIVE_10000M_SIGRATIO1"]),       # S-N 10km    (1)
             float(row["WE_DERIVATIVE_2000M_SIGRATIO1"]),        # W-E 2km     (1)
-        ])   # 18 features total
+        ])   # 2 + 4 + 8 = 14 features total
 
-    features = torch.tensor(rows, dtype=torch.float32)         # (N, 18)
+    features = torch.tensor(rows, dtype=torch.float32)         # (N, 14)
     mean     = features.mean(dim=0)                            # (18,)
     std      = features.std(dim=0).clamp(min=1e-6)             # (18,)
 
@@ -279,7 +280,7 @@ class StationMAEDataset(Dataset):
         y           (N, V)     normalised target snapshot
         y_mask      (N, V)     sensor availability for target
         y_hours     ()         hours-since-epoch for target step (→ TemporalEmbedding)
-        spatial     (N, 18)    normalised static station features
+        spatial     (N, 14)    normalised static station features
         delta_steps int        forecast lead time in 10-min steps
 
     The encoder receives the full window [W, N, V], attending across both
@@ -319,7 +320,7 @@ class StationMAEDataset(Dataset):
         # 1. Spatial features — static, shared across all samples
         # ------------------------------------------------------------------
         self.spatial, self.spatial_stats = build_spatial_features(ds)
-        # (N, 18), normalised
+        # (N, 14), normalised
 
         # ------------------------------------------------------------------
         # 2. Full observation tensor
@@ -419,6 +420,6 @@ class StationMAEDataset(Dataset):
             "y":           y,                             # (N, V)
             "y_mask":      y_mask,                        # (N, V)
             "y_hours":     y_hours,                       # ()
-            "spatial":     self.spatial,                  # (N, 18)
+            "spatial":     self.spatial,                  # (N, 14)
             "delta_steps": torch.tensor(dt, dtype=torch.long),
         }
