@@ -129,6 +129,7 @@ def load_peakweather(root: str) -> PeakWeatherDataset:
         ],
         compute_uv=True,        # adds wind_u, wind_v columns
         station_type="meteo_station",
+        imputation_method=None,
         freq="10min",
     )
 

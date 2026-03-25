@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from model.embeddings import TARGET_VARIABLE_NAMES
+from model.embeddings import TARGET_VARIABLE_NAMES, NUM_TARGET_VARIABLES
 
 
 # ---------------------------------------------------------------------------
@@ -87,17 +87,23 @@ def evaluate(
 
         B = preds.size(0)
 
+        # Slice y and y_mask to target variables only — drops precipitation (last col).
+        # preds is already (B, N, NUM_TARGET_VARIABLES) from the decoder head;
+        # y and y_mask from the batch are still (B, N, 6) so they must match.
+        y_target      = y[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
+        y_mask_target = y_mask[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
+
         # ---- Gather masked-station predictions per sample ----------
         for b in range(B):
-            m_idx = masked_idx[b]                           # (N_masked,)
-            preds_list.append(preds[b, m_idx].cpu())        # (N_masked, V)
-            targets_list.append(y[b, m_idx].cpu())          # (N_masked, V)
-            masks_list.append(y_mask[b, m_idx].cpu())       # (N_masked, V)
+            m_idx = masked_idx[b]                                    # (N_masked,)
+            preds_list.append(preds[b, m_idx].cpu())                 # (N_masked, 5)
+            targets_list.append(y_target[b, m_idx].cpu())            # (N_masked, 5)
+            masks_list.append(y_mask_target[b, m_idx].cpu())         # (N_masked, 5)
 
     # ---- Concatenate across all batches ----------------------------
-    preds_all   = torch.cat(preds_list,   dim=0)    # (total_masked, V)
-    targets_all = torch.cat(targets_list, dim=0)
-    masks_all   = torch.cat(masks_list,   dim=0).bool()
+    preds_all   = torch.cat(preds_list,   dim=0)    # (total_masked, 5)
+    targets_all = torch.cat(targets_list, dim=0)    # (total_masked, 5)
+    masks_all   = torch.cat(masks_list,   dim=0).bool()  # (total_masked, 5)
 
     # ---- Per-variable metrics (present sensors only) ---------------
     metrics: dict[str, float] = {}
