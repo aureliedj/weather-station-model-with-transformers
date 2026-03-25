@@ -10,7 +10,7 @@ Public API
 
 Returned metrics
 ----------------
-    For each variable v in VARIABLE_NAMES:
+    For each variable v in TARGET_VARIABLE_NAMES (5 vars, excludes precipitation):
         {v}_rmse   — root-mean-square error on masked stations
         {v}_mae    — mean absolute error on masked stations
 
@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from model.embeddings import VARIABLE_NAMES
+from model.embeddings import TARGET_VARIABLE_NAMES
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +102,7 @@ def evaluate(
     # ---- Per-variable metrics (present sensors only) ---------------
     metrics: dict[str, float] = {}
 
-    for v, var_name in enumerate(VARIABLE_NAMES):
+    for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
         m = masks_all[:, v]              # (total_masked,) boolean
         if m.sum() == 0:
             metrics[f"{var_name}_rmse"] = float("nan")

@@ -40,7 +40,13 @@ VARIABLE_NAMES = [
     "wind_v",
     "precipitation",
 ]
-NUM_VARIABLES = len(VARIABLE_NAMES)   # 6
+NUM_VARIABLES = len(VARIABLE_NAMES)   # 6  — all variables used as *input*
+
+# Variables the model is asked to *predict*.
+# Precipitation is kept as an input signal but excluded from the loss / output head
+# because it is intermittent and heavily zero-inflated, making MSE a poor objective.
+TARGET_VARIABLE_NAMES = [v for v in VARIABLE_NAMES if v != "precipitation"]
+NUM_TARGET_VARIABLES  = len(TARGET_VARIABLE_NAMES)   # 5
 
 # Names of the static station metadata fields (in the order used by encode_spatial_static).
 # Aspects are stored as raw degrees; sin/cos encoding is applied inside encode_spatial_static.

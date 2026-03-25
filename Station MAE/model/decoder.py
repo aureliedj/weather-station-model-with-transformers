@@ -48,6 +48,7 @@ from .embeddings import (
     SPATIAL_INPUT_DIM,
     TEMPORAL_FOURIER_DIM,
     NUM_VARIABLES,
+    NUM_TARGET_VARIABLES,
 )
 from .encoder import TransformerBlock   # reuse the same Pre-LN block
 
@@ -57,33 +58,37 @@ class StationMAEDecoder(nn.Module):
     MAE decoder for weather station reconstruction and forecasting.
 
     Args:
-        d_model:     Model dimension — must match encoder d_model.
-        num_heads:   Attention heads (default 4).
-        num_layers:  Transformer blocks (default 2; lighter than encoder).
-        mlp_ratio:   FFN hidden-dim ratio (default 4.0).
-        dropout:     Dropout rate (default 0.1).
-        num_vars:    Variables to predict per station (default 6).
-        spatial_dim: Static feature dimension (default 14).
-        fourier_dim: Fourier dimension for TemporalEmbedding (default 32).
-        max_delta:   Maximum forecast lead-time in 10-min steps (default 36 = 6 h).
+        d_model:          Model dimension — must match encoder d_model.
+        num_heads:        Attention heads (default 4).
+        num_layers:       Transformer blocks (default 2; lighter than encoder).
+        mlp_ratio:        FFN hidden-dim ratio (default 4.0).
+        dropout:          Dropout rate (default 0.1).
+        num_vars:         Input variables per station (default 6, used by encoder).
+        num_target_vars:  Variables to predict per station (default 5, excludes
+                          precipitation which is used as input only).
+        spatial_dim:      Static feature dimension (default 14).
+        fourier_dim:      Fourier dimension for TemporalEmbedding (default 32).
+        max_delta:        Maximum forecast lead-time in 10-min steps (default 36 = 6 h).
     """
 
     def __init__(
         self,
-        d_model:     int   = 128,
-        num_heads:   int   = 4,
-        num_layers:  int   = 2,
-        mlp_ratio:   float = 4.0,
-        dropout:     float = 0.1,
-        num_vars:    int   = NUM_VARIABLES,
-        spatial_dim: int   = SPATIAL_INPUT_DIM,
-        fourier_dim: int   = TEMPORAL_FOURIER_DIM,
-        max_delta:   int   = 36,
+        d_model:         int   = 128,
+        num_heads:       int   = 4,
+        num_layers:      int   = 2,
+        mlp_ratio:       float = 4.0,
+        dropout:         float = 0.1,
+        num_vars:        int   = NUM_VARIABLES,
+        num_target_vars: int   = NUM_TARGET_VARIABLES,
+        spatial_dim:     int   = SPATIAL_INPUT_DIM,
+        fourier_dim:     int   = TEMPORAL_FOURIER_DIM,
+        max_delta:       int   = 36,
     ):
         super().__init__()
 
-        self.d_model  = d_model
-        self.num_vars = num_vars
+        self.d_model         = d_model
+        self.num_vars        = num_vars         # input variables (encoder side)
+        self.num_target_vars = num_target_vars  # predicted variables (head output)
 
         # ------------------------------------------------------------------
         # Learnable mask token — shared starting point for all station queries.
@@ -114,9 +119,11 @@ class StationMAEDecoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
         # ------------------------------------------------------------------
-        # Prediction head: d_model → num_vars
+        # Prediction head: d_model → num_target_vars
+        # Precipitation is excluded from the output — it is used as input
+        # context only (zero-inflated distribution makes MSE a poor fit).
         # ------------------------------------------------------------------
-        self.head = nn.Linear(d_model, num_vars)
+        self.head = nn.Linear(d_model, num_target_vars)
 
     # ------------------------------------------------------------------
     # Forward
@@ -140,7 +147,8 @@ class StationMAEDecoder(nn.Module):
                                                   (0 = pure reconstruction)
 
         Returns:
-            preds: (B, N, num_vars)  raw predictions for every station.
+            preds: (B, N, num_target_vars)  raw predictions for every station.
+                   num_target_vars = 5 (temperature, pressure, humidity, wind_u, wind_v).
                    Loss is computed externally on masked stations only.
         """
         B = encoded_vis.size(0)

@@ -12,6 +12,8 @@ from .embeddings import (
     # Constants
     VARIABLE_NAMES,
     NUM_VARIABLES,
+    TARGET_VARIABLE_NAMES,
+    NUM_TARGET_VARIABLES,
     SPATIAL_FEATURE_NAMES,
     SPATIAL_INPUT_DIM,
     TEMPORAL_FOURIER_DIM,
@@ -34,6 +36,8 @@ __all__ = [
     "compute_spatial_normalization",
     "VARIABLE_NAMES",
     "NUM_VARIABLES",
+    "TARGET_VARIABLE_NAMES",
+    "NUM_TARGET_VARIABLES",
     "SPATIAL_FEATURE_NAMES",
     "SPATIAL_INPUT_DIM",
     "TEMPORAL_FOURIER_DIM",

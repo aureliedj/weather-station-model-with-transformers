@@ -48,6 +48,7 @@ from .encoder import StationMAEEncoder
 from .decoder import StationMAEDecoder
 from .embeddings import (
     NUM_VARIABLES,
+    NUM_TARGET_VARIABLES,
     SPATIAL_INPUT_DIM,
     TEMPORAL_FOURIER_DIM,
 )
@@ -80,7 +81,10 @@ class StationMAE(nn.Module):
         mlp_ratio:        FFN hidden-dim = d_model × mlp_ratio.
         dropout:          Dropout applied in attention and FFN.
         mask_ratio:       Fraction of stations masked per sample (0–1).
-        num_vars:         Number of meteorological variables.
+        num_vars:         Input variables per station (6: temp, pres, hum, wind_u, wind_v, precip).
+        num_target_vars:  Predicted variables per station (5: all except precipitation).
+                          Precipitation is used as input context but excluded from the
+                          loss — its zero-inflated distribution makes MSE unsuitable.
         spatial_dim:      Static feature dimension (14).
         fourier_dim:      Fourier feature dimension for temporal embedding (32).
         max_delta_steps:  Maximum forecast lead-time in 10-min steps (36 = 6 h).
@@ -97,14 +101,16 @@ class StationMAE(nn.Module):
         dropout:          float = 0.1,
         mask_ratio:       float = 0.5,
         num_vars:         int   = NUM_VARIABLES,
+        num_target_vars:  int   = NUM_TARGET_VARIABLES,
         spatial_dim:      int   = SPATIAL_INPUT_DIM,
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
         max_delta_steps:  int   = 36,
     ):
         super().__init__()
 
-        self.mask_ratio = mask_ratio
-        self.num_vars   = num_vars
+        self.mask_ratio      = mask_ratio
+        self.num_vars        = num_vars
+        self.num_target_vars = num_target_vars
 
         self.encoder = StationMAEEncoder(
             d_model=d_model,
@@ -125,6 +131,7 @@ class StationMAE(nn.Module):
             mlp_ratio=mlp_ratio,
             dropout=dropout,
             num_vars=num_vars,
+            num_target_vars=num_target_vars,
             spatial_dim=spatial_dim,
             fourier_dim=fourier_dim,
             max_delta=max_delta_steps,
@@ -150,7 +157,8 @@ class StationMAE(nn.Module):
 
         Returns:
             loss:           scalar — MSE loss on masked stations (present sensors only)
-            preds:          (B, N, V) — predictions for all stations at target time
+            preds:          (B, N, num_target_vars) — predictions for all stations
+                            num_target_vars = 5 (excludes precipitation)
             masked_indices: (B, N_masked) — which station indices were masked
         """
         # 1. Encode: process visible station tokens only
@@ -160,12 +168,16 @@ class StationMAE(nn.Module):
         # encoded:    (B, W*N_vis, d_model)
         # masked_idx: (B, N_masked)
 
-        # 2. Decode: predict all N stations at the target time
+        # 2. Decode: predict target variables for all N stations at the target time
         preds = self.decoder(encoded, spatial, y_hours, delta_steps)
-        # preds: (B, N, V)
+        # preds: (B, N, num_target_vars)
 
-        # 3. Compute loss on masked stations only
-        loss = self._masked_loss(preds, y, y_mask, masked_idx)
+        # 3. Slice y and y_mask to target variables only (drop precipitation column)
+        y_target      = y[:, :, :self.num_target_vars]       # (B, N, num_target_vars)
+        y_mask_target = y_mask[:, :, :self.num_target_vars]  # (B, N, num_target_vars)
+
+        # 4. Compute loss on masked stations only
+        loss = self._masked_loss(preds, y_target, y_mask_target, masked_idx)
 
         return loss, preds, masked_idx
 
@@ -191,7 +203,8 @@ class StationMAE(nn.Module):
             (same shapes as forward, but y / y_mask not needed)
 
         Returns:
-            preds: (B, N, V) predictions for all stations at target time.
+            preds: (B, N, num_target_vars) predictions for all stations at target time.
+                   num_target_vars = 5 (temperature, pressure, humidity, wind_u, wind_v).
         """
         self.eval()
         encoded, _, _ = self.encoder(x, x_mask, spatial, x_hours)
