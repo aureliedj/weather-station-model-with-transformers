@@ -17,6 +17,7 @@ from .embeddings import (
     SPATIAL_FEATURE_NAMES,
     SPATIAL_INPUT_DIM,
     TEMPORAL_FOURIER_DIM,
+    DELTA_FOURIER_DIM,
 )
 from .encoder import StationMAEEncoder, TransformerBlock
 from .decoder import StationMAEDecoder
@@ -41,4 +42,5 @@ __all__ = [
     "SPATIAL_FEATURE_NAMES",
     "SPATIAL_INPUT_DIM",
     "TEMPORAL_FOURIER_DIM",
+    "DELTA_FOURIER_DIM",
 ]
