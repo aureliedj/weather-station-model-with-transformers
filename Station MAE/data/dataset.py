@@ -90,6 +90,7 @@ SPATIAL_FEATURE_NAMES = [
     "SN_DERIVATIVE_2000M_SIGRATIO1",
     "SN_DERIVATIVE_10000M_SIGRATIO1",
     "WE_DERIVATIVE_2000M_SIGRATIO1",
+    "WE_DERIVATIVE_10000M_SIGRATIO1",   # regional W-E gradient (Föhn / valley flow)
 ]
 
 # Train / val / test split by year
@@ -153,8 +154,8 @@ def build_spatial_features(
         ds: PeakWeatherDataset instance (must have extended_topo_vars="DEM").
 
     Returns:
-        spatial_norm : (N, 14) normalised float32 tensor
-        stats        : {"mean": (14,), "std": (14,)} — keep for inference normalisation
+        spatial_norm : (N, 15) normalised float32 tensor
+        stats        : {"mean": (15,), "std": (15,)} — keep for inference normalisation
     """
     stations = ds.stations_table
     rows = []
@@ -168,23 +169,24 @@ def build_spatial_features(
         sa10, ca10 = _sincos_deg(row["ASPECT_10000M_SIGRATIO1"])
 
         rows.append([
-            float(row["swiss_easting"]),                        # easting  (1) — scalar, m
-            float(row["swiss_northing"]),                       # northing (1) — scalar, m
-            sa2,  ca2,                                          # aspect 2km  (2) — cyclic
-            sa10, ca10,                                         # aspect 10km (2) — cyclic
-            float(row["station_height"]),                       # elevation   (1)
-            float(row["dem"]),                                  # DEM         (1)
-            float(row["TPI_2000M"]),                            # TPI         (1)
-            float(row["SLOPE_2000M_SIGRATIO1"]),                # slope 2km   (1)
-            float(row["SLOPE_10000M_SIGRATIO1"]),               # slope 10km  (1)
-            float(row["SN_DERIVATIVE_2000M_SIGRATIO1"]),        # S-N 2km     (1)
-            float(row["SN_DERIVATIVE_10000M_SIGRATIO1"]),       # S-N 10km    (1)
-            float(row["WE_DERIVATIVE_2000M_SIGRATIO1"]),        # W-E 2km     (1)
-        ])   # 2 + 4 + 8 = 14 features total
+            float(row["swiss_easting"]),                         # easting  (1) — scalar, m
+            float(row["swiss_northing"]),                        # northing (1) — scalar, m
+            sa2,  ca2,                                           # aspect 2km  (2) — cyclic
+            sa10, ca10,                                          # aspect 10km (2) — cyclic
+            float(row["station_height"]),                        # elevation   (1)
+            float(row["dem"]),                                   # DEM         (1)
+            float(row["TPI_2000M"]),                             # TPI         (1)
+            float(row["SLOPE_2000M_SIGRATIO1"]),                 # slope 2km   (1)
+            float(row["SLOPE_10000M_SIGRATIO1"]),                # slope 10km  (1)
+            float(row["SN_DERIVATIVE_2000M_SIGRATIO1"]),         # S-N 2km     (1)
+            float(row["SN_DERIVATIVE_10000M_SIGRATIO1"]),        # S-N 10km    (1)
+            float(row["WE_DERIVATIVE_2000M_SIGRATIO1"]),         # W-E 2km     (1)
+            float(row["WE_DERIVATIVE_10000M_SIGRATIO1"]),        # W-E 10km    (1)
+        ])   # 2 + 4 + 9 = 15 features total
 
-    features = torch.tensor(rows, dtype=torch.float32)         # (N, 14)
-    mean     = features.mean(dim=0)                            # (18,)
-    std      = features.std(dim=0).clamp(min=1e-6)             # (18,)
+    features = torch.tensor(rows, dtype=torch.float32)          # (N, 15)
+    mean     = features.mean(dim=0)                             # (15,)
+    std      = features.std(dim=0).clamp(min=1e-6)              # (15,)
 
     return (features - mean) / std, {"mean": mean, "std": std}
 

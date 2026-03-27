@@ -146,6 +146,12 @@ class StationMAEEncoder(nn.Module):
         self.spatial_emb  = SpatialEmbedding(d_model=d_model, input_dim=spatial_dim)
         self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim)
 
+        # --- Post-assembly normalisation ---
+        # Applied after summing var_proj + spatial_emb + temporal_emb to keep
+        # the three independently-initialised components on a common scale
+        # before they enter the first transformer block.
+        self.token_norm = nn.LayerNorm(d_model)
+
         # --- Transformer blocks ---
         self.blocks = nn.ModuleList([
             TransformerBlock(d_model, num_heads, mlp_ratio, dropout)
@@ -188,6 +194,10 @@ class StationMAEEncoder(nn.Module):
 
         # Sum three embeddings — broadcasts cleanly over (B, W, N, d_model)
         tokens = var_tokens + spatial_emb + temp_emb            # (B, W, N, d_model)
+
+        # Normalise after summation: prevents any single component from
+        # dominating the scale seen by the first transformer block.
+        tokens = self.token_norm(tokens)                        # (B, W, N, d_model)
         return tokens
 
     def _mask_stations(

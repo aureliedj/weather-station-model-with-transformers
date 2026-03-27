@@ -55,7 +55,8 @@ def evaluate(
 
     Returns:
         metrics: dict mapping metric names → float values.
-                 Keys: "{var}_rmse", "{var}_mae", "overall_rmse", "overall_mae".
+                 Keys: "avg_loss" (MSE, same scale as train loss),
+                       "{var}_rmse", "{var}_mae", "overall_rmse", "overall_mae".
     """
     model.eval()
 
@@ -63,6 +64,9 @@ def evaluate(
     preds_list   = []   # list of (n_masked, V) tensors
     targets_list = []
     masks_list   = []   # sensor presence at target step
+
+    total_loss = 0.0   # sum of per-batch MSE losses (same objective as training)
+    n_batches  = 0
 
     for batch in loader:
         # ---- Move to device ----------------------------------------
@@ -82,8 +86,12 @@ def evaluate(
         loss, preds, masked_idx = model(
             x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
         )
+        # loss:       scalar MSE (same objective as training)
         # preds:      (B, N, V)
         # masked_idx: (B, N_masked)
+
+        total_loss += loss.item()
+        n_batches  += 1
 
         B = preds.size(0)
 
@@ -106,7 +114,9 @@ def evaluate(
     masks_all   = torch.cat(masks_list,   dim=0).bool()  # (total_masked, 5)
 
     # ---- Per-variable metrics (present sensors only) ---------------
-    metrics: dict[str, float] = {}
+    metrics: dict[str, float] = {
+        "avg_loss": total_loss / max(n_batches, 1),   # MSE, same scale as train_loss
+    }
 
     for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
         m = masks_all[:, v]              # (total_masked,) boolean

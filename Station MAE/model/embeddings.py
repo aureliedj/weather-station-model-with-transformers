@@ -63,23 +63,30 @@ SPATIAL_FEATURE_NAMES = [
     "SN_DERIVATIVE_2000M_SIGRATIO1",
     "SN_DERIVATIVE_10000M_SIGRATIO1",
     "WE_DERIVATIVE_2000M_SIGRATIO1",
+    "WE_DERIVATIVE_10000M_SIGRATIO1",   # regional W-E gradient (Föhn / valley flow)
 ]
 
 # Output dimension of encode_spatial_static:
 #   swiss_easting / swiss_northing → 1 each (plain scalar, normalised)
 #   aspect 2km / 10km              → 2 each (sin/cos — genuinely cyclic angles)
-#   scalars                        → 8 (station_height, dem, tpi, 2×slope, 2×sn_deriv, we_deriv)
-# Total: 2 + 4 + 8 = 14
+#   scalars                        → 9 (station_height, dem, tpi, 2×slope, 2×sn_deriv, 2×we_deriv)
+# Total: 2 + 4 + 9 = 15
 #
 # NOTE: Swiss LV95/LV03 coordinates are Cartesian (metres), not angles.
 # Sin/cos encoding would be meaningless at that scale (~2.6M m easting → ~45k rad).
 # Simple zero-mean unit-variance normalisation is the correct treatment.
-SPATIAL_INPUT_DIM = 14
+SPATIAL_INPUT_DIM = 15
 
 # Fourier feature dimension for TemporalEmbedding.
 # Must be even: TEMPORAL_FOURIER_DIM // 2 wavelengths are used.
 # 32 → 16 wavelengths spanning ~10 min to ~1 year.
 TEMPORAL_FOURIER_DIM = 32
+
+# Fourier feature dimension for DeltaTimeEmbedding.
+# Smaller than TEMPORAL_FOURIER_DIM — lead-time range (0–6 h) is much narrower
+# than the temporal range (10 min → 1 year), so fewer basis functions suffice.
+# 16 → 8 wavelengths spanning 10 min to 8 h.
+DELTA_FOURIER_DIM = 16
 
 
 # ---------------------------------------------------------------------------
@@ -88,7 +95,7 @@ TEMPORAL_FOURIER_DIM = 32
 
 def encode_spatial_static(station_info: dict) -> torch.Tensor:
     """
-    Encode static station metadata into an 18-dimensional feature vector.
+    Encode static station metadata into a 15-dimensional feature vector.
 
     Cyclic variables (latitude, longitude, aspects) are sin/cos encoded.
     Scalar topographic features are returned as-is and should be normalised
@@ -100,7 +107,7 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
                       (e.g. a row from ds.stations_table).
 
     Returns:
-        torch.Tensor of shape (14,), dtype float32.
+        torch.Tensor of shape (15,), dtype float32.
     """
     def _sincos_deg(deg: float):
         rad = math.radians(float(deg))
@@ -115,21 +122,22 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
         # These are NOT angles: sin/cos would be meaningless at ~2.6 M metre scale.
         # Kept as plain scalars; normalised (zero-mean, unit-var) across the station
         # population by the caller (build_spatial_features / compute_spatial_normalization).
-        float(station_info["swiss_easting"]),                       # 1 — CH1903 easting  (m)
-        float(station_info["swiss_northing"]),                      # 1 — CH1903 northing (m)
+        float(station_info["swiss_easting"]),                        # 1 — CH1903 easting  (m)
+        float(station_info["swiss_northing"]),                       # 1 — CH1903 northing (m)
         # Aspect angles — sin/cos encoding is correct for cyclic compass directions
-        sin_asp2k,  cos_asp2k,                                      # 2 — local aspect
-        sin_asp10k, cos_asp10k,                                     # 2 — regional aspect
+        sin_asp2k,  cos_asp2k,                                       # 2 — local aspect
+        sin_asp10k, cos_asp10k,                                      # 2 — regional aspect
         # Scalar topographic features (all normalised by caller)
-        float(station_info["station_height"]),                      # 1 — sensor elevation
-        float(station_info["dem"]),                                 # 1 — DEM elevation
-        float(station_info["TPI_2000M"]),                           # 1 — valley(−) vs ridge(+)
-        float(station_info["SLOPE_2000M_SIGRATIO1"]),               # 1 — local slope steepness
-        float(station_info["SLOPE_10000M_SIGRATIO1"]),              # 1 — regional slope steepness
-        float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),       # 1 — S-N gradient local
-        float(station_info["SN_DERIVATIVE_10000M_SIGRATIO1"]),      # 1 — S-N gradient regional
-        float(station_info["WE_DERIVATIVE_2000M_SIGRATIO1"]),       # 1 — W-E gradient (Föhn)
-    ]   # total: 2 + 4 + 8 = 14
+        float(station_info["station_height"]),                       # 1 — sensor elevation
+        float(station_info["dem"]),                                  # 1 — DEM elevation
+        float(station_info["TPI_2000M"]),                            # 1 — valley(−) vs ridge(+)
+        float(station_info["SLOPE_2000M_SIGRATIO1"]),                # 1 — local slope steepness
+        float(station_info["SLOPE_10000M_SIGRATIO1"]),               # 1 — regional slope steepness
+        float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — S-N gradient local
+        float(station_info["SN_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — S-N gradient regional
+        float(station_info["WE_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — W-E gradient local (Föhn)
+        float(station_info["WE_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — W-E gradient regional
+    ]   # total: 2 + 4 + 9 = 15
 
     return torch.tensor(features, dtype=torch.float32)
 
@@ -159,7 +167,7 @@ def encode_temporal(ts: pd.Timestamp) -> float:
 
 class SpatialEmbedding(nn.Module):
     """
-    Projects static station metadata (18-dim) into d_model space via a 2-layer MLP.
+    Projects static station metadata (15-dim) into d_model space via a 2-layer MLP.
 
     Usage note:
         Spatial features are fixed per station. Pre-encode all stations with
@@ -169,7 +177,7 @@ class SpatialEmbedding(nn.Module):
 
     Args:
         d_model:    Transformer model dimension.
-        input_dim:  Dimensionality of encode_spatial_static output (default 14).
+        input_dim:  Dimensionality of encode_spatial_static output (default 15).
     """
 
     def __init__(self, d_model: int, input_dim: int = SPATIAL_INPUT_DIM):
@@ -177,13 +185,14 @@ class SpatialEmbedding(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
+            nn.LayerNorm(d_model),   # stabilises scale before second linear
             nn.Linear(d_model, d_model),
         )
 
     def forward(self, spatial_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            spatial_features: (N, 14) or (B, N, 14)
+            spatial_features: (N, 15) or (B, N, 15)
                               Should be normalised before calling.
         Returns:
             (N, d_model) or (B, N, d_model)
@@ -237,6 +246,7 @@ class TemporalEmbedding(nn.Module):
         self.proj = nn.Sequential(
             nn.Linear(fourier_dim, d_model),
             nn.GELU(),
+            nn.LayerNorm(d_model),   # stabilises scale before second linear
             nn.Linear(d_model, d_model),
         )
 
@@ -266,7 +276,20 @@ class TemporalEmbedding(nn.Module):
 
 class DeltaTimeEmbedding(nn.Module):
     """
-    Learned embedding table for discrete forecast lead-time steps.
+    Fourier-based lead-time embedding for forecast horizons.
+
+    Replaces the previous discrete lookup table with a continuous sinusoidal
+    encoding that is consistent with TemporalEmbedding's design.
+
+    Each integer delta_steps is first converted to hours
+    (hours = delta_steps × step_size_h), then encoded with log-spaced Fourier
+    features spanning [lambda_min, lambda_max], and projected to d_model
+    via a 2-layer MLP.
+
+    Advantages over a lookup table:
+      - Generalises to unseen horizons (extrapolation beyond max_steps).
+      - Consistent encoding philosophy with TemporalEmbedding.
+      - No upper bound on delta_steps baked into the architecture.
 
     step = 0  →  reconstruction  (target time == input time t)
     step = k  →  forecast k × 10 minutes ahead of t
@@ -274,26 +297,56 @@ class DeltaTimeEmbedding(nn.Module):
     Used exclusively in the decoder. The encoder never uses this.
 
     Args:
-        d_model:    Transformer model dimension.
-        max_steps:  Maximum forecast horizon in 10-minute steps (default 36 = 6 h).
+        d_model:      Transformer model dimension.
+        fourier_dim:  Total Fourier feature dimension (must be even; default 16).
+                      Gives fourier_dim // 2 distinct wavelengths.
+        lambda_min:   Shortest wavelength in hours (default 10 min = 1/6 h).
+        lambda_max:   Longest  wavelength in hours (default 8 h — beyond 6 h horizon).
+        step_size_h:  Duration of one step in hours (default 1/6 for 10-min steps).
     """
 
-    def __init__(self, d_model: int, max_steps: int = 36):
+    def __init__(
+        self,
+        d_model:      int   = 128,
+        fourier_dim:  int   = DELTA_FOURIER_DIM,
+        lambda_min:   float = 1.0 / 6.0,    # 10 minutes in hours
+        lambda_max:   float = 8.0,           # 8 hours — buffer beyond 6 h max horizon
+        step_size_h:  float = 1.0 / 6.0,    # each step = 10 minutes = 1/6 h
+    ):
         super().__init__()
-        self.embedding = nn.Embedding(max_steps + 1, d_model)  # +1 for step=0
-        self.max_steps = max_steps
+        assert fourier_dim % 2 == 0, "fourier_dim must be even"
+        self.fourier_dim  = fourier_dim
+        self.step_size_h  = step_size_h
+
+        # Non-trainable log-spaced wavelengths: (fourier_dim // 2,)
+        n_wl = fourier_dim // 2
+        lambdas = torch.exp(
+            torch.linspace(math.log(lambda_min), math.log(lambda_max), n_wl)
+        )
+        self.register_buffer("lambdas", lambdas)
+
+        # MLP: fourier_dim → d_model → d_model  (matches TemporalEmbedding structure)
+        self.proj = nn.Sequential(
+            nn.Linear(fourier_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+        )
 
     def forward(self, delta_steps: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            delta_steps: (B,) integer tensor, values in [0, max_steps].
+            delta_steps: (B,) integer tensor of lead-time steps (≥ 0).
         Returns:
             (B, d_model)
         """
-        assert delta_steps.max() <= self.max_steps, (
-            f"delta_steps contains {delta_steps.max()} > max_steps={self.max_steps}"
-        )
-        return self.embedding(delta_steps)
+        # Convert discrete steps to continuous hours
+        hours  = delta_steps.float() * self.step_size_h          # (B,)
+        x      = hours.unsqueeze(-1)                              # (B, 1)
+        angles = 2.0 * math.pi * x / self.lambdas                # (B, n_wl)
+        fourier = torch.cat([torch.cos(angles),
+                             torch.sin(angles)], dim=-1)          # (B, fourier_dim)
+        return self.proj(fourier)                                  # (B, d_model)
 
 
 class VariableProjection(nn.Module):
@@ -301,12 +354,22 @@ class VariableProjection(nn.Module):
     Projects raw meteorological measurements into d_model space.
 
     Each variable has its own scalar-to-d_model linear projection plus a
-    learned type embedding encoding variable identity. Contributions from
+    learned type embedding encoding variable identity.  Contributions from
     present variables are summed and averaged, making the token representation
     invariant to how many sensors a station has.
 
     Missing variables (mask == 0) are excluded so the model cannot confuse
     a true zero measurement with an absent sensor.
+
+    Implementation note:
+        Variables are projected in a single vectorised operation:
+            proj[b, n, v] = x[b, n, v] * var_weights[v] + var_biases[v]
+        This replaces the previous Python loop over V separate Linear modules,
+        reducing the number of kernel dispatches from V to 1.
+
+        NOTE: parameter names changed from ``var_projections.{v}.{weight,bias}``
+        to ``var_weights`` / ``var_biases`` — checkpoints saved before this
+        change are not directly compatible.
 
     Args:
         num_vars:  Number of meteorological variables (default 6).
@@ -318,12 +381,13 @@ class VariableProjection(nn.Module):
         self.num_vars = num_vars
         self.d_model  = d_model
 
-        # One linear projection per variable: scalar → d_model
-        self.var_projections = nn.ModuleList([
-            nn.Linear(1, d_model) for _ in range(num_vars)
-        ])
+        # Batched per-variable linear: var_weights[v] projects x[..., v] → d_model
+        # Equivalent to num_vars independent Linear(1, d_model) modules but vectorised.
+        self.var_weights = nn.Parameter(torch.empty(num_vars, d_model))
+        self.var_biases  = nn.Parameter(torch.zeros(num_vars, d_model))
+        nn.init.xavier_uniform_(self.var_weights)
 
-        # Learned type embedding: encodes which variable this is
+        # Learned type embedding: one d_model vector per variable identity
         self.var_type_embedding = nn.Embedding(num_vars, d_model)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -335,21 +399,17 @@ class VariableProjection(nn.Module):
         Returns:
             (B, N, d_model)
         """
-        B, N, V = x.shape
-        device  = x.device
+        # Per-variable linear: (B, N, V, 1) * (V, d_model) → (B, N, V, d_model)
+        proj = x.unsqueeze(-1) * self.var_weights + self.var_biases   # (B, N, V, d_model)
 
-        out    = torch.zeros(B, N, self.d_model, device=device)
-        counts = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)   # (B, N, 1)
+        # Add variable-identity embedding; var_type_embedding.weight is (V, d_model)
+        proj = proj + self.var_type_embedding.weight                   # (B, N, V, d_model)
 
-        for v in range(self.num_vars):
-            present  = mask[..., v]                               # (B, N)
-            value    = x[..., v].unsqueeze(-1)                    # (B, N, 1)
-            proj     = self.var_projections[v](value)             # (B, N, d_model)
-            idx      = torch.full((B, N), v, dtype=torch.long, device=device)
-            type_emb = self.var_type_embedding(idx)               # (B, N, d_model)
-            out     += present.unsqueeze(-1) * (proj + type_emb)
+        # Zero out absent sensors and average over present variables
+        counts = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)        # (B, N, 1)
+        out    = (proj * mask.unsqueeze(-1)).sum(dim=-2) / counts      # (B, N, d_model)
 
-        return out / counts                                       # (B, N, d_model)
+        return out
 
 
 # ---------------------------------------------------------------------------
@@ -363,11 +423,11 @@ def compute_spatial_normalization(
     Compute per-feature mean and std across all stations for normalisation.
 
     Args:
-        all_spatial_features: (N_stations, 14) from encode_spatial_static.
+        all_spatial_features: (N_stations, 15) from encode_spatial_static.
 
     Returns:
-        mean: (18,)
-        std:  (18,) — clamped to avoid division by zero.
+        mean: (15,)
+        std:  (15,) — clamped to avoid division by zero.
     """
     mean = all_spatial_features.mean(dim=0)
     std  = all_spatial_features.std(dim=0).clamp(min=1e-6)

@@ -29,6 +29,7 @@ Config keys (passed as dict `cfg`)
     grad_clip       float   (default 1.0)
 """
 
+import csv
 import math
 import os
 import time
@@ -245,6 +246,9 @@ def train(
         <save_dir>/epoch_{N:03d}.pt   — after every epoch
         <save_dir>/best.pt            — best validation loss
 
+    A CSV loss log is written to:
+        <save_dir>/logs.csv           — columns: epoch, train_loss, val_loss, val_rmse
+
     The checkpoint dict contains:
         epoch, model_state_dict, optimizer_state_dict,
         scheduler_state_dict, train_loss, val_loss (or None)
@@ -259,6 +263,15 @@ def train(
     use_amp       = cfg.get("amp",           True) and device.type in ("cuda", "mps")
 
     os.makedirs(save_dir, exist_ok=True)
+
+    # ---- CSV loss log --------------------------------------------------
+    log_path = os.path.join(save_dir, "logs.csv")
+    _write_log_header = not os.path.exists(log_path)   # don't overwrite on resume
+    log_file = open(log_path, "a", newline="")
+    log_writer = csv.writer(log_file)
+    if _write_log_header:
+        log_writer.writerow(["epoch", "train_loss", "val_loss", "val_rmse"])
+        log_file.flush()
 
     optimizer = build_optimizer(model, lr=lr, weight_decay=weight_decay)
 
@@ -280,33 +293,50 @@ def train(
         )
 
         # ---- Validation ------------------------------------------------
-        val_loss = None
+        val_loss = None     # MSE — same scale as train_loss
+        val_rmse = None     # RMSE — interpretable in normalised units
         if val_loader is not None:
             from engine.evaluate import evaluate   # lazy import to avoid circulars
             metrics  = evaluate(model, val_loader, device)
-            val_loss = metrics.get("overall_rmse", float("nan"))
+            val_loss = metrics.get("avg_loss",    float("nan"))
+            val_rmse = metrics.get("overall_rmse", float("nan"))
 
         # ---- Logging ---------------------------------------------------
-        elapsed = time.time() - t_epoch
-        val_str = f"  val_rmse {val_loss:.5f}" if val_loss is not None else ""
+        elapsed  = time.time() - t_epoch
+        val_str  = (
+            f"  val_loss {val_loss:.5f}  val_rmse {val_rmse:.5f}"
+            if val_loss is not None else ""
+        )
         print(
             f"Epoch {epoch:3d}/{epochs}  "
             f"train_loss {train_loss:.5f}{val_str}  "
             f"({elapsed:.1f}s)"
         )
 
+        # ---- CSV log ---------------------------------------------------
+        log_writer.writerow([
+            epoch,
+            f"{train_loss:.6f}",
+            f"{val_loss:.6f}"  if val_loss is not None else "",
+            f"{val_rmse:.6f}"  if val_rmse is not None else "",
+        ])
+        log_file.flush()
+
         # ---- Checkpointing ---------------------------------------------
         ckpt = {
-            "epoch":               epoch,
-            "model_state_dict":    model.state_dict(),
+            "epoch":                epoch,
+            "model_state_dict":     model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "scheduler_state_dict": scheduler.state_dict(),
-            "train_loss":          train_loss,
-            "val_loss":            val_loss,
+            "train_loss":           train_loss,
+            "val_loss":             val_loss,   # MSE
+            "val_rmse":             val_rmse,   # RMSE
         }
         torch.save(ckpt, os.path.join(save_dir, f"epoch_{epoch:03d}.pt"))
 
         if val_loss is not None and val_loss < best_val:
             best_val = val_loss
             torch.save(ckpt, os.path.join(save_dir, "best.pt"))
-            print(f"  ✓ New best val_rmse: {best_val:.5f} — saved best.pt")
+            print(f"  ✓ New best val_loss: {best_val:.5f} (MSE) — saved best.pt")
+
+    log_file.close()
