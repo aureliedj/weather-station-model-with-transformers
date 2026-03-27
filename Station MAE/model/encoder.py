@@ -120,7 +120,7 @@ class StationMAEEncoder(nn.Module):
         dropout:       Dropout rate (default 0.1).
         mask_ratio:    Fraction of stations to mask (default 0.5).
         num_vars:      Number of meteorological variables (default 6).
-        spatial_dim:   Spatial feature dimension (default 14).
+        spatial_dim:   Spatial feature dimension (default 15).
         fourier_dim:   Fourier feature dimension for TemporalEmbedding (default 32).
     """
 
@@ -164,7 +164,7 @@ class StationMAEEncoder(nn.Module):
         self,
         x:       torch.Tensor,   # (B, W, N, V)
         x_mask:  torch.Tensor,   # (B, W, N, V)
-        spatial: torch.Tensor,   # (N, 14)  or  (B, N, 14)
+        spatial: torch.Tensor,   # (N, 15)  or  (B, N, 15)
         x_hours: torch.Tensor,   # (B, W)   hours-since-epoch per input step
     ) -> torch.Tensor:
         """
@@ -182,9 +182,9 @@ class StationMAEEncoder(nn.Module):
         var_tokens  = self.var_proj(x_flat, mask_flat)          # (B*W, N, d_model)
         var_tokens  = var_tokens.view(B, W, N, self.d_model)    # (B, W, N, d_model)
 
-        # --- Spatial embedding: (N, 14) → (N, d_model) → broadcast (B, 1, N, d_model) ---
+        # --- Spatial embedding: (N, 15) → (N, d_model) → broadcast (B, 1, N, d_model) ---
         if spatial.dim() == 2:
-            spatial = spatial.unsqueeze(0)                       # (1, N, 14)
+            spatial = spatial.unsqueeze(0)                       # (1, N, 15)
         spatial_emb = self.spatial_emb(spatial)                  # (1/B, N, d_model)
         spatial_emb = spatial_emb.unsqueeze(1)                   # (1/B, 1, N, d_model)
 
@@ -246,7 +246,7 @@ class StationMAEEncoder(nn.Module):
         self,
         x:       torch.Tensor,   # (B, W, N, V)
         x_mask:  torch.Tensor,   # (B, W, N, V)
-        spatial: torch.Tensor,   # (N, 14) or (B, N, 14)
+        spatial: torch.Tensor,   # (N, 15) or (B, N, 15)
         x_hours: torch.Tensor,   # (B, W)  hours-since-epoch per input timestep
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -255,7 +255,7 @@ class StationMAEEncoder(nn.Module):
         Args:
             x:        (B, W, N, V)  normalised observations
             x_mask:   (B, W, N, V)  sensor availability mask
-            spatial:  (N, 14)       normalised static station features
+            spatial:  (N, 15)       normalised static station features
             x_hours:  (B, W)        hours since epoch for each input timestep
                                     (feeds TemporalEmbedding)
 

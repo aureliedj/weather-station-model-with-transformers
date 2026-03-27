@@ -11,7 +11,7 @@ Design:
         y           : (N, V)     — target snapshot at t + delta_steps
         y_mask      : (N, V)     — sensor availability mask for target
         y_hours     : ()         — hours-since-epoch for target step (→ TemporalEmbedding)
-        spatial     : (N, 14)    — normalised static station features (same for all samples)
+        spatial     : (N, 15)    — normalised static station features (same for all samples)
         delta_steps : int        — forecast lead time in 10-min steps (0 = reconstruction)
 
     Where:
@@ -283,7 +283,7 @@ class StationMAEDataset(Dataset):
         y           (N, V)     normalised target snapshot
         y_mask      (N, V)     sensor availability for target
         y_hours     ()         hours-since-epoch for target step (→ TemporalEmbedding)
-        spatial     (N, 14)    normalised static station features
+        spatial     (N, 15)    normalised static station features
         delta_steps int        forecast lead time in 10-min steps
 
     The encoder receives the full window [W, N, V], attending across both
@@ -323,7 +323,7 @@ class StationMAEDataset(Dataset):
         # 1. Spatial features — static, shared across all samples
         # ------------------------------------------------------------------
         self.spatial, self.spatial_stats = build_spatial_features(ds)
-        # (N, 14), normalised
+        # (N, 15), normalised
 
         # ------------------------------------------------------------------
         # 2. Full observation tensor
@@ -423,6 +423,6 @@ class StationMAEDataset(Dataset):
             "y":           y,                             # (N, V)
             "y_mask":      y_mask,                        # (N, V)
             "y_hours":     y_hours,                       # ()
-            "spatial":     self.spatial,                  # (N, 14)
+            "spatial":     self.spatial,                  # (N, 15)
             "delta_steps": torch.tensor(dt, dtype=torch.long),
         }

@@ -80,7 +80,7 @@ def evaluate(
         delta_steps = batch["delta_steps"].to(device)
 
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
-            spatial = spatial[0]   # (N, 14)
+            spatial = spatial[0]   # (N, 15)
 
         # ---- Forward (includes random masking in encoder) ----------
         loss, preds, masked_idx = model(

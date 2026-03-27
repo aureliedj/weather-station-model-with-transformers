@@ -85,9 +85,8 @@ class StationMAE(nn.Module):
         num_target_vars:  Predicted variables per station (5: all except precipitation).
                           Precipitation is used as input context but excluded from the
                           loss — its zero-inflated distribution makes MSE unsuitable.
-        spatial_dim:      Static feature dimension (14).
+        spatial_dim:      Static feature dimension (15).
         fourier_dim:      Fourier feature dimension for temporal embedding (32).
-        max_delta_steps:  Maximum forecast lead-time in 10-min steps (36 = 6 h).
     """
 
     def __init__(
@@ -104,7 +103,6 @@ class StationMAE(nn.Module):
         num_target_vars:  int   = NUM_TARGET_VARIABLES,
         spatial_dim:      int   = SPATIAL_INPUT_DIM,
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
-        max_delta_steps:  int   = 36,
     ):
         super().__init__()
 
@@ -134,7 +132,6 @@ class StationMAE(nn.Module):
             num_target_vars=num_target_vars,
             spatial_dim=spatial_dim,
             fourier_dim=fourier_dim,
-            max_delta=max_delta_steps,
         )
 
     # ------------------------------------------------------------------
@@ -145,7 +142,7 @@ class StationMAE(nn.Module):
         self,
         x:           torch.Tensor,   # (B, W, N, V)   normalised input window
         x_mask:      torch.Tensor,   # (B, W, N, V)   sensor availability (1=present)
-        spatial:     torch.Tensor,   # (N, 14) or (B, N, 14)
+        spatial:     torch.Tensor,   # (N, 15) or (B, N, 15)
         x_hours:     torch.Tensor,   # (B, W)          hours-since-epoch per input step
         y:           torch.Tensor,   # (B, N, V)       normalised target snapshot
         y_mask:      torch.Tensor,   # (B, N, V)       target sensor availability

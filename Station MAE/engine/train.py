@@ -156,17 +156,17 @@ def train_one_epoch(
         # ---- Move to device ----------------------------------------
         x           = batch["x"].to(device)            # (B, W, N, V)
         x_mask      = batch["x_mask"].to(device)       # (B, W, N, V)
-        spatial     = batch["spatial"].to(device)      # (N, 14) or (B, N, 14)
+        spatial     = batch["spatial"].to(device)      # (N, 15) or (B, N, 15)
         x_hours     = batch["x_hours"].to(device)      # (B, W)
         y           = batch["y"].to(device)             # (B, N, V)
         y_mask      = batch["y_mask"].to(device)        # (B, N, V)
         y_hours     = batch["y_hours"].to(device)       # (B,)
         delta_steps = batch["delta_steps"].to(device)   # (B,)
 
-        # spatial may be (N, 14) when collated from samples sharing the same
+        # spatial may be (N, 15) when collated from samples sharing the same
         # station set — squeeze the batch dim if accidentally added
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
-            spatial = spatial[0]  # (N, 14)
+            spatial = spatial[0]  # (N, 15)
 
         # ---- Forward + loss ----------------------------------------
         optimizer.zero_grad()

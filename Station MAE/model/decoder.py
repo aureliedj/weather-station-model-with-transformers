@@ -138,7 +138,7 @@ class StationMAEDecoder(nn.Module):
     def forward(
         self,
         encoded_vis: torch.Tensor,    # (B, W*N_vis, d_model)  — encoder output
-        spatial:     torch.Tensor,    # (N, 14) or (B, N, 14)  — ALL N stations
+        spatial:     torch.Tensor,    # (N, 15) or (B, N, 15)  — ALL N stations
         y_hours:     torch.Tensor,    # (B,)   hours since epoch for target step
         delta_steps: torch.Tensor,    # (B,)   integer forecast lead-time
     ) -> torch.Tensor:
@@ -147,7 +147,7 @@ class StationMAEDecoder(nn.Module):
 
         Args:
             encoded_vis:  (B, W*N_vis, d_model)  encoder output (visible tokens)
-            spatial:      (N, 14) or (B, N, 14)  static features for ALL N stations
+            spatial:      (N, 15) or (B, N, 15)  static features for ALL N stations
             y_hours:      (B,)                   target time as hours since epoch
             delta_steps:  (B,)                   forecast horizon in 10-min steps
                                                   (0 = pure reconstruction)
@@ -162,10 +162,10 @@ class StationMAEDecoder(nn.Module):
         # --- Resolve spatial shape ---
         if spatial.dim() == 2:
             N         = spatial.size(0)
-            spatial_b = spatial.unsqueeze(0).expand(B, -1, -1)   # (B, N, 14)
+            spatial_b = spatial.unsqueeze(0).expand(B, -1, -1)   # (B, N, 15)
         else:
             N         = spatial.size(1)
-            spatial_b = spatial                                   # (B, N, 14)
+            spatial_b = spatial                                   # (B, N, 15)
 
         # ------------------------------------------------------------------
         # 1. Build station query tokens for the target timestep
