@@ -1,13 +1,14 @@
 # model/__init__.py
 from .embeddings import (
     # Embedding modules
-    SpatialEmbedding,
-    TemporalEmbedding,        # multi-scale Fourier encoding (Aurora-inspired)
-    DeltaTimeEmbedding,
-    VariableProjection,
+    PositionalEmbedding,     # p1 — Fourier 2D positional (easting/northing)
+    StationEmbedding,        # p2 — MLP over topographic characteristics
+    TemporalEmbedding,       # t  — multi-scale Fourier encoding (Aurora-inspired)
+    DeltaTimeEmbedding,      # Δt — Fourier lead-time encoding [decoder only]
+    VariableProjection,      # v  — per-variable measurement projection
     # Helper functions
     encode_spatial_static,
-    encode_temporal,          # returns hours-since-epoch float for TemporalEmbedding
+    encode_temporal,
     compute_spatial_normalization,
     # Constants
     VARIABLE_NAMES,
@@ -16,6 +17,9 @@ from .embeddings import (
     NUM_TARGET_VARIABLES,
     SPATIAL_FEATURE_NAMES,
     SPATIAL_INPUT_DIM,
+    POSITION_DIM,
+    STATION_CHAR_DIM,
+    POSITION_FOURIER_DIM,
     TEMPORAL_FOURIER_DIM,
     DELTA_FOURIER_DIM,
 )
@@ -28,7 +32,8 @@ __all__ = [
     "StationMAEEncoder",
     "StationMAEDecoder",
     "TransformerBlock",
-    "SpatialEmbedding",
+    "PositionalEmbedding",
+    "StationEmbedding",
     "TemporalEmbedding",
     "DeltaTimeEmbedding",
     "VariableProjection",
@@ -41,6 +46,9 @@ __all__ = [
     "NUM_TARGET_VARIABLES",
     "SPATIAL_FEATURE_NAMES",
     "SPATIAL_INPUT_DIM",
+    "POSITION_DIM",
+    "STATION_CHAR_DIM",
+    "POSITION_FOURIER_DIM",
     "TEMPORAL_FOURIER_DIM",
     "DELTA_FOURIER_DIM",
 ]

@@ -3,21 +3,31 @@ model/embeddings.py
 
 Embedding modules for Station-MAE.
 
-  - SpatialEmbedding    : static station metadata (lat/lon/topo) → d_model
-  - TemporalEmbedding   : multi-scale Fourier time encoding       → d_model
-  - DeltaTimeEmbedding  : forecast lead-time steps                → d_model  [decoder only]
-  - VariableProjection  : per-variable measurement values         → d_model
+Each token is the sum of four independent components:
 
-Temporal encoding design (inspired by Aurora, Price et al. 2024 Section B.4):
-    Time is represented as hours since the Unix epoch (a single float).  The
-    TemporalEmbedding module expands this scalar into log-spaced Fourier features
-    spanning λ_min (10 min) to λ_max (1 year), then projects to d_model via a
-    2-layer MLP.  This lets the model jointly discover sub-daily, weekly, monthly
-    and seasonal patterns without hard-coding the relevant periods.
+  p1  PositionalEmbedding  : 2-D station coordinates (easting, northing)   → d_model
+                              Fourier-based: same philosophy as TemporalEmbedding
+                              but over space rather than time.
+  p2  StationEmbedding     : 13-D topographic / physical characteristics    → d_model
+                              (aspect sin/cos, elevation, slope, TPI, gradients)
+                              Plain 2-layer MLP — features are heterogeneous scalars.
+  v   VariableProjection   : per-variable measurements                      → d_model
+  t   TemporalEmbedding    : multi-scale Fourier time encoding               → d_model
 
-    Formula:  Emb(x) = [cos(2πx/λ_i), sin(2πx/λ_i)]  for i = 0 … D/2 − 1
-              λ_i = exp(log λ_min + i·(log λ_max − log λ_min) / (D/2 − 1))
-              x   = hours elapsed since 1970-01-01 00:00 UTC
+Separating p1 from p2 lets the model learn pure location-based priors (e.g.
+Föhn gaps in the Alps vs. Plateau stations) independently from the physical
+characteristics of each site, and uses a principled continuous encoding for
+the geographic position rather than treating coordinates as plain scalars.
+
+Fourier encoding design (shared by PositionalEmbedding, TemporalEmbedding,
+DeltaTimeEmbedding — inspired by Aurora, Price et al. 2024 Section B.4):
+
+    Emb(x) = [cos(2πx/λ_i), sin(2πx/λ_i)]  for i = 0 … D/2 − 1
+    λ_i = exp(log λ_min + i·(log λ_max − log λ_min) / (D/2 − 1))
+
+    PositionalEmbedding : x = normalised easting or northing (each independently)
+    TemporalEmbedding   : x = hours since 1970-01-01 00:00 UTC
+    DeltaTimeEmbedding  : x = forecast lead-time in hours
 """
 
 import math
@@ -66,16 +76,34 @@ SPATIAL_FEATURE_NAMES = [
     "WE_DERIVATIVE_10000M_SIGRATIO1",   # regional W-E gradient (Föhn / valley flow)
 ]
 
-# Output dimension of encode_spatial_static:
-#   swiss_easting / swiss_northing → 1 each (plain scalar, normalised)
-#   aspect 2km / 10km              → 2 each (sin/cos — genuinely cyclic angles)
-#   scalars                        → 9 (station_height, dem, tpi, 2×slope, 2×sn_deriv, 2×we_deriv)
-# Total: 2 + 4 + 9 = 15
+# Layout of the spatial feature tensor (N, 15) produced by build_spatial_features:
+#
+#   Columns 0:2   — swiss_easting, swiss_northing  → consumed by PositionalEmbedding (p1)
+#   Columns 2:15  — topographic characteristics     → consumed by StationEmbedding   (p2)
+#       2,3   sin/cos aspect 2km
+#       4,5   sin/cos aspect 10km
+#       6     station_height
+#       7     dem
+#       8     TPI_2000M
+#       9     SLOPE_2000M
+#       10    SLOPE_10000M
+#       11    SN_DERIVATIVE_2000M
+#       12    SN_DERIVATIVE_10000M
+#       13    WE_DERIVATIVE_2000M
+#       14    WE_DERIVATIVE_10000M
 #
 # NOTE: Swiss LV95/LV03 coordinates are Cartesian (metres), not angles.
-# Sin/cos encoding would be meaningless at that scale (~2.6M m easting → ~45k rad).
-# Simple zero-mean unit-variance normalisation is the correct treatment.
-SPATIAL_INPUT_DIM = 15
+# After normalisation they live in roughly [-3, 3]; Fourier features in that
+# domain cover spatial scales from ~10 km (local) to ~850 km (supra-national).
+SPATIAL_INPUT_DIM  = 15   # total spatial features per station
+POSITION_DIM       = 2    # columns 0:2  — easting, northing
+STATION_CHAR_DIM   = 13   # columns 2:15 — topographic characteristics
+
+# Fourier feature dimension for PositionalEmbedding (per coordinate).
+# 16 features per coordinate (8 wavelengths), two coordinates → 32 total Fourier
+# features fed to the projection MLP.
+# λ_min=0.1 ≈ 8.5 km, λ_max=10 ≈ 850 km in normalised-coordinate space.
+POSITION_FOURIER_DIM = 16
 
 # Fourier feature dimension for TemporalEmbedding.
 # Must be even: TEMPORAL_FOURIER_DIM // 2 wavelengths are used.
@@ -97,10 +125,14 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
     """
     Encode static station metadata into a 15-dimensional feature vector.
 
-    Cyclic variables (latitude, longitude, aspects) are sin/cos encoded.
-    Scalar topographic features are returned as-is and should be normalised
-    (zero-mean, unit-variance across stations) before being passed to
-    SpatialEmbedding.
+    The output layout matches SPATIAL_INPUT_DIM = 15:
+        columns  0:2  → easting, northing  (consumed by PositionalEmbedding p1)
+        columns 2:15  → characteristics    (consumed by StationEmbedding     p2)
+
+    Aspect angles are sin/cos encoded (genuinely cyclic).
+    All other features are plain scalars and should be normalised
+    (zero-mean, unit-variance across stations) before being passed to the
+    embedding modules.
 
     Args:
         station_info: dict-like with keys matching SPATIAL_FEATURE_NAMES
@@ -122,21 +154,21 @@ def encode_spatial_static(station_info: dict) -> torch.Tensor:
         # These are NOT angles: sin/cos would be meaningless at ~2.6 M metre scale.
         # Kept as plain scalars; normalised (zero-mean, unit-var) across the station
         # population by the caller (build_spatial_features / compute_spatial_normalization).
-        float(station_info["swiss_easting"]),                        # 1 — CH1903 easting  (m)
-        float(station_info["swiss_northing"]),                       # 1 — CH1903 northing (m)
+        float(station_info["swiss_easting"]),                        # 1 — CH1903 easting  (m) **
+        float(station_info["swiss_northing"]),                       # 1 — CH1903 northing (m) **
         # Aspect angles — sin/cos encoding is correct for cyclic compass directions
         sin_asp2k,  cos_asp2k,                                       # 2 — local aspect
         sin_asp10k, cos_asp10k,                                      # 2 — regional aspect
         # Scalar topographic features (all normalised by caller)
-        float(station_info["station_height"]),                       # 1 — sensor elevation
-        float(station_info["dem"]),                                  # 1 — DEM elevation
-        float(station_info["TPI_2000M"]),                            # 1 — valley(−) vs ridge(+)
-        float(station_info["SLOPE_2000M_SIGRATIO1"]),                # 1 — local slope steepness
-        float(station_info["SLOPE_10000M_SIGRATIO1"]),               # 1 — regional slope steepness
-        float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — S-N gradient local
-        float(station_info["SN_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — S-N gradient regional
-        float(station_info["WE_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — W-E gradient local (Föhn)
-        float(station_info["WE_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — W-E gradient regional
+        float(station_info["station_height"]),                       # 1 — sensor elevation ***
+        float(station_info["dem"]),                                  # 1 — DEM elevation    ***
+        float(station_info["TPI_2000M"]),                            # 1 — valley(−) vs ridge(+) ***
+        float(station_info["SLOPE_2000M_SIGRATIO1"]),                # 1 — local slope steepness ***
+        float(station_info["SLOPE_10000M_SIGRATIO1"]),               # 1 — regional slope steepness ***
+        float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — S-N gradient local   ***
+        float(station_info["SN_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — S-N gradient regional    ***
+        float(station_info["WE_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — W-E gradient local (Föhn) ***
+        float(station_info["WE_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — W-E gradient regional ***
     ]   # total: 2 + 4 + 9 = 15
 
     return torch.tensor(features, dtype=torch.float32)
@@ -165,22 +197,110 @@ def encode_temporal(ts: pd.Timestamp) -> float:
 # nn.Module embeddings
 # ---------------------------------------------------------------------------
 
-class SpatialEmbedding(nn.Module):
+class PositionalEmbedding(nn.Module):
     """
-    Projects static station metadata (15-dim) into d_model space via a 2-layer MLP.
+    Fourier-based 2-D positional embedding for Swiss LV95 station coordinates (p1).
 
-    Usage note:
-        Spatial features are fixed per station. Pre-encode all stations with
-        encode_spatial_static(), normalise the scalar features across the
-        station population, then call this module once to obtain a cached
-        (N, d_model) tensor that is reused every forward pass.
+    After normalisation across the station population, easting and northing
+    are each independently expanded into log-spaced Fourier features
+    (POSITION_FOURIER_DIM features per coordinate).  The two sets of features
+    are concatenated and projected to d_model via a 2-layer MLP.
+
+    This mirrors TemporalEmbedding's design: a continuous scalar domain
+    (normalised metres) mapped to sinusoids at multiple spatial scales,
+    letting the model learn pure location-based priors (e.g. Föhn gaps,
+    Alpine vs. Plateau regimes) without encoding them into the topographic
+    characteristics embedding.
+
+    Wavelengths span λ_min ≈ 8.5 km to λ_max ≈ 850 km in normalised-coordinate
+    space (assuming σ_easting ≈ 85 km, σ_northing ≈ 55 km).
+
+    The spatial tensor layout is:
+        spatial[:, 0]  = normalised easting
+        spatial[:, 1]  = normalised northing
+        spatial[:, 2:] = topographic characteristics  (→ StationEmbedding)
+
+    Args:
+        d_model:      Transformer model dimension.
+        fourier_dim:  Fourier features per coordinate (must be even; default 16).
+                      Total input to the MLP = 2 × fourier_dim.
+        lambda_min:   Shortest wavelength in normalised-coordinate units (default 0.1).
+        lambda_max:   Longest  wavelength in normalised-coordinate units (default 10.0).
+    """
+
+    def __init__(
+        self,
+        d_model:     int   = 128,
+        fourier_dim: int   = POSITION_FOURIER_DIM,
+        lambda_min:  float = 0.1,    # ≈ 8.5 km (local station-spacing scale)
+        lambda_max:  float = 10.0,   # ≈ 850 km (supra-national scale)
+    ):
+        super().__init__()
+        assert fourier_dim % 2 == 0, "fourier_dim must be even"
+        self.fourier_dim = fourier_dim
+
+        # Non-trainable log-spaced wavelengths: (fourier_dim // 2,)
+        n_wl = fourier_dim // 2
+        lambdas = torch.exp(
+            torch.linspace(math.log(lambda_min), math.log(lambda_max), n_wl)
+        )
+        self.register_buffer("lambdas", lambdas)  # (n_wl,)
+
+        # MLP: (2 × fourier_dim) → d_model → d_model
+        # Two coordinates × fourier_dim features each = 2 × fourier_dim input
+        self.proj = nn.Sequential(
+            nn.Linear(2 * fourier_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+        )
+
+    def _fourier_1d(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Expand a scalar coordinate into Fourier features.
+
+        Args:
+            x: (...) float tensor of normalised coordinate values.
+        Returns:
+            (..., fourier_dim) — [cos, sin] interleaved over wavelengths.
+        """
+        x = x.unsqueeze(-1)                                  # (..., 1)
+        angles = 2.0 * math.pi * x / self.lambdas            # (..., n_wl)
+        return torch.cat([torch.cos(angles),
+                          torch.sin(angles)], dim=-1)         # (..., fourier_dim)
+
+    def forward(self, pos: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pos: (..., 2) float tensor — normalised [easting, northing].
+                 Typically (N, 2) or (B, N, 2).
+        Returns:
+            (..., d_model)
+        """
+        east_feat  = self._fourier_1d(pos[..., 0])            # (..., fourier_dim)
+        north_feat = self._fourier_1d(pos[..., 1])            # (..., fourier_dim)
+        fourier    = torch.cat([east_feat, north_feat], dim=-1)  # (..., 2*fourier_dim)
+        return self.proj(fourier)                              # (..., d_model)
+
+
+class StationEmbedding(nn.Module):
+    """
+    Projects the 13-D station characteristic features into d_model space (p2).
+
+    This covers the heterogeneous topographic and physical scalars:
+        sin/cos aspect (2km & 10km), station_height, dem, TPI, slope (2km & 10km),
+        S-N derivative (2km & 10km), W-E derivative (2km & 10km).
+
+    A 2-layer MLP with an intermediate LayerNorm is used rather than Fourier
+    encoding because the features are heterogeneous (different units, ranges,
+    and semantics) and do not share a common 1-D continuous domain.
 
     Args:
         d_model:    Transformer model dimension.
-        input_dim:  Dimensionality of encode_spatial_static output (default 15).
+        input_dim:  Number of station characteristics (default STATION_CHAR_DIM = 13).
     """
 
-    def __init__(self, d_model: int, input_dim: int = SPATIAL_INPUT_DIM):
+    def __init__(self, d_model: int, input_dim: int = STATION_CHAR_DIM):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(input_dim, d_model),
@@ -189,15 +309,15 @@ class SpatialEmbedding(nn.Module):
             nn.Linear(d_model, d_model),
         )
 
-    def forward(self, spatial_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, char_features: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            spatial_features: (N, 15) or (B, N, 15)
-                              Should be normalised before calling.
+            char_features: (..., 13) normalised station characteristic features.
+                           Typically (N, 13) or (B, N, 13).
         Returns:
-            (N, d_model) or (B, N, d_model)
+            (..., d_model)
         """
-        return self.proj(spatial_features)
+        return self.proj(char_features)
 
 
 class TemporalEmbedding(nn.Module):

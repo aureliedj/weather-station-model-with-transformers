@@ -42,10 +42,12 @@ import torch
 import torch.nn as nn
 
 from .embeddings import (
-    SpatialEmbedding,
+    PositionalEmbedding,
+    StationEmbedding,
     TemporalEmbedding,
     DeltaTimeEmbedding,
-    SPATIAL_INPUT_DIM,
+    POSITION_FOURIER_DIM,
+    STATION_CHAR_DIM,
     TEMPORAL_FOURIER_DIM,
     DELTA_FOURIER_DIM,
     NUM_VARIABLES,
@@ -59,55 +61,61 @@ class StationMAEDecoder(nn.Module):
     MAE decoder for weather station reconstruction and forecasting.
 
     Args:
-        d_model:           Model dimension — must match encoder d_model.
-        num_heads:         Attention heads (default 4).
-        num_layers:        Transformer blocks (default 2; lighter than encoder).
-        mlp_ratio:         FFN hidden-dim ratio (default 4.0).
-        dropout:           Dropout rate (default 0.1).
-        num_vars:          Input variables per station (default 6, used by encoder).
-        num_target_vars:   Variables to predict per station (default 5, excludes
-                           precipitation which is used as input only).
-        spatial_dim:       Static feature dimension (default 15).
-        fourier_dim:       Fourier dimension for TemporalEmbedding (default 32).
-        delta_fourier_dim: Fourier dimension for DeltaTimeEmbedding (default 16).
+        d_model:              Model dimension — must match encoder d_model.
+        num_heads:            Attention heads (default 4).
+        num_layers:           Transformer blocks (default 2; lighter than encoder).
+        mlp_ratio:            FFN hidden-dim ratio (default 4.0).
+        dropout:              Dropout rate (default 0.1).
+        num_vars:             Input variables per station (default 6).
+        num_target_vars:      Variables to predict per station (default 5, excludes
+                              precipitation which is used as input only).
+        station_char_dim:     Dimension of station characteristic features p2 (default 13).
+        fourier_dim:          Fourier dimension for TemporalEmbedding (default 32).
+        delta_fourier_dim:    Fourier dimension for DeltaTimeEmbedding (default 16).
+        position_fourier_dim: Fourier features per coordinate for PositionalEmbedding (default 16).
     """
 
     def __init__(
         self,
-        d_model:           int   = 128,
-        num_heads:         int   = 4,
-        num_layers:        int   = 2,
-        mlp_ratio:         float = 4.0,
-        dropout:           float = 0.1,
-        num_vars:          int   = NUM_VARIABLES,
-        num_target_vars:   int   = NUM_TARGET_VARIABLES,
-        spatial_dim:       int   = SPATIAL_INPUT_DIM,
-        fourier_dim:       int   = TEMPORAL_FOURIER_DIM,
-        delta_fourier_dim: int   = DELTA_FOURIER_DIM,
+        d_model:              int   = 128,
+        num_heads:            int   = 4,
+        num_layers:           int   = 2,
+        mlp_ratio:            float = 4.0,
+        dropout:              float = 0.1,
+        num_vars:             int   = NUM_VARIABLES,
+        num_target_vars:      int   = NUM_TARGET_VARIABLES,
+        station_char_dim:     int   = STATION_CHAR_DIM,
+        fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
+        delta_fourier_dim:    int   = DELTA_FOURIER_DIM,
+        position_fourier_dim: int   = POSITION_FOURIER_DIM,
     ):
         super().__init__()
 
         self.d_model         = d_model
-        self.num_vars        = num_vars         # input variables (encoder side)
-        self.num_target_vars = num_target_vars  # predicted variables (head output)
+        self.num_vars        = num_vars
+        self.num_target_vars = num_target_vars
 
         # ------------------------------------------------------------------
         # Learnable mask token — shared starting point for all station queries.
-        # Position is then injected via the three positional embeddings below.
+        # Position is injected via the four embeddings below.
         # ------------------------------------------------------------------
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
         # ------------------------------------------------------------------
-        # Positional embeddings used ONLY in the decoder
+        # Positional / contextual embeddings for query token construction
+        # Token = mask_token + p1 + p2 + t + delta
         # ------------------------------------------------------------------
-        # WHERE  — same SpatialEmbedding architecture as encoder
-        self.spatial_emb  = SpatialEmbedding(d_model=d_model, input_dim=spatial_dim)
+        # p1 — WHERE (position): Fourier encoding of easting/northing
+        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim)
 
-        # WHEN   — Aurora-inspired Fourier temporal encoding for the TARGET timestep
+        # p2 — WHERE (characteristics): MLP over topographic features
+        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim)
+
+        # t  — WHEN: Aurora Fourier temporal encoding for the TARGET timestep
         self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim)
 
-        # LEAD   — Fourier encoding over continuous lead-time hours
+        # Δt — LEAD: Fourier encoding over continuous lead-time hours
         self.delta_emb    = DeltaTimeEmbedding(d_model=d_model, fourier_dim=delta_fourier_dim)
 
         # --- Post-assembly normalisation for station query tokens ---
@@ -138,7 +146,7 @@ class StationMAEDecoder(nn.Module):
     def forward(
         self,
         encoded_vis: torch.Tensor,    # (B, W*N_vis, d_model)  — encoder output
-        spatial:     torch.Tensor,    # (N, 15) or (B, N, 15)  — ALL N stations
+        spatial:     torch.Tensor,    # (N, 15) or (B, N, 15)  — [:2]=pos, [2:]=char
         y_hours:     torch.Tensor,    # (B,)   hours since epoch for target step
         delta_steps: torch.Tensor,    # (B,)   integer forecast lead-time
     ) -> torch.Tensor:
@@ -147,7 +155,9 @@ class StationMAEDecoder(nn.Module):
 
         Args:
             encoded_vis:  (B, W*N_vis, d_model)  encoder output (visible tokens)
-            spatial:      (N, 15) or (B, N, 15)  static features for ALL N stations
+            spatial:      (N, 15) or (B, N, 15)  static features for ALL N stations;
+                          columns 0:2 → easting/northing (PositionalEmbedding p1)
+                          columns 2:  → topographic characteristics (StationEmbedding p2)
             y_hours:      (B,)                   target time as hours since epoch
             delta_steps:  (B,)                   forecast horizon in 10-min steps
                                                   (0 = pure reconstruction)
@@ -159,7 +169,7 @@ class StationMAEDecoder(nn.Module):
         """
         B = encoded_vis.size(0)
 
-        # --- Resolve spatial shape ---
+        # --- Resolve spatial shape → (B, N, 15) ---
         if spatial.dim() == 2:
             N         = spatial.size(0)
             spatial_b = spatial.unsqueeze(0).expand(B, -1, -1)   # (B, N, 15)
@@ -169,25 +179,29 @@ class StationMAEDecoder(nn.Module):
 
         # ------------------------------------------------------------------
         # 1. Build station query tokens for the target timestep
-        #    query[b, n] = mask_token + spatial[n] + temporal(y_hours[b])
-        #                             + delta(delta_steps[b])
+        #    query[b,n] = mask_token
+        #               + p1: pos_emb(spatial[n, :2])       — WHERE (position)
+        #               + p2: station_emb(spatial[n, 2:])   — WHERE (characteristics)
+        #               + t:  temporal_emb(y_hours[b])       — WHEN
+        #               + Δt: delta_emb(delta_steps[b])      — LEAD
         # ------------------------------------------------------------------
 
-        # Start with shared learnable token: expand to (B, N, d_model)
-        queries = self.mask_token.expand(B, N, -1).contiguous()   # (B, N, d_model)
+        # Start with shared learnable mask token: (B, N, d_model)
+        queries = self.mask_token.expand(B, N, -1).contiguous()    # (B, N, d_model)
 
-        # Add WHERE: spatial embedding per station
-        queries = queries + self.spatial_emb(spatial_b)            # (B, N, d_model)
+        # p1 — WHERE (position): Fourier encoding of easting/northing
+        queries = queries + self.pos_emb(spatial_b[..., :2])       # (B, N, d_model)
 
-        # Add WHEN: Aurora Fourier temporal encoding for target step
-        # y_hours: (B,) → temporal_emb: (B, d_model) → broadcast over N
-        temp_emb = self.temporal_emb(y_hours)                      # (B, d_model)
-        queries  = queries + temp_emb.unsqueeze(1)                 # (B, N, d_model)
+        # p2 — WHERE (characteristics): MLP over topographic features
+        queries = queries + self.station_emb(spatial_b[..., 2:])   # (B, N, d_model)
 
-        # Add LEAD: learned delta-time embedding per sample
-        # delta_steps: (B,) → delta_emb: (B, d_model) → broadcast over N
-        delt_emb = self.delta_emb(delta_steps)                     # (B, d_model)
-        queries  = queries + delt_emb.unsqueeze(1)                 # (B, N, d_model)
+        # t — WHEN: Aurora Fourier temporal encoding for target step
+        temp_emb = self.temporal_emb(y_hours)                       # (B, d_model)
+        queries  = queries + temp_emb.unsqueeze(1)                  # (B, N, d_model)
+
+        # Δt — LEAD: Fourier delta-time embedding
+        delt_emb = self.delta_emb(delta_steps)                      # (B, d_model)
+        queries  = queries + delt_emb.unsqueeze(1)                  # (B, N, d_model)
 
         # Normalise query tokens after summation — mirrors encoder token_norm
         queries = self.query_norm(queries)                         # (B, N, d_model)

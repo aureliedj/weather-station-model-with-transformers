@@ -24,12 +24,18 @@ Variables:
 
 Usage:
     from peakweather.dataset import PeakWeatherDataset
-    from data.dataset import StationMAEDataset, load_peakweather
+    from data.dataset import StationMAEDataset, load_peakweather, compute_obs_stats
 
-    ds_peak        = load_peakweather(root="path/to/data")
-    train_dataset  = StationMAEDataset(ds_peak, window_size=12, delta_steps=6, split="train")
-    val_dataset    = StationMAEDataset(ds_peak, window_size=12, delta_steps=6, split="val")
-    loader         = DataLoader(train_dataset, batch_size=16, shuffle=True, num_workers=4)
+    ds_peak  = load_peakweather(root="path/to/data")
+    stats    = compute_obs_stats(ds_peak)   # computed once from the full dataset
+
+    train_ds = StationMAEDataset(ds_peak, window_size=12, delta_steps=6,
+                                 split="train", obs_stats=stats)
+    val_ds   = StationMAEDataset(ds_peak, window_size=12, delta_steps=6,
+                                 split="val",   obs_stats=stats)
+    test_ds  = StationMAEDataset(ds_peak, window_size=12, delta_steps=6,
+                                 split="test",  obs_stats=stats)
+    loader   = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4)
 """
 
 import math
@@ -102,6 +108,31 @@ TEST_YEARS  = [2023, 2024]
 # ---------------------------------------------------------------------------
 # PeakWeather loader
 # ---------------------------------------------------------------------------
+
+def compute_obs_stats(ds: PeakWeatherDataset) -> dict:
+    """
+    Compute observation normalisation statistics from the TRAINING split only.
+
+    Call this ONCE before constructing any split, then pass the returned dict
+    as ``obs_stats=`` to every StationMAEDataset constructor so that train,
+    val and test sets share a consistent normalisation scale derived purely
+    from training data (2017–2021), avoiding any leakage from val/test years.
+
+    Args:
+        ds: PeakWeatherDataset instance from load_peakweather().
+
+    Returns:
+        dict with keys:
+            "mean": (V,) float32 tensor — per-variable mean over training years
+            "std":  (V,) float32 tensor — per-variable std  (clamped to ≥ 1e-6)
+    """
+    obs_full, mask_full, timestamps_full = build_observations(ds)
+    train_idx = [i for i, ts in enumerate(timestamps_full) if ts.year in TRAIN_YEARS]
+    obs_train  = obs_full[train_idx]
+    mask_train = mask_full[train_idx]
+    _, stats = normalise_observations(obs_train, mask_train)
+    return stats
+
 
 def load_peakweather(root: str) -> PeakWeatherDataset:
     """
@@ -326,14 +357,30 @@ class StationMAEDataset(Dataset):
         # (N, 15), normalised
 
         # ------------------------------------------------------------------
-        # 2. Full observation tensor
+        # 2. Full observation tensor (all years)
         # ------------------------------------------------------------------
         obs_full, mask_full, timestamps_full = build_observations(ds)
         # obs_full:  (T, N, V)
         # mask_full: (T, N, V)
 
         # ------------------------------------------------------------------
-        # 3. Split by year
+        # 3. Normalisation statistics — always derived from TRAINING data only.
+        #    If obs_stats is not provided, stats are computed on the fly from
+        #    the training years (2017–2021) of obs_full.
+        #    Pass pre-computed stats (from compute_obs_stats) to avoid
+        #    reloading all observations when constructing val/test splits.
+        # ------------------------------------------------------------------
+        if obs_stats is None:
+            train_idx  = [i for i, ts in enumerate(timestamps_full)
+                          if ts.year in TRAIN_YEARS]
+            _, self.obs_stats = normalise_observations(
+                obs_full[train_idx], mask_full[train_idx]
+            )
+        else:
+            self.obs_stats = obs_stats
+
+        # ------------------------------------------------------------------
+        # 4. Split by year
         # ------------------------------------------------------------------
         year_map = {"train": TRAIN_YEARS, "val": VAL_YEARS, "test": TEST_YEARS}
         keep_years = year_map[split]
@@ -349,19 +396,14 @@ class StationMAEDataset(Dataset):
         timestamps = [timestamps_full[i] for i in indices]
 
         # ------------------------------------------------------------------
-        # 4. Normalise observations
+        # 5. Apply normalisation to split observations
         # ------------------------------------------------------------------
-        if obs_stats is None:
-            obs, self.obs_stats = normalise_observations(obs, mask)
-        else:
-            # Apply pre-computed stats (use training stats for val/test)
-            self.obs_stats = obs_stats
-            obs_norm = obs.clone()
-            for v in range(NUM_VARIABLES):
-                obs_norm[:, :, v] = (
-                    (obs[:, :, v] - obs_stats["mean"][v]) / obs_stats["std"][v]
-                ) * mask[:, :, v]
-            obs = obs_norm
+        obs_norm = obs.clone()
+        for v in range(NUM_VARIABLES):
+            obs_norm[:, :, v] = (
+                (obs[:, :, v] - self.obs_stats["mean"][v]) / self.obs_stats["std"][v]
+            ) * mask[:, :, v]
+        obs = obs_norm
 
         self.obs        = obs         # (T_split, N, V)
         self.mask       = mask        # (T_split, N, V)

@@ -49,7 +49,6 @@ from .decoder import StationMAEDecoder
 from .embeddings import (
     NUM_VARIABLES,
     NUM_TARGET_VARIABLES,
-    SPATIAL_INPUT_DIM,
     TEMPORAL_FOURIER_DIM,
 )
 
@@ -85,7 +84,6 @@ class StationMAE(nn.Module):
         num_target_vars:  Predicted variables per station (5: all except precipitation).
                           Precipitation is used as input context but excluded from the
                           loss — its zero-inflated distribution makes MSE unsuitable.
-        spatial_dim:      Static feature dimension (15).
         fourier_dim:      Fourier feature dimension for temporal embedding (32).
     """
 
@@ -101,7 +99,6 @@ class StationMAE(nn.Module):
         mask_ratio:       float = 0.5,
         num_vars:         int   = NUM_VARIABLES,
         num_target_vars:  int   = NUM_TARGET_VARIABLES,
-        spatial_dim:      int   = SPATIAL_INPUT_DIM,
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
     ):
         super().__init__()
@@ -118,7 +115,6 @@ class StationMAE(nn.Module):
             dropout=dropout,
             mask_ratio=mask_ratio,
             num_vars=num_vars,
-            spatial_dim=spatial_dim,
             fourier_dim=fourier_dim,
         )
 
@@ -130,7 +126,6 @@ class StationMAE(nn.Module):
             dropout=dropout,
             num_vars=num_vars,
             num_target_vars=num_target_vars,
-            spatial_dim=spatial_dim,
             fourier_dim=fourier_dim,
         )
 
