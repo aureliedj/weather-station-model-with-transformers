@@ -89,8 +89,10 @@ class TransformerBlock(nn.Module):
             (B, L, d_model)
         """
         # Self-attention with residual
+        # need_weights=False lets PyTorch route through F.scaled_dot_product_attention
+        # (Flash Attention on CUDA), avoiding materialising the full O(seq²) matrix.
         x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm)
+        attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
         x = x + attn_out
 
         # FFN with residual
