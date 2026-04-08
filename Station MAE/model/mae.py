@@ -19,7 +19,7 @@ Data flow
    StationMAEDecoder
         │  + spatial  +  y_hours  +  delta_steps
         ▼
-   preds  (B, N, V)
+   preds  (B, N, num_target_vars)
         │
         ▼
    _masked_loss  →  loss   (scalar, MSE on masked stations × present sensors)
@@ -32,13 +32,17 @@ must predict all variables for EVERY station at the target time (t + Δt),
 but the gradient signal flows only through the masked stations — visible
 stations are used as context, not as supervision targets.
 
-The loss is weighted by y_mask so that absent sensors (NaN originally,
-replaced with 0) never contribute to the gradient.
+Multi-delta training
+--------------------
+``forward_multi_delta`` accepts K lead-times per sample (y/y_mask of shape
+(B, K, N, V)).  The encoder runs once; the decoder runs K times.  This
+amortises the expensive O(L²) encoder attention across multiple forecast
+horizons and improves gradient diversity within each step.
 
 Inference
 ---------
-Call model.predict(…) for a no-grad forward pass that returns (B, N, V)
-predictions for all stations without computing the loss.
+Call ``model.predict(…)`` for a no-grad forward pass that returns
+(B, N, num_target_vars) predictions without computing the loss.
 """
 
 import torch
@@ -80,11 +84,9 @@ class StationMAE(nn.Module):
         mlp_ratio:        FFN hidden-dim = d_model × mlp_ratio.
         dropout:          Dropout applied in attention and FFN.
         mask_ratio:       Fraction of stations masked per sample (0–1).
-        num_vars:         Input variables per station (6: temp, pres, hum, wind_u, wind_v, precip).
-        num_target_vars:  Predicted variables per station (5: all except precipitation).
-                          Precipitation is used as input context but excluded from the
-                          loss — its zero-inflated distribution makes MSE unsuitable.
-        fourier_dim:      Fourier feature dimension for temporal embedding (32).
+        num_vars:         Input variables per station (6).
+        num_target_vars:  Predicted variables per station (5, excludes precip).
+        fourier_dim:      Fourier feature dimension for temporal embedding.
     """
 
     def __init__(
@@ -130,48 +132,100 @@ class StationMAE(nn.Module):
         )
 
     # ------------------------------------------------------------------
-    # Training forward
+    # Single-delta training forward
     # ------------------------------------------------------------------
 
     def forward(
         self,
-        x:           torch.Tensor,   # (B, W, N, V)   normalised input window
-        x_mask:      torch.Tensor,   # (B, W, N, V)   sensor availability (1=present)
+        x:           torch.Tensor,   # (B, W, N, V)
+        x_mask:      torch.Tensor,   # (B, W, N, V)
         spatial:     torch.Tensor,   # (N, 15) or (B, N, 15)
-        x_hours:     torch.Tensor,   # (B, W)          hours-since-epoch per input step
-        y:           torch.Tensor,   # (B, N, V)       normalised target snapshot
-        y_mask:      torch.Tensor,   # (B, N, V)       target sensor availability
-        y_hours:     torch.Tensor,   # (B,)             hours-since-epoch for target
-        delta_steps: torch.Tensor,   # (B,)             lead-time in 10-min steps
+        x_hours:     torch.Tensor,   # (B, W)
+        y:           torch.Tensor,   # (B, N, V)
+        y_mask:      torch.Tensor,   # (B, N, V)
+        y_hours:     torch.Tensor,   # (B,)
+        delta_steps: torch.Tensor,   # (B,)
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Full training forward pass.
+        Full training forward pass for a single lead-time per sample.
 
         Returns:
-            loss:           scalar — MSE loss on masked stations (present sensors only)
-            preds:          (B, N, num_target_vars) — predictions for all stations
-                            num_target_vars = 5 (excludes precipitation)
-            masked_indices: (B, N_masked) — which station indices were masked
+            loss:           scalar — MSE on masked stations (present sensors only)
+            preds:          (B, N, num_target_vars)
+            masked_indices: (B, N_masked)
         """
-        # 1. Encode: process visible station tokens only
-        encoded, masked_idx, visible_idx = self.encoder(
-            x, x_mask, spatial, x_hours
-        )
-        # encoded:    (B, W*N_vis, d_model)
-        # masked_idx: (B, N_masked)
-
-        # 2. Decode: predict target variables for all N stations at the target time
+        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
         preds = self.decoder(encoded, spatial, y_hours, delta_steps)
-        # preds: (B, N, num_target_vars)
 
-        # 3. Slice y and y_mask to target variables only (drop precipitation column)
-        y_target      = y[:, :, :self.num_target_vars]       # (B, N, num_target_vars)
-        y_mask_target = y_mask[:, :, :self.num_target_vars]  # (B, N, num_target_vars)
-
-        # 4. Compute loss on masked stations only
+        y_target      = y[:, :, :self.num_target_vars]
+        y_mask_target = y_mask[:, :, :self.num_target_vars]
         loss = self._masked_loss(preds, y_target, y_mask_target, masked_idx)
 
         return loss, preds, masked_idx
+
+    # ------------------------------------------------------------------
+    # Multi-delta training forward
+    # ------------------------------------------------------------------
+
+    def forward_multi_delta(
+        self,
+        x:           torch.Tensor,   # (B, W, N, V)
+        x_mask:      torch.Tensor,   # (B, W, N, V)
+        spatial:     torch.Tensor,   # (N, 15) or (B, N, 15)
+        x_hours:     torch.Tensor,   # (B, W)
+        y:           torch.Tensor,   # (B, K, N, V)
+        y_mask:      torch.Tensor,   # (B, K, N, V)
+        y_hours:     torch.Tensor,   # (B, K)
+        delta_steps: torch.Tensor,   # (B, K)  long tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Multi-delta training forward: encoder runs once, decoder runs K times.
+
+        The encoder processes the input window once (the expensive O(L²) step).
+        The decoder — which is much lighter — runs once per lead-time, producing
+        predictions for all K horizons.  The total loss is the mean over K.
+
+        This amortises the encoder cost across forecast horizons and exposes
+        the model to a diverse range of lead-times within every gradient step.
+
+        Args:
+            x, x_mask, spatial, x_hours : as in forward()
+            y:           (B, K, N, V)    — K target snapshots per sample
+            y_mask:      (B, K, N, V)    — sensor availability per target
+            y_hours:     (B, K)          — hours-since-epoch for each target
+            delta_steps: (B, K)          — lead-time (10-min steps) per target
+
+        Returns:
+            loss:           scalar — mean MSE over K lead-times
+            preds:          (B, K, N, num_target_vars)
+            masked_indices: (B, N_masked)
+        """
+        K = delta_steps.shape[1]
+
+        # ── Encoder: runs once ──────────────────────────────────────────
+        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+        # encoded: (B, W*N_vis, d_model)
+
+        # ── Decoder: runs K times ────────────────────────────────────────
+        preds_list = []
+        loss_acc   = torch.zeros(1, device=x.device, dtype=encoded.dtype).squeeze()
+
+        for k in range(K):
+            preds_k = self.decoder(
+                encoded, spatial, y_hours[:, k], delta_steps[:, k]
+            )   # (B, N, num_target_vars)
+
+            y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
+            y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
+
+            loss_k   = self._masked_loss(preds_k, y_target_k, y_mask_target_k, masked_idx)
+            loss_acc = loss_acc + loss_k
+            preds_list.append(preds_k)
+
+        loss      = loss_acc / K
+        preds_all = torch.stack(preds_list, dim=1)   # (B, K, N, num_target_vars)
+
+        return loss, preds_all, masked_idx
 
     # ------------------------------------------------------------------
     # Inference (no grad, no loss)
@@ -188,20 +242,18 @@ class StationMAE(nn.Module):
         delta_steps: torch.Tensor,
     ) -> torch.Tensor:
         """
-        Inference-only forward pass — no masking randomness (eval mode) and
-        no loss computation.
+        Inference-only forward pass — no masking randomness (eval mode).
 
         Args:
             (same shapes as forward, but y / y_mask not needed)
+            delta_steps: (B,) for single horizon, or call once per horizon.
 
         Returns:
-            preds: (B, N, num_target_vars) predictions for all stations at target time.
-                   num_target_vars = 5 (temperature, pressure, humidity, wind_u, wind_v).
+            preds: (B, N, num_target_vars) predictions for all stations.
         """
         self.eval()
         encoded, _, _ = self.encoder(x, x_mask, spatial, x_hours)
-        preds         = self.decoder(encoded, spatial, y_hours, delta_steps)
-        return preds
+        return self.decoder(encoded, spatial, y_hours, delta_steps)
 
     # ------------------------------------------------------------------
     # Loss
@@ -219,28 +271,19 @@ class StationMAE(nn.Module):
           (a) stations that were masked by the encoder, AND
           (b) sensors that were present at the target timestep (y_mask == 1).
 
-        Stations masked but with no active sensors at target time contribute
-        zero to the loss (no NaN: denominator is clamped to ≥ 1).
-
-        Returns:
-            scalar loss tensor.
+        Returns a scalar.
         """
         B, N, V = preds.shape
 
-        # Binary mask over stations: True where station was masked
-        # scatter_ places True at positions given by masked_indices along dim 1
         station_masked = torch.zeros(B, N, dtype=torch.bool, device=preds.device)
         station_masked.scatter_(1, masked_indices, True)              # (B, N)
 
-        # Combine: station must be masked AND sensor must be present at target
-        sensor_ok  = y_mask.bool()                                    # (B, N, V)
-        full_mask  = station_masked.unsqueeze(-1) & sensor_ok         # (B, N, V)
+        sensor_ok = y_mask.bool()                                     # (B, N, V)
+        full_mask = station_masked.unsqueeze(-1) & sensor_ok          # (B, N, V)
 
-        sq_err = (preds - y).pow(2)                                   # (B, N, V)
+        sq_err = (preds - y).pow(2)
         denom  = full_mask.float().sum().clamp(min=1.0)
-        loss   = (sq_err * full_mask.float()).sum() / denom
-
-        return loss
+        return (sq_err * full_mask.float()).sum() / denom
 
     # ------------------------------------------------------------------
     # Convenience

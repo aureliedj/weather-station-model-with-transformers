@@ -4,41 +4,41 @@ data/dataset.py
 PyTorch Dataset for the Station-MAE project, built on top of PeakWeather.
 
 Design:
-    Each sample contains a multi-step input window and a single target snapshot:
-        x           : (W, N, V)  — input window of W timesteps
-        x_mask      : (W, N, V)  — sensor availability mask for input (1=present, 0=absent)
-        x_hours     : (W,)       — hours-since-epoch per input step (→ TemporalEmbedding)
-        y           : (N, V)     — target snapshot at t + delta_steps
-        y_mask      : (N, V)     — sensor availability mask for target
-        y_hours     : ()         — hours-since-epoch for target step (→ TemporalEmbedding)
-        spatial     : (N, 15)    — normalised static station features (same for all samples)
-        delta_steps : int        — forecast lead time in 10-min steps (0 = reconstruction)
+    Each sample contains a multi-step input window and one or more target snapshots:
+        x           : (W, N, V)        — input window of W timesteps
+        x_mask      : (W, N, V)        — sensor availability mask for input
+        x_hours     : (W,)             — hours-since-epoch per input step
+        y           : (N, V)           — target snapshot  [single-delta mode]
+                      (K, N, V)        — K target snapshots [multi-delta mode]
+        y_mask      : (N, V) or (K, N, V)
+        y_hours     : ()   or (K,)
+        spatial     : (N, 15)          — normalised static station features
+        delta_steps : ()   or (K,)     — lead-time(s) in 10-min steps
 
-    Where:
-        W = window_size  (number of input timesteps)
-        N = number of stations
-        V = 6            (temperature, pressure, humidity, wind_u, wind_v, precipitation)
+Multi-delta mode
+----------------
+Set ``num_delta_per_sample > 1`` to return K randomly chosen lead-times per
+sample in [1, max_delta_steps].  The encoder runs once per sample while the
+decoder runs K times — amortising the expensive O(L²) encoder attention cost.
+
+Data caching
+------------
+The first call to ``build_observations`` reads every row from the underlying
+PeakWeather HDF/parquet files and can take several minutes.  Pass ``cache_dir``
+to save the result as a single ``.pt`` file; subsequent runs load in seconds.
+
+    StationMAEDataset(..., cache_dir="/path/to/cache")
+
+Delete the cache file to force a rebuild after the underlying data changes.
 
 Variables:
     temperature, pressure, humidity, wind_u, wind_v, precipitation
-
-Usage:
-    from peakweather.dataset import PeakWeatherDataset
-    from data.dataset import StationMAEDataset, load_peakweather, compute_obs_stats
-
-    ds_peak  = load_peakweather(root="path/to/data")
-    stats    = compute_obs_stats(ds_peak)   # computed once from the full dataset
-
-    train_ds = StationMAEDataset(ds_peak, window_size=12, delta_steps=6,
-                                 split="train", obs_stats=stats)
-    val_ds   = StationMAEDataset(ds_peak, window_size=12, delta_steps=6,
-                                 split="val",   obs_stats=stats)
-    test_ds  = StationMAEDataset(ds_peak, window_size=12, delta_steps=6,
-                                 split="test",  obs_stats=stats)
-    loader   = DataLoader(train_ds, batch_size=16, shuffle=True, num_workers=4)
 """
 
 import math
+import os
+import time
+
 import torch
 import numpy as np
 import pandas as pd
@@ -48,21 +48,11 @@ from peakweather.dataset import PeakWeatherDataset
 
 
 # ---------------------------------------------------------------------------
-# Temporal helper (mirrored from model/embeddings.py to avoid circular import)
+# Temporal helper
 # ---------------------------------------------------------------------------
 
 def _hours_since_epoch(ts: pd.Timestamp) -> float:
-    """
-    Return hours elapsed since 1970-01-01 00:00 UTC.
-
-    This scalar feeds TemporalEmbedding, which expands it into
-    multi-scale Fourier features spanning 10 min → 1 year wavelengths.
-
-    Args:
-        ts: pd.Timestamp — UTC-aware or naive (assumed UTC).
-    Returns:
-        float: hours since Unix epoch.
-    """
+    """Return hours elapsed since 1970-01-01 00:00 UTC."""
     epoch = pd.Timestamp("1970-01-01", tz="UTC")
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
@@ -70,7 +60,7 @@ def _hours_since_epoch(ts: pd.Timestamp) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Constants — must stay in sync with model/embeddings.py
+# Constants
 # ---------------------------------------------------------------------------
 
 VARIABLE_NAMES = [
@@ -96,10 +86,9 @@ SPATIAL_FEATURE_NAMES = [
     "SN_DERIVATIVE_2000M_SIGRATIO1",
     "SN_DERIVATIVE_10000M_SIGRATIO1",
     "WE_DERIVATIVE_2000M_SIGRATIO1",
-    "WE_DERIVATIVE_10000M_SIGRATIO1",   # regional W-E gradient (Föhn / valley flow)
+    "WE_DERIVATIVE_10000M_SIGRATIO1",
 ]
 
-# Train / val / test split by year
 TRAIN_YEARS = list(range(2017, 2022))   # 2017–2021
 VAL_YEARS   = [2022]
 TEST_YEARS  = [2023, 2024]
@@ -109,39 +98,12 @@ TEST_YEARS  = [2023, 2024]
 # PeakWeather loader
 # ---------------------------------------------------------------------------
 
-def compute_obs_stats(ds: PeakWeatherDataset) -> dict:
-    """
-    Compute observation normalisation statistics from the TRAINING split only.
-
-    Call this ONCE before constructing any split, then pass the returned dict
-    as ``obs_stats=`` to every StationMAEDataset constructor so that train,
-    val and test sets share a consistent normalisation scale derived purely
-    from training data (2017–2021), avoiding any leakage from val/test years.
-
-    Args:
-        ds: PeakWeatherDataset instance from load_peakweather().
-
-    Returns:
-        dict with keys:
-            "mean": (V,) float32 tensor — per-variable mean over training years
-            "std":  (V,) float32 tensor — per-variable std  (clamped to ≥ 1e-6)
-    """
-    obs_full, mask_full, timestamps_full = build_observations(ds)
-    train_idx = [i for i, ts in enumerate(timestamps_full) if ts.year in TRAIN_YEARS]
-    obs_train  = obs_full[train_idx]
-    mask_train = mask_full[train_idx]
-    _, stats = normalise_observations(obs_train, mask_train)
-    return stats
-
-
 def load_peakweather(root: str) -> PeakWeatherDataset:
     """
     Load PeakWeatherDataset with the correct parameters for this project.
 
     Loads meteo stations only, computes wind_u/wind_v from speed + direction,
     and attaches DEM topographic variables for spatial embeddings.
-    wind_speed, wind_direction and wind_gust are excluded from the final
-    variable set — only wind_u and wind_v are used by the model.
 
     Args:
         root: Path to the local PeakWeather data directory.
@@ -155,11 +117,11 @@ def load_peakweather(root: str) -> PeakWeatherDataset:
             "temperature",
             "pressure",
             "humidity",
-            "wind_speed",       # required by compute_uv internally
-            "wind_direction",   # required by compute_uv internally
+            "wind_speed",
+            "wind_direction",
             "precipitation",
         ],
-        compute_uv=True,        # adds wind_u, wind_v columns
+        compute_uv=True,
         station_type="meteo_station",
         imputation_method=None,
         freq="10min",
@@ -174,19 +136,14 @@ def build_spatial_features(
     ds: PeakWeatherDataset,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Encode and normalise static station metadata into a spatial feature tensor.
+    Encode and normalise static station metadata into a (N, 15) feature tensor.
 
-    Swiss LV95/LV03 coordinates are Cartesian (metres) — they are kept as plain
-    scalars and normalised together with the other scalar features.  Sin/cos
-    encoding is only applied to aspect angles, which are genuinely cyclic
-    compass directions.
-
-    Args:
-        ds: PeakWeatherDataset instance (must have extended_topo_vars="DEM").
+    Swiss LV95 coordinates are Cartesian metres, normalised as plain scalars.
+    Aspect angles receive sin/cos encoding (genuinely cyclic compass values).
 
     Returns:
         spatial_norm : (N, 15) normalised float32 tensor
-        stats        : {"mean": (15,), "std": (15,)} — keep for inference normalisation
+        stats        : {"mean": (15,), "std": (15,)}
     """
     stations = ds.stations_table
     rows = []
@@ -198,27 +155,25 @@ def build_spatial_features(
     for _, row in stations.iterrows():
         sa2,  ca2  = _sincos_deg(row["ASPECT_2000M_SIGRATIO1"])
         sa10, ca10 = _sincos_deg(row["ASPECT_10000M_SIGRATIO1"])
-
         rows.append([
-            float(row["swiss_easting"]),                         # easting  (1) — scalar, m
-            float(row["swiss_northing"]),                        # northing (1) — scalar, m
-            sa2,  ca2,                                           # aspect 2km  (2) — cyclic
-            sa10, ca10,                                          # aspect 10km (2) — cyclic
-            float(row["station_height"]),                        # elevation   (1)
-            float(row["dem"]),                                   # DEM         (1)
-            float(row["TPI_2000M"]),                             # TPI         (1)
-            float(row["SLOPE_2000M_SIGRATIO1"]),                 # slope 2km   (1)
-            float(row["SLOPE_10000M_SIGRATIO1"]),                # slope 10km  (1)
-            float(row["SN_DERIVATIVE_2000M_SIGRATIO1"]),         # S-N 2km     (1)
-            float(row["SN_DERIVATIVE_10000M_SIGRATIO1"]),        # S-N 10km    (1)
-            float(row["WE_DERIVATIVE_2000M_SIGRATIO1"]),         # W-E 2km     (1)
-            float(row["WE_DERIVATIVE_10000M_SIGRATIO1"]),        # W-E 10km    (1)
+            float(row["swiss_easting"]),
+            float(row["swiss_northing"]),
+            sa2,  ca2,
+            sa10, ca10,
+            float(row["station_height"]),
+            float(row["dem"]),
+            float(row["TPI_2000M"]),
+            float(row["SLOPE_2000M_SIGRATIO1"]),
+            float(row["SLOPE_10000M_SIGRATIO1"]),
+            float(row["SN_DERIVATIVE_2000M_SIGRATIO1"]),
+            float(row["SN_DERIVATIVE_10000M_SIGRATIO1"]),
+            float(row["WE_DERIVATIVE_2000M_SIGRATIO1"]),
+            float(row["WE_DERIVATIVE_10000M_SIGRATIO1"]),
         ])   # 2 + 4 + 9 = 15 features total
 
-    features = torch.tensor(rows, dtype=torch.float32)          # (N, 15)
-    mean     = features.mean(dim=0)                             # (15,)
-    std      = features.std(dim=0).clamp(min=1e-6)              # (15,)
-
+    features = torch.tensor(rows, dtype=torch.float32)   # (N, 15)
+    mean     = features.mean(dim=0)
+    std      = features.std(dim=0).clamp(min=1e-6)
     return (features - mean) / std, {"mean": mean, "std": std}
 
 
@@ -226,26 +181,22 @@ def build_observations(
     ds: PeakWeatherDataset,
 ) -> tuple[torch.Tensor, torch.Tensor, list[pd.Timestamp]]:
     """
-    Extract the full observation array for the 6 selected variables.
+    Extract the full (T, N, V) observation array for the 6 model variables.
 
-    wind_speed, wind_direction and wind_gust are excluded here even if
-    present in the underlying dataset.
+    wind_speed, wind_direction and wind_gust are excluded; only wind_u/wind_v.
 
     Returns:
-        obs       : (T, N, V) float32  — NaN where sensor absent, value otherwise
-        mask      : (T, N, V) float32  — 1.0 present, 0.0 absent
-        timestamps: list of T pd.Timestamp objects
+        obs        : (T, N, V) float32 — 0.0 where sensor absent
+        mask       : (T, N, V) float32 — 1.0 present, 0.0 absent
+        timestamps : list of T pd.Timestamp objects
     """
-    # Pull observations for the 6 model variables only
-    raw = ds.get_observations(parameters=VARIABLE_NAMES)   # MultiIndex DataFrame
+    raw      = ds.get_observations(parameters=VARIABLE_NAMES)
+    stations = ds.stations_table.index.tolist()
+    T        = len(raw)
+    N        = len(stations)
+    V        = NUM_VARIABLES
 
-    # Shape: (T, N*V) → pivot to (T, N, V)
-    stations   = ds.stations_table.index.tolist()
-    T          = len(raw)
-    N          = len(stations)
-    V          = NUM_VARIABLES
-
-    obs  = np.full((T, N, V), np.nan, dtype=np.float32)
+    obs = np.full((T, N, V), np.nan, dtype=np.float32)
     for v_idx, var in enumerate(VARIABLE_NAMES):
         for n_idx, stn in enumerate(stations):
             col = (stn, var)
@@ -253,19 +204,17 @@ def build_observations(
                 obs[:, n_idx, v_idx] = raw[col].values.astype(np.float32)
 
     mask = (~np.isnan(obs)).astype(np.float32)
-    obs  = np.nan_to_num(obs, nan=0.0)                     # replace NaN with 0
-
-    timestamps = raw.index.tolist()
+    obs  = np.nan_to_num(obs, nan=0.0)
 
     return (
-        torch.from_numpy(obs),     # (T, N, V)
-        torch.from_numpy(mask),    # (T, N, V)
-        timestamps,
+        torch.from_numpy(obs),
+        torch.from_numpy(mask),
+        raw.index.tolist(),
     )
 
 
 def normalise_observations(
-    obs: torch.Tensor,
+    obs:  torch.Tensor,
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, dict]:
     """
@@ -276,27 +225,121 @@ def normalise_observations(
         mask: (T, N, V) presence mask
 
     Returns:
-        obs_norm : (T, N, V) normalised observations
-        stats    : {"mean": (V,), "std": (V,)} — save for denormalisation at inference
+        obs_norm : (T, N, V) normalised
+        stats    : {"mean": (V,), "std": (V,)}
     """
-    means = []
-    stds  = []
-
+    means, stds = [], []
     obs_norm = obs.clone()
     for v in range(NUM_VARIABLES):
         vals = obs[:, :, v][mask[:, :, v] == 1.0]
         m    = vals.mean()
         s    = vals.std().clamp(min=1e-6)
         obs_norm[:, :, v] = (obs[:, :, v] - m) / s
-        # zero out absent sensors again after normalisation
         obs_norm[:, :, v] *= mask[:, :, v]
         means.append(m)
         stds.append(s)
+    return obs_norm, {"mean": torch.stack(means), "std": torch.stack(stds)}
 
-    return obs_norm, {
-        "mean": torch.stack(means),   # (V,)
-        "std":  torch.stack(stds),    # (V,)
-    }
+
+def compute_obs_stats(
+    ds:          PeakWeatherDataset,
+    obs_full:    "torch.Tensor | None" = None,
+    mask_full:   "torch.Tensor | None" = None,
+    timestamps:  "list | None"         = None,
+    train_years: "list[int] | None"    = None,
+) -> dict:
+    """
+    Compute normalisation statistics from the training split.
+
+    Two calling conventions::
+
+        compute_obs_stats(ds)
+            → builds observations from scratch (slow first time)
+
+        compute_obs_stats(ds, obs_full, mask_full, timestamps)
+            → reuses pre-built tensors (fast, use after cache load)
+
+    Args:
+        train_years: Years to use as the training split for computing stats.
+                     Defaults to TRAIN_YEARS (2017–2021). Pass a subset list
+                     (e.g. [2020, 2021]) to match a subset training run.
+
+    Returns:
+        dict with "mean": (V,) and "std": (V,) float32 tensors.
+    """
+    if obs_full is None or mask_full is None or timestamps is None:
+        obs_full, mask_full, timestamps = build_observations(ds)
+
+    years      = train_years if train_years is not None else TRAIN_YEARS
+    train_idx  = [i for i, ts in enumerate(timestamps) if ts.year in years]
+    obs_train  = obs_full[train_idx]
+    mask_train = mask_full[train_idx]
+    _, stats   = normalise_observations(obs_train, mask_train)
+    return stats
+
+
+# ---------------------------------------------------------------------------
+# Disk cache for preprocessed tensors
+# ---------------------------------------------------------------------------
+
+_CACHE_FILENAME = "peakweather_obs_cache.pt"
+
+
+def _load_or_build_cache(
+    ds:        PeakWeatherDataset,
+    cache_dir: str,
+) -> tuple[torch.Tensor, torch.Tensor, list, torch.Tensor, dict]:
+    """
+    Load preprocessed observation + spatial tensors from a cache file,
+    building and saving them on the first call.
+
+    Cache: ``{cache_dir}/peakweather_obs_cache.pt``
+
+    Stores: obs_full (T,N,V), mask_full (T,N,V), timestamps list,
+            spatial (N,15), spatial_stats dict.
+
+    Delete the file to force a rebuild (e.g. after updating the raw data).
+
+    Returns:
+        obs_full, mask_full, timestamps, spatial, spatial_stats
+    """
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = os.path.join(cache_dir, _CACHE_FILENAME)
+
+    if os.path.exists(cache_path):
+        t0 = time.time()
+        print(f"[Cache] Loading from {cache_path} …", flush=True)
+        payload = torch.load(cache_path, weights_only=False)
+        elapsed = time.time() - t0
+        obs_shape = tuple(payload["obs_full"].shape)
+        print(f"[Cache] Loaded in {elapsed:.1f}s  (obs {obs_shape})", flush=True)
+        return (
+            payload["obs_full"],
+            payload["mask_full"],
+            payload["timestamps"],
+            payload["spatial"],
+            payload["spatial_stats"],
+        )
+
+    # ── First run: build from raw data and save ─────────────────────────
+    print("[Cache] First run — building tensors from raw data "
+          "(may take several minutes)…", flush=True)
+    t0 = time.time()
+    obs_full, mask_full, timestamps = build_observations(ds)
+    spatial, spatial_stats          = build_spatial_features(ds)
+    elapsed = time.time() - t0
+    print(f"[Cache] Built in {elapsed:.1f}s  — saving to {cache_path}", flush=True)
+
+    torch.save({
+        "obs_full":      obs_full,
+        "mask_full":     mask_full,
+        "timestamps":    timestamps,
+        "spatial":       spatial,
+        "spatial_stats": spatial_stats,
+    }, cache_path)
+    print("[Cache] Saved.", flush=True)
+
+    return obs_full, mask_full, timestamps, spatial, spatial_stats
 
 
 # ---------------------------------------------------------------------------
@@ -307,132 +350,176 @@ class StationMAEDataset(Dataset):
     """
     Sliding-window dataset over PeakWeather observations for Station-MAE.
 
-    Each sample packages:
-        x           (W, N, V)  normalised input window
-        x_mask      (W, N, V)  sensor availability for input
-        x_hours     (W,)       hours-since-epoch per input step (→ TemporalEmbedding)
-        y           (N, V)     normalised target snapshot
-        y_mask      (N, V)     sensor availability for target
-        y_hours     ()         hours-since-epoch for target step (→ TemporalEmbedding)
-        spatial     (N, 15)    normalised static station features
-        delta_steps int        forecast lead time in 10-min steps
+    Single-delta mode  (num_delta_per_sample == 1)
+    -----------------------------------------------
+    Each sample packages a single (x, y) pair with one lead-time.  The
+    lead-time is either fixed at ``delta_steps`` or drawn randomly from
+    ``[1, max_delta_steps]`` when those two values differ.
 
-    The encoder receives the full window [W, N, V], attending across both
-    stations and timesteps (multi-step mode). The decoder receives the
-    target queries enriched with their spatial + temporal + Δt embeddings.
+    Multi-delta mode  (num_delta_per_sample == K > 1)
+    --------------------------------------------------
+    K distinct lead-times are drawn per sample from ``[1, max_delta_steps]``.
+    Batch shapes gain a K dimension:
+        y / y_mask   → (K, N, V)
+        y_hours      → (K,)
+        delta_steps  → (K,)  long tensor
+
+    The training loop calls ``model.forward_multi_delta()``, which runs the
+    encoder once and the decoder K times — amortising O(L²) attention cost.
+
+    Data loading optimisations
+    --------------------------
+    * ``share_memory_()`` is called on obs, mask, and hours tensors so that
+      all DataLoader worker processes share the same memory pages without
+      copying, keeping per-worker RAM usage negligible.
+    * Pass ``cache_dir`` to persist the expensive ``build_observations()``
+      result across Python sessions — subsequent starts load in < 5 s.
+    * Use ``persistent_workers=True`` and ``prefetch_factor=4`` in your
+      DataLoader to keep workers alive between epochs and pipeline I/O.
 
     Args:
-        ds:           PeakWeatherDataset instance from load_peakweather().
-        window_size:  Number of input timesteps W (default 12 = 2 hours).
-        delta_steps:  Forecast horizon in 10-min steps (default 6 = 1 hour).
-                      Use 0 for pure reconstruction (gap-filling).
-        split:        One of "train", "val", "test". Selects years accordingly.
-        obs_stats:    Optional pre-computed normalisation stats dict
-                      {"mean": (V,), "std": (V,)}. If None, computed from
-                      the split's data. Pass training stats to val/test splits.
+        ds:                   PeakWeatherDataset from ``load_peakweather()``.
+        window_size:          Input timesteps W (default 288 = 48 h at 10 min).
+        delta_steps:          Fixed lead-time in 10-min steps (default 18 = 3 h).
+                              Used as-is when max_delta_steps is None.
+        split:                "train", "val", or "test".
+        obs_stats:            Normalisation stats dict {"mean": (V,), "std": (V,)}.
+                              If None, computed from training years of obs_full.
+                              Always pass training-split stats to val/test splits
+                              to prevent data leakage.
+        num_delta_per_sample: K lead-times returned per sample (default 1).
+                              When K > 1, max_delta_steps must be provided.
+        max_delta_steps:      Upper bound for randomly sampled lead-times.
+                              Required when num_delta_per_sample > 1.
+        cache_dir:            Directory for the preprocessed tensor cache.
+                              First run builds and saves; subsequent runs load
+                              from disk in seconds.
     """
 
     def __init__(
         self,
-        ds:          PeakWeatherDataset,
-        window_size: int  = 12,
-        delta_steps: int  = 6,
-        split:       str  = "train",
-        obs_stats:   dict = None,
+        ds:                   PeakWeatherDataset,
+        window_size:          int  = 288,
+        delta_steps:          int  = 18,
+        split:                str  = "train",
+        obs_stats:            "dict | None" = None,
+        num_delta_per_sample: int  = 1,
+        max_delta_steps:      "int | None" = None,
+        cache_dir:            "str | None" = None,
+        train_years:          "list[int] | None" = None,
     ):
         super().__init__()
 
         assert split in ("train", "val", "test"), \
             f"split must be 'train', 'val' or 'test', got '{split}'"
         assert delta_steps >= 0, "delta_steps must be >= 0"
+        assert num_delta_per_sample >= 1, "num_delta_per_sample must be >= 1"
+        if num_delta_per_sample > 1:
+            assert max_delta_steps is not None, \
+                "max_delta_steps must be set when num_delta_per_sample > 1"
 
-        self.window_size  = window_size
-        self.delta_steps  = delta_steps
-        self.split        = split
-
-        # ------------------------------------------------------------------
-        # 1. Spatial features — static, shared across all samples
-        # ------------------------------------------------------------------
-        self.spatial, self.spatial_stats = build_spatial_features(ds)
-        # (N, 15), normalised
-
-        # ------------------------------------------------------------------
-        # 2. Full observation tensor (all years)
-        # ------------------------------------------------------------------
-        obs_full, mask_full, timestamps_full = build_observations(ds)
-        # obs_full:  (T, N, V)
-        # mask_full: (T, N, V)
+        self.window_size          = window_size
+        self.delta_steps          = delta_steps
+        self.split                = split
+        self.num_delta_per_sample = num_delta_per_sample
+        # Effective upper bound on lead-time — governs valid index calculation
+        # and random sampling in __getitem__
+        self.max_delta_steps = max_delta_steps if max_delta_steps is not None \
+                               else delta_steps
 
         # ------------------------------------------------------------------
-        # 3. Normalisation statistics — always derived from TRAINING data only.
-        #    If obs_stats is not provided, stats are computed on the fly from
-        #    the training years (2017–2021) of obs_full.
-        #    Pass pre-computed stats (from compute_obs_stats) to avoid
-        #    reloading all observations when constructing val/test splits.
+        # 1. Load (or build + cache) raw tensors
         # ------------------------------------------------------------------
+        if cache_dir is not None:
+            obs_full, mask_full, timestamps_full, spatial, spatial_stats = \
+                _load_or_build_cache(ds, cache_dir)
+        else:
+            obs_full, mask_full, timestamps_full = build_observations(ds)
+            spatial, spatial_stats               = build_spatial_features(ds)
+
+        self.spatial       = spatial          # (N, 15)
+        self.spatial_stats = spatial_stats
+
+        # ------------------------------------------------------------------
+        # 2. Normalisation statistics — always from TRAINING years only
+        # ------------------------------------------------------------------
+        # train_years controls which years are used for normalisation stats.
+        # For a subset run (e.g. train_years=[2020,2021]) this ensures stats
+        # are computed from the SAME data the model was trained on, avoiding
+        # scale drift if you later run a full (2017–2021) training job.
+        effective_train_years = train_years if train_years is not None else TRAIN_YEARS
         if obs_stats is None:
-            train_idx  = [i for i, ts in enumerate(timestamps_full)
-                          if ts.year in TRAIN_YEARS]
-            _, self.obs_stats = normalise_observations(
-                obs_full[train_idx], mask_full[train_idx]
+            self.obs_stats = compute_obs_stats(
+                ds,
+                obs_full     = obs_full,
+                mask_full    = mask_full,
+                timestamps   = timestamps_full,
+                train_years  = effective_train_years,
             )
         else:
             self.obs_stats = obs_stats
 
         # ------------------------------------------------------------------
-        # 4. Split by year
+        # 3. Slice to split years
         # ------------------------------------------------------------------
-        year_map = {"train": TRAIN_YEARS, "val": VAL_YEARS, "test": TEST_YEARS}
+        year_map   = {"train": effective_train_years, "val": VAL_YEARS, "test": TEST_YEARS}
         keep_years = year_map[split]
+        split_idx  = [i for i, ts in enumerate(timestamps_full)
+                      if ts.year in keep_years]
+        assert len(split_idx) > 0, (
+            f"No timesteps found for split='{split}' with years={keep_years}. "
+            f"Check that the dataset covers these years."
+        )
 
-        indices = [
-            i for i, ts in enumerate(timestamps_full)
-            if ts.year in keep_years
-        ]
-        assert len(indices) > 0, f"No timesteps found for split='{split}'"
-
-        obs       = obs_full[indices]       # (T_split, N, V)
-        mask      = mask_full[indices]      # (T_split, N, V)
-        timestamps = [timestamps_full[i] for i in indices]
+        obs        = obs_full[split_idx]
+        mask       = mask_full[split_idx]
+        timestamps = [timestamps_full[i] for i in split_idx]
 
         # ------------------------------------------------------------------
-        # 5. Apply normalisation to split observations
+        # 4. Normalise split observations using training-split statistics
         # ------------------------------------------------------------------
         obs_norm = obs.clone()
         for v in range(NUM_VARIABLES):
             obs_norm[:, :, v] = (
                 (obs[:, :, v] - self.obs_stats["mean"][v]) / self.obs_stats["std"][v]
             ) * mask[:, :, v]
-        obs = obs_norm
 
-        self.obs        = obs         # (T_split, N, V)
-        self.mask       = mask        # (T_split, N, V)
-        self.timestamps = timestamps  # list of T_split pd.Timestamp
+        # Place tensors in shared memory: DataLoader workers share the pages
+        # rather than each forking a private copy.
+        self.obs  = obs_norm.share_memory_()   # (T_split, N, V)
+        self.mask = mask.share_memory_()        # (T_split, N, V)
 
         # ------------------------------------------------------------------
-        # 5. Pre-compute hours-since-epoch for every timestep
-        #    TemporalEmbedding internally expands this scalar into
-        #    multi-scale Fourier features (10 min → 1 year wavelengths).
+        # 5. Hours-since-epoch for every split timestep
         # ------------------------------------------------------------------
         self.hours = torch.tensor(
             [_hours_since_epoch(ts) for ts in timestamps],
             dtype=torch.float32,
-        )   # (T_split,)
+        ).share_memory_()   # (T_split,)
+
+        self.timestamps = timestamps
 
         # ------------------------------------------------------------------
         # 6. Valid window start indices
-        #    A window [i : i+W] with target at i+W-1+delta_steps must fit
-        #    within the split. We also skip windows that span year boundaries
-        #    to avoid mixing context from different years.
+        #
+        #    A window at index i is valid iff:
+        #      - i + W - 1 + max_delta_steps < T_split   (fits in the split)
+        #      - timestamps[i].year ==
+        #        timestamps[i + W - 1 + max_delta_steps].year
+        #        (no year-boundary crossing, even for the longest lead-time)
+        #
+        #    Enforcing this for max_delta guarantees validity for all deltas
+        #    in [1, max_delta_steps] without checking each one individually.
         # ------------------------------------------------------------------
-        T            = len(timestamps)
-        max_start    = T - window_size - delta_steps
-        self.indices = []
+        T         = len(timestamps)
+        max_delta = self.max_delta_steps
+        max_start = T - window_size - max_delta
 
-        for i in range(max_start + 1):
-            win_start_year  = timestamps[i].year
-            target_year     = timestamps[i + window_size - 1 + delta_steps].year
-            if win_start_year == target_year:   # no year boundary crossing
+        self.indices: list[int] = []
+        for i in range(max(0, max_start + 1)):
+            start_year  = timestamps[i].year
+            target_year = timestamps[i + window_size - 1 + max_delta].year
+            if start_year == target_year:
                 self.indices.append(i)
 
     # ------------------------------------------------------------------
@@ -443,28 +530,61 @@ class StationMAEDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> dict:
-        i   = self.indices[idx]
-        W   = self.window_size
-        dt  = self.delta_steps
+        i = self.indices[idx]
+        W = self.window_size
+        K = self.num_delta_per_sample
 
-        # Input window indices: [i, i+W)
-        x       = self.obs[i : i + W]       # (W, N, V)
-        x_mask  = self.mask[i : i + W]      # (W, N, V)
-        x_hours = self.hours[i : i + W]     # (W,)  — hours-since-epoch per step
+        # ── Input window — shared across all K targets ─────────────────
+        x       = self.obs[i : i + W]      # (W, N, V)
+        x_mask  = self.mask[i : i + W]     # (W, N, V)
+        x_hours = self.hours[i : i + W]    # (W,)
 
-        # Target snapshot index: i + W - 1 + delta_steps
-        t_idx   = i + W - 1 + dt
-        y       = self.obs[t_idx]            # (N, V)
-        y_mask  = self.mask[t_idx]           # (N, V)
-        y_hours = self.hours[t_idx]          # ()   — scalar for target step
+        # ── Target snapshot(s) ─────────────────────────────────────────
+        if K == 1:
+            # Single lead-time per sample
+            # Random mode  : max_delta_steps != fixed delta_steps
+            # Fixed mode   : both equal (original behaviour)
+            if self.max_delta_steps != self.delta_steps:
+                dt = int(torch.randint(1, self.max_delta_steps + 1, ()).item())
+            else:
+                dt = self.delta_steps
 
-        return {
-            "x":           x,                             # (W, N, V)
-            "x_mask":      x_mask,                        # (W, N, V)
-            "x_hours":     x_hours,                       # (W,)
-            "y":           y,                             # (N, V)
-            "y_mask":      y_mask,                        # (N, V)
-            "y_hours":     y_hours,                       # ()
-            "spatial":     self.spatial,                  # (N, 15)
-            "delta_steps": torch.tensor(dt, dtype=torch.long),
-        }
+            t_idx = i + W - 1 + dt
+            return {
+                "x":           x,
+                "x_mask":      x_mask,
+                "x_hours":     x_hours,
+                "y":           self.obs[t_idx],           # (N, V)
+                "y_mask":      self.mask[t_idx],          # (N, V)
+                "y_hours":     self.hours[t_idx],         # scalar
+                "spatial":     self.spatial,              # (N, 15)
+                "delta_steps": torch.tensor(dt, dtype=torch.long),
+            }
+
+        else:
+            # Multi-delta: K distinct lead-times from [1, max_delta_steps]
+            max_dt = self.max_delta_steps
+            if K <= max_dt:
+                # Guarantee distinct values via randperm
+                deltas, _ = (torch.randperm(max_dt)[:K] + 1).sort()
+            else:
+                # More deltas than range — allow repeats
+                deltas, _ = torch.randint(1, max_dt + 1, (K,)).sort()
+
+            ys, y_masks, y_hrs = [], [], []
+            for dt in deltas.tolist():
+                t_idx = i + W - 1 + dt
+                ys.append(self.obs[t_idx])
+                y_masks.append(self.mask[t_idx])
+                y_hrs.append(self.hours[t_idx])
+
+            return {
+                "x":           x,
+                "x_mask":      x_mask,
+                "x_hours":     x_hours,
+                "y":           torch.stack(ys),        # (K, N, V)
+                "y_mask":      torch.stack(y_masks),   # (K, N, V)
+                "y_hours":     torch.stack(y_hrs),     # (K,)
+                "spatial":     self.spatial,            # (N, 15)
+                "delta_steps": deltas.long(),           # (K,)
+            }
