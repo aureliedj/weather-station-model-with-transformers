@@ -24,8 +24,8 @@ python main.py \
     --data_root       "$DATA_ROOT" \
     --cache_dir       "$DATA_ROOT" \
     --subset \
-    --window          288 \
-    --max_delta       18 \
+    --window          48 \
+    --max_delta       6 \
     --num_delta       3 \
     --d_model         128 \
     --enc_layers      6 \
