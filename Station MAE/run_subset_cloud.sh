@@ -31,7 +31,7 @@ python main.py \
     --enc_layers             6 \
     --dec_layers             2 \
     --batch_size             32 \
-    --num_workers            8 \
+    --num_workers            6 \
     --epochs                 20 \
     --patience               5 \
     --save_every             5 \
