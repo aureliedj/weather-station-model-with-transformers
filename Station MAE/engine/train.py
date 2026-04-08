@@ -53,6 +53,35 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+try:
+    import psutil as _psutil
+except ImportError:
+    _psutil = None
+
+
+def _mem_stats(device: torch.device) -> str:
+    """
+    Return a compact memory string for the log line.
+
+    CUDA  →  "GPU 4.2/20.0 GB  RAM 18.3 GB"
+    MPS   →  "RAM 18.3 GB"   (MPS shares unified memory; no separate VRAM API)
+    CPU   →  "RAM 18.3 GB"
+    """
+    parts = []
+
+    # ── GPU (CUDA only) ────────────────────────────────────────────────────
+    if device.type == "cuda":
+        used  = torch.cuda.memory_reserved(device)  / 1024 ** 3   # GB reserved
+        total = torch.cuda.get_device_properties(device).total_memory / 1024 ** 3
+        parts.append(f"GPU {used:.1f}/{total:.0f}GB")
+
+    # ── RAM (all devices via psutil if available) ──────────────────────────
+    if _psutil is not None:
+        ram_used = _psutil.virtual_memory().used / 1024 ** 3
+        parts.append(f"RAM {ram_used:.1f}GB")
+
+    return "  ".join(parts)
+
 
 # ---------------------------------------------------------------------------
 # Early stopping
@@ -279,13 +308,15 @@ def train_one_epoch(
         n_batches  += 1
 
         if (step + 1) % log_interval == 0:
-            elapsed = time.time() - t0
-            lr_now  = optimizer.param_groups[0]["lr"]
-            mode    = f"K={delta_steps.shape[1]}" if is_multi else "K=1"
+            elapsed  = time.time() - t0
+            lr_now   = optimizer.param_groups[0]["lr"]
+            mode     = f"K={delta_steps.shape[1]}" if is_multi else "K=1"
+            mem_str  = _mem_stats(device)
             print(
                 f"  Epoch {epoch:3d}  step {step + 1:5d}/{len(loader)}  "
                 f"loss {loss.item():.5f}  lr {lr_now:.2e}  "
-                f"[{mode}]  ({elapsed:.1f}s)",
+                f"[{mode}]  ({elapsed:.1f}s)"
+                + (f"  [{mem_str}]" if mem_str else ""),
                 flush=True,
             )
 

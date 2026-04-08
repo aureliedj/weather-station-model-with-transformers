@@ -13,6 +13,9 @@ geopandas>=0.14
 rioxarray>=0.15
 matplotlib>=3.7
 
+# System monitoring (RAM usage in training logs)
+psutil>=5.9
+
 # Notebooks
 numba>=0.59
 jupyterlab>=4.0
