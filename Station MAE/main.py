@@ -203,11 +203,14 @@ def main() -> None:
     print("Loading PeakWeather dataset …")
     ds = load_peakweather(root=args.data_root)
 
-    # shared_memory=True only helps when num_workers > 0 (Linux/CUDA).
-    # On macOS MPS, unified memory makes it redundant and the OS shared-memory
-    # segment cap (kern.sysv.shmmax) will raise "Invalid buffer size" for large
-    # datasets — so only enable it when actually using DataLoader workers.
-    _use_shm = (args.num_workers > 0)
+    # share_memory_() is disabled unconditionally.
+    # On macOS, kern.sysv.shmmax caps shared-memory segments well below dataset
+    # size. On Linux containers (Docker/Kubernetes/Renku), /dev/shm defaults to
+    # 64 MB regardless of available RAM, causing the same OOM.
+    # DataLoader workers on Linux use fork() with copy-on-write semantics, so
+    # the dataset tensors are shared implicitly at no extra cost — share_memory_()
+    # provides no benefit in practice.
+    _use_shm = False
 
     print("Building train dataset …")
     train_ds = StationMAEDataset(
