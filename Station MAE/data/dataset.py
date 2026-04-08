@@ -407,6 +407,7 @@ class StationMAEDataset(Dataset):
         max_delta_steps:      "int | None" = None,
         cache_dir:            "str | None" = None,
         train_years:          "list[int] | None" = None,
+        shared_memory:        bool = False,
     ):
         super().__init__()
 
@@ -484,18 +485,28 @@ class StationMAEDataset(Dataset):
                 (obs[:, :, v] - self.obs_stats["mean"][v]) / self.obs_stats["std"][v]
             ) * mask[:, :, v]
 
-        # Place tensors in shared memory: DataLoader workers share the pages
-        # rather than each forking a private copy.
-        self.obs  = obs_norm.share_memory_()   # (T_split, N, V)
-        self.mask = mask.share_memory_()        # (T_split, N, V)
+        # Optionally place tensors in shared memory so DataLoader workers share
+        # the pages rather than each forking a private copy.
+        # Only useful when num_workers > 0 on Linux/CUDA.
+        # On macOS MPS, unified memory makes this redundant and the OS-level
+        # shared-memory segment limit (kern.sysv.shmmax) can cause OOM errors
+        # for large datasets — leave shared_memory=False (default) on Apple Silicon.
+        if shared_memory:
+            obs_norm.share_memory_()
+            mask.share_memory_()
+        self.obs  = obs_norm   # (T_split, N, V)
+        self.mask = mask       # (T_split, N, V)
 
         # ------------------------------------------------------------------
         # 5. Hours-since-epoch for every split timestep
         # ------------------------------------------------------------------
-        self.hours = torch.tensor(
+        hours = torch.tensor(
             [_hours_since_epoch(ts) for ts in timestamps],
             dtype=torch.float32,
-        ).share_memory_()   # (T_split,)
+        )
+        if shared_memory:
+            hours.share_memory_()
+        self.hours = hours   # (T_split,)
 
         self.timestamps = timestamps
 

@@ -196,6 +196,12 @@ def main() -> None:
     print("Loading PeakWeather dataset …")
     ds = load_peakweather(root=args.data_root)
 
+    # shared_memory=True only helps when num_workers > 0 (Linux/CUDA).
+    # On macOS MPS, unified memory makes it redundant and the OS shared-memory
+    # segment cap (kern.sysv.shmmax) will raise "Invalid buffer size" for large
+    # datasets — so only enable it when actually using DataLoader workers.
+    _use_shm = (args.num_workers > 0)
+
     print("Building train dataset …")
     train_ds = StationMAEDataset(
         ds,
@@ -206,6 +212,7 @@ def main() -> None:
         max_delta_steps=args.max_delta,
         cache_dir=cache_dir,
         train_years=train_years,
+        shared_memory=_use_shm,
     )
 
     print("Building val dataset …")
@@ -219,6 +226,7 @@ def main() -> None:
         max_delta_steps=args.max_delta,
         cache_dir=cache_dir,
         train_years=train_years,            # keeps stats consistent
+        shared_memory=_use_shm,
     )
 
     print(f"  train: {len(train_ds):,} samples  "
