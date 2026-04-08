@@ -54,10 +54,12 @@ Arguments
     --lr          FLT   Peak learning rate (default 1e-4)
     --weight_decay FLT  AdamW weight decay (default 0.05)
     --warmup_epochs INT Warmup epochs (default 5)
-    --grad_clip        FLT   Gradient clipping max norm (default 1.0)
-    --amp                    Enable automatic mixed precision (flag, CUDA/MPS)
-    --grad_checkpoint        Enable gradient checkpointing (~66% less VRAM, ~33% slower)
-    --device           STR   'cpu', 'cuda', or 'mps' (default: auto)
+    --grad_clip              FLT   Gradient clipping max norm (default 1.0)
+    --amp                         Enable automatic mixed precision (flag, CUDA/MPS)
+    --grad_checkpoint             Enable gradient checkpointing (~66% less VRAM, ~33% slower)
+    --factorised_encoder          Axial attention in encoder (~100× cheaper at W=288)
+    --cross_attn_decoder          Cross-attention decoder (queries attend to encoder context)
+    --device                STR   'cpu', 'cuda', or 'mps' (default: auto)
     --seed        INT   Random seed (default 42)
 
   Early stopping
@@ -125,6 +127,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_epochs",type=int,   default=5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
+    p.add_argument("--factorised_encoder",      action="store_true",
+                   help="Use factorised (axial) attention in the encoder: temporal "
+                        "then spatial, O(N·W²+W·N²) vs O((W·N)²). ~100× cheaper "
+                        "at W=288, N=100. Incompatible with checkpoints trained "
+                        "without this flag.")
+    p.add_argument("--cross_attn_decoder",      action="store_true",
+                   help="Use cross-attention decoder: query tokens attend TO encoder "
+                        "context instead of concatenated self-attention. Reduces decoder "
+                        "sequence from W·N_vis+N·K to N·K.")
     p.add_argument("--amp",             action="store_true")
     p.add_argument("--grad_checkpoint", action="store_true",
                    help="Enable gradient checkpointing on every transformer block. "
@@ -285,11 +296,16 @@ def main() -> None:
         # Note: max_delta_steps is NOT passed to StationMAE — DeltaTimeEmbedding
         # uses continuous Fourier encoding over hours so no upper bound is needed.
         use_checkpoint=args.grad_checkpoint,
+        factorised_encoder=args.factorised_encoder,
+        cross_attention_decoder=args.cross_attn_decoder,
     ).to(device)
 
     if args.grad_checkpoint:
-        print("Gradient checkpointing: ON  "
-              "(recomputes block activations on backward — saves VRAM, ~33%% slower)")
+        print("Gradient checkpointing   : ON  (~33%% extra compute, ~66%% less VRAM)")
+    if args.factorised_encoder:
+        print("Factorised encoder       : ON  (axial attention, ~100× cheaper at W=288)")
+    if args.cross_attn_decoder:
+        print("Cross-attention decoder  : ON  (queries attend to encoder context)")
 
     print(f"Model: {model.count_parameters():,} trainable parameters")
 

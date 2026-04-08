@@ -21,8 +21,8 @@ python main.py \
     --cache_dir   "$DATA_ROOT" \
     --subset \
     --window      12 \
-    --max_delta   6 \
-    --num_delta   3 \
+    --max_delta   3 \
+    --num_delta   1 \
     --d_model     128 \
     --enc_layers  6 \
     --dec_layers  2 \
@@ -32,4 +32,6 @@ python main.py \
     --patience    5 \
     --save_every  5 \
     --amp \
+    --factorised_encoder \
+    --cross_attn_decoder \
     --save_dir    "$SAVE_DIR"

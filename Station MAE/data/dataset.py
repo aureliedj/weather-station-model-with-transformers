@@ -442,6 +442,31 @@ class StationMAEDataset(Dataset):
         self.spatial_stats = spatial_stats
 
         # ------------------------------------------------------------------
+        # 1b. Log1p-transform precipitation before normalisation
+        #
+        # Precipitation is zero-inflated and heavy-tailed (most values are 0,
+        # rare events can be very large).  A direct z-score normalisation on the
+        # raw mm values produces a highly skewed distribution that is hard for
+        # the variable projection to embed meaningfully.
+        #
+        # log1p(x) = log(1 + x) compresses the tail while mapping:
+        #   0   mm → 0.0        (exact: no-rain is preserved as zero)
+        #   1   mm → 0.693
+        #   10  mm → 2.398
+        #   100 mm → 4.615
+        #
+        # Applied here to obs_full BEFORE stats are computed, so the
+        # normalisation statistics are in log-space.  The mask is respected:
+        # missing values are already 0 in obs_full and log1p(0)=0, so the
+        # zero-filling for absent sensors is preserved exactly.
+        # ------------------------------------------------------------------
+        _PRECIP_IDX = VARIABLE_NAMES.index("precipitation")   # = 5
+        obs_full = obs_full.clone()   # don't modify the cached tensor in-place
+        obs_full[:, :, _PRECIP_IDX] = torch.log1p(
+            obs_full[:, :, _PRECIP_IDX].clamp(min=0.0)
+        )
+
+        # ------------------------------------------------------------------
         # 2. Normalisation statistics — always from TRAINING years only
         # ------------------------------------------------------------------
         # train_years controls which years are used for normalisation stats.

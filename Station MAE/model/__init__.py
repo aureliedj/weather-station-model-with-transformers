@@ -23,8 +23,8 @@ from .embeddings import (
     TEMPORAL_FOURIER_DIM,
     DELTA_FOURIER_DIM,
 )
-from .encoder import StationMAEEncoder, TransformerBlock
-from .decoder import StationMAEDecoder
+from .encoder import StationMAEEncoder, TransformerBlock, FactorisedTransformerBlock
+from .decoder import StationMAEDecoder, CrossAttentionBlock
 from .mae    import StationMAE
 
 __all__ = [
@@ -32,6 +32,8 @@ __all__ = [
     "StationMAEEncoder",
     "StationMAEDecoder",
     "TransformerBlock",
+    "FactorisedTransformerBlock",
+    "CrossAttentionBlock",
     "PositionalEmbedding",
     "StationEmbedding",
     "TemporalEmbedding",

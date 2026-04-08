@@ -57,6 +57,104 @@ from .embeddings import (
 from .encoder import TransformerBlock   # reuse the same Pre-LN block
 
 
+# ---------------------------------------------------------------------------
+# Cross-attention decoder block
+# ---------------------------------------------------------------------------
+
+class CrossAttentionBlock(nn.Module):
+    """
+    Decoder block where query tokens attend to encoder context via cross-attention.
+
+    Structure (Pre-LN throughout):
+      1. Self-attention    — queries attend to each other (captures inter-station
+                             structure within the query set).
+      2. Cross-attention   — queries (Q) attend to encoder output (K, V); lets
+                             every query token directly read from the full encoder
+                             context without concatenating the two sequences.
+      3. FFN
+
+    Why cross-attention instead of concatenated self-attention?
+        The original decoder concatenates [encoder_tokens ‖ query_tokens] and runs
+        joint self-attention.  This forces every encoder token to also attend to
+        every query token — wasting capacity and adding N (or N·K) extra tokens to
+        an already large encoder sequence.  Cross-attention is cleaner:
+
+          Old (self-attn):  sequence length = W·N_vis + N·K   (~29,400 at W=288)
+          New (cross-attn): query length    = N·K             (~600)
+                            context length  = W·N_vis          (~28,800, read-only)
+
+        Memory cost of the cross-attention matrix:
+            O(N·K × W·N_vis) with standard attention
+            O(N·K)           with Flash Attention (need_weights=False)
+
+    Args:
+        d_model:   Model dimension — must match encoder d_model.
+        num_heads: Attention heads (shared across self and cross sub-layers).
+        mlp_ratio: FFN hidden-dim ratio (default 4.0).
+        dropout:   Dropout rate (default 0.1).
+    """
+
+    def __init__(
+        self,
+        d_model:   int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout:   float = 0.1,
+    ):
+        super().__init__()
+
+        # ── Self-attention on queries ─────────────────────────────────────
+        self.norm_sa    = nn.LayerNorm(d_model)
+        self.self_attn  = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+
+        # ── Cross-attention: Q from queries, K/V from encoder context ─────
+        self.norm_q     = nn.LayerNorm(d_model)   # normalise query side
+        self.norm_kv    = nn.LayerNorm(d_model)   # normalise encoder context
+        self.cross_attn = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+
+        # ── FFN ───────────────────────────────────────────────────────────
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ffn     = nn.Sequential(
+            nn.Linear(d_model, int(d_model * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(d_model * mlp_ratio), d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(
+        self,
+        q:  torch.Tensor,   # (B, L_q,  d_model) — decoder query tokens
+        kv: torch.Tensor,   # (B, L_kv, d_model) — encoder context (key/value)
+    ) -> torch.Tensor:
+        """
+        Returns:
+            (B, L_q, d_model)
+        """
+        # 1. Self-attention among queries
+        q_n  = self.norm_sa(q)
+        sa, _ = self.self_attn(q_n, q_n, q_n, need_weights=False)
+        q    = q + sa
+
+        # 2. Cross-attention: queries read from encoder context
+        kv_n  = self.norm_kv(kv)          # normalise once, reuse for K and V
+        ca, _ = self.cross_attn(
+            self.norm_q(q),               # Q: normalised queries
+            kv_n,                         # K: normalised encoder context
+            kv_n,                         # V: same
+            need_weights=False,
+        )
+        q = q + ca
+
+        # 3. FFN
+        q = q + self.ffn(self.norm_ff(q))
+        return q
+
+
 class StationMAEDecoder(nn.Module):
     """
     MAE decoder for weather station reconstruction and forecasting.
@@ -75,6 +173,10 @@ class StationMAEDecoder(nn.Module):
         delta_fourier_dim:    Fourier dimension for DeltaTimeEmbedding (default 16).
         position_fourier_dim: Fourier features per coordinate for PositionalEmbedding (default 16).
         use_checkpoint:       If True, use gradient checkpointing on each decoder block.
+        cross_attention:      If True, use CrossAttentionBlock (query tokens cross-attend
+                              to encoder context) instead of concatenated self-attention.
+                              Reduces decoder sequence length from W·N_vis+N·K to just N·K,
+                              which is much cheaper when the encoder context is long.
     """
 
     def __init__(
@@ -91,13 +193,15 @@ class StationMAEDecoder(nn.Module):
         delta_fourier_dim:    int   = DELTA_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
         use_checkpoint:       bool  = False,
+        cross_attention:      bool  = False,
     ):
         super().__init__()
 
-        self.d_model         = d_model
-        self.num_vars        = num_vars
-        self.num_target_vars = num_target_vars
-        self.use_checkpoint  = use_checkpoint
+        self.d_model           = d_model
+        self.num_vars          = num_vars
+        self.num_target_vars   = num_target_vars
+        self.use_checkpoint    = use_checkpoint
+        self.use_cross_attention = cross_attention
 
         # ------------------------------------------------------------------
         # Learnable mask token — shared starting point for all station queries.
@@ -128,10 +232,13 @@ class StationMAEDecoder(nn.Module):
         self.query_norm = nn.LayerNorm(d_model)
 
         # ------------------------------------------------------------------
-        # Lightweight self-attention stack (2 layers by default)
+        # Decoder attention stack
+        # cross_attention=True  → CrossAttentionBlock  (queries cross-attend encoder)
+        # cross_attention=False → TransformerBlock     (concatenated self-attention)
         # ------------------------------------------------------------------
+        _block_cls = CrossAttentionBlock if cross_attention else TransformerBlock
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, mlp_ratio, dropout)
+            _block_cls(d_model, num_heads, mlp_ratio, dropout)
             for _ in range(num_layers)
         ])
         self.norm = nn.LayerNorm(d_model)
@@ -214,7 +321,6 @@ class StationMAEDecoder(nn.Module):
 
         if not is_multi:
             # ── Single-delta path ─────────────────────────────────────────
-            # t — WHEN and Δt — LEAD: both (B,) → (B, d_model)
             temp_emb = self.temporal_emb(y_hours)                   # (B, d_model)
             delt_emb = self.delta_emb(delta_steps)                  # (B, d_model)
 
@@ -223,52 +329,65 @@ class StationMAEDecoder(nn.Module):
                     + delt_emb.unsqueeze(1)                         # (B, N, d_model)
             queries = self.query_norm(queries)                      # (B, N, d_model)
 
-            full_seq = torch.cat([encoded_vis, queries], dim=1)     # (B, L_ctx+N, d_model)
-            h = full_seq
-            for block in self.blocks:
-                if self.use_checkpoint and torch.is_grad_enabled():
-                    h = _cp_checkpoint(block, h, use_reentrant=False)
-                else:
-                    h = block(h)
-            h = self.norm(h)
+            if self.use_cross_attention:
+                # ── Cross-attention: queries attend TO encoder context ────
+                # Sequence fed to blocks is just (B, N, d_model) — no concat.
+                h = queries
+                for block in self.blocks:
+                    if self.use_checkpoint and torch.is_grad_enabled():
+                        h = _cp_checkpoint(block, h, encoded_vis, use_reentrant=False)
+                    else:
+                        h = block(h, encoded_vis)
+                h = self.norm(h)                                    # (B, N, d_model)
+            else:
+                # ── Original: concatenate encoder context + queries ───────
+                full_seq = torch.cat([encoded_vis, queries], dim=1) # (B, L_ctx+N, d_model)
+                h = full_seq
+                for block in self.blocks:
+                    if self.use_checkpoint and torch.is_grad_enabled():
+                        h = _cp_checkpoint(block, h, use_reentrant=False)
+                    else:
+                        h = block(h)
+                h = self.norm(h)
+                h = h[:, -N:, :]                                    # (B, N, d_model)
 
-            station_tokens = h[:, -N:, :]                          # (B, N, d_model)
-            return self.head(station_tokens)                        # (B, N, num_target_vars)
+            return self.head(h)                                     # (B, N, num_target_vars)
 
         else:
             # ── Multi-delta path ──────────────────────────────────────────
-            # TemporalEmbedding and DeltaTimeEmbedding both handle arbitrary
-            # leading shapes via their _fourier helper, so (B, K) → (B, K, d_model).
             temp_emb = self.temporal_emb(y_hours)                   # (B, K, d_model)
             delt_emb = self.delta_emb(delta_steps)                  # (B, K, d_model)
 
-            # Broadcast spatial (B,N,d) and temporal (B,K,d) to (B,N,K,d)
             spatial_exp = spatial_q.unsqueeze(2).expand(B, N, K, -1)   # (B, N, K, d_model)
             temp_exp    = temp_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
             delt_exp    = delt_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
 
-            queries_NK = spatial_exp + temp_exp + delt_exp          # (B, N, K, d_model)
-            queries_NK = self.query_norm(queries_NK)                # (B, N, K, d_model)
-
-            # Flatten N×K into a single sequence dimension for the transformer
-            # Layout: [stn0_Δ0, stn0_Δ1, …, stn0_ΔK-1, stn1_Δ0, …, stnN_ΔK-1]
+            queries_NK  = spatial_exp + temp_exp + delt_exp         # (B, N, K, d_model)
+            queries_NK  = self.query_norm(queries_NK)
             queries_seq = queries_NK.reshape(B, N * K, self.d_model)   # (B, N*K, d_model)
 
-            # Single transformer pass over encoder context + all N×K queries
-            full_seq = torch.cat([encoded_vis, queries_seq], dim=1)    # (B, L_ctx+N*K, d_model)
-            h = full_seq
-            for block in self.blocks:
-                if self.use_checkpoint and torch.is_grad_enabled():
-                    h = _cp_checkpoint(block, h, use_reentrant=False)
-                else:
-                    h = block(h)
-            h = self.norm(h)
+            if self.use_cross_attention:
+                # ── Cross-attention: N*K queries attend TO encoder context ─
+                h = queries_seq
+                for block in self.blocks:
+                    if self.use_checkpoint and torch.is_grad_enabled():
+                        h = _cp_checkpoint(block, h, encoded_vis, use_reentrant=False)
+                    else:
+                        h = block(h, encoded_vis)
+                h = self.norm(h)                                    # (B, N*K, d_model)
+            else:
+                # ── Original: concatenate encoder context + N*K queries ───
+                full_seq = torch.cat([encoded_vis, queries_seq], dim=1)
+                h = full_seq
+                for block in self.blocks:
+                    if self.use_checkpoint and torch.is_grad_enabled():
+                        h = _cp_checkpoint(block, h, use_reentrant=False)
+                    else:
+                        h = block(h)
+                h = self.norm(h)
+                h = h[:, -N * K:, :]                               # (B, N*K, d_model)
 
-            # Extract the last N*K tokens and project
-            station_tokens = h[:, -N * K:, :]                      # (B, N*K, d_model)
-            preds = self.head(station_tokens)                       # (B, N*K, num_target_vars)
-
-            # Reshape (B, N*K, V) → (B, N, K, V) → (B, K, N, V)
+            preds = self.head(h)                                    # (B, N*K, num_target_vars)
             preds = preds.reshape(B, N, K, self.num_target_vars)
             preds = preds.permute(0, 2, 1, 3).contiguous()         # (B, K, N, num_target_vars)
             return preds

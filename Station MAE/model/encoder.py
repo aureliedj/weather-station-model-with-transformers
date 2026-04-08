@@ -40,7 +40,7 @@ from .embeddings import (
 
 
 # ---------------------------------------------------------------------------
-# Transformer block
+# Transformer blocks
 # ---------------------------------------------------------------------------
 
 class TransformerBlock(nn.Module):
@@ -101,6 +101,98 @@ class TransformerBlock(nn.Module):
         return x
 
 
+class FactorisedTransformerBlock(nn.Module):
+    """
+    Factorised (axial) attention block operating on 4-D token grids (B, W, N, d).
+
+    Instead of attending jointly over all W×N tokens (O((W·N)²) pairs), this
+    block alternates two cheaper operations:
+
+      1. Temporal attention  — each station independently attends over its W
+         timesteps → reshape to (B·N, W, d), run MHA, reshape back.
+
+      2. Spatial attention   — all N stations attend to each other at every
+         timestep → reshape to (B·W, N, d), run MHA, reshape back.
+
+      3. Shared FFN applied element-wise over the last dimension.
+
+    Complexity: O(N·W² + W·N²)  vs  O((W·N)²) for flat self-attention.
+    At W=288, N_vis≈100: ~8.3M vs ~830M attention pairs — roughly 100× cheaper.
+
+    Temporal and spatial sub-layers each have their own LayerNorm and MHA
+    (separate parameters) so the model can learn distinct inductive biases for
+    the time and space axes.
+
+    Args:
+        d_model:   Model dimension.
+        num_heads: Attention heads (shared across both sub-layers).
+        mlp_ratio: FFN hidden-dim ratio (default 4.0).
+        dropout:   Dropout in attention and FFN (default 0.1).
+    """
+
+    def __init__(
+        self,
+        d_model:   int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout:   float = 0.1,
+    ):
+        super().__init__()
+
+        # ── Temporal sub-layer (each station over W timesteps) ────────────
+        self.norm_t = nn.LayerNorm(d_model)
+        self.attn_t = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+
+        # ── Spatial sub-layer (all N stations at each timestep) ──────────
+        self.norm_s = nn.LayerNorm(d_model)
+        self.attn_s = nn.MultiheadAttention(
+            d_model, num_heads, dropout=dropout, batch_first=True
+        )
+
+        # ── Shared FFN ────────────────────────────────────────────────────
+        self.norm_ff = nn.LayerNorm(d_model)
+        self.ffn     = nn.Sequential(
+            nn.Linear(d_model, int(d_model * mlp_ratio)),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(int(d_model * mlp_ratio), d_model),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, W, N, d_model)
+        Returns:
+            (B, W, N, d_model)
+        """
+        B, W, N, D = x.shape
+
+        # ── 1. Temporal attention: (B·N, W, D) ───────────────────────────
+        # Permute so N is before W, then merge B and N into a single batch dim.
+        # Each of the B·N sequences has length W (the temporal axis).
+        xt     = x.permute(0, 2, 1, 3).reshape(B * N, W, D)   # (B·N, W, D)
+        xt_n   = self.norm_t(xt)
+        at, _  = self.attn_t(xt_n, xt_n, xt_n, need_weights=False)
+        xt     = xt + at
+        x      = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)   # (B, W, N, D)
+
+        # ── 2. Spatial attention: (B·W, N, D) ────────────────────────────
+        # Merge B and W into a single batch dim.
+        # Each of the B·W sequences has length N (the station axis).
+        xs     = x.reshape(B * W, N, D)                        # (B·W, N, D)
+        xs_n   = self.norm_s(xs)
+        as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
+        xs     = xs + as_
+        x      = xs.reshape(B, W, N, D)                        # (B, W, N, D)
+
+        # ── 3. FFN (applied over last dim, works on any leading shape) ────
+        x = x + self.ffn(self.norm_ff(x))
+        return x
+
+
 # ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
@@ -131,6 +223,12 @@ class StationMAEEncoder(nn.Module):
         use_checkpoint:       If True, use gradient checkpointing on each transformer block.
                               Trades ~33% extra compute for ~66% less activation memory —
                               enables larger batches / deeper models on limited GPU VRAM.
+        factorised:           If True, use FactorisedTransformerBlock (axial attention over
+                              the W×N grid) instead of flat self-attention over W·N tokens.
+                              Reduces complexity from O((W·N)²) to O(N·W²+W·N²) — ~100×
+                              cheaper at W=288, N=100.  Tokens remain in (B,W,N,d) shape
+                              through the blocks; flattened to (B,W·N_vis,d) at output to
+                              preserve the decoder interface.
     """
 
     def __init__(
@@ -146,12 +244,14 @@ class StationMAEEncoder(nn.Module):
         fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
         use_checkpoint:       bool  = False,
+        factorised:           bool  = False,
     ):
         super().__init__()
 
         self.d_model         = d_model
         self.mask_ratio      = mask_ratio
         self.use_checkpoint  = use_checkpoint
+        self.factorised      = factorised
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
         self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
@@ -166,8 +266,12 @@ class StationMAEEncoder(nn.Module):
         self.token_norm = nn.LayerNorm(d_model)
 
         # --- Transformer blocks ---
+        # FactorisedTransformerBlock (axial attention over W×N grid) is used when
+        # factorised=True; otherwise fall back to flat TransformerBlock for
+        # backward compatibility with existing checkpoints.
+        _block_cls = FactorisedTransformerBlock if factorised else TransformerBlock
         self.blocks = nn.ModuleList([
-            TransformerBlock(d_model, num_heads, mlp_ratio, dropout)
+            _block_cls(d_model, num_heads, mlp_ratio, dropout)
             for _ in range(num_layers)
         ])
 
@@ -255,9 +359,9 @@ class StationMAEEncoder(nn.Module):
 
         visible_tokens = tokens.gather(2, vis_idx_exp)             # (B, W, N_vis, D)
 
-        # Flatten W and N_vis into a single sequence dimension
-        visible_tokens = visible_tokens.reshape(B, W * num_visible, D)
-
+        # NOTE: returned as (B, W, N_vis, D) — NOT flattened.
+        # forward() flattens to (B, W*N_vis, D) after the transformer blocks so
+        # that both the flat and factorised paths share the same decoder interface.
         return visible_tokens, masked_indices, visible_indices
 
     def forward(
@@ -287,21 +391,30 @@ class StationMAEEncoder(nn.Module):
         # 1. Build full token representations
         tokens = self._build_tokens(x, x_mask, spatial, x_hours)  # (B, W, N, d_model)
 
-        # 2. Mask stations
+        # 2. Mask stations → visible_tokens: (B, W, N_vis, d_model)  [unflattened]
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
-        # visible_tokens: (B, W*N_vis, d_model)
+        B_sz, W_sz, N_vis, D = visible_tokens.shape
 
-        # 3. Transformer blocks over visible tokens only
-        # Gradient checkpointing (use_checkpoint=True) avoids storing intermediate
-        # activations from each block; they are recomputed during backprop instead.
-        # This cuts activation memory by ~66% at ~33% extra compute — essential for
-        # deep encoders (enc_layers ≥ 6) or large windows on ≤ 30 GB GPUs.
-        h = visible_tokens
-        for block in self.blocks:
-            if self.use_checkpoint and torch.is_grad_enabled():
-                h = _cp_checkpoint(block, h, use_reentrant=False)
-            else:
-                h = block(h)
+        # 3. Transformer blocks
+        # ── Factorised path: keep (B, W, N_vis, d) through FactorisedTransformerBlocks
+        #    then flatten to (B, W*N_vis, d) for the decoder interface.
+        # ── Flat path:       flatten first to (B, W*N_vis, d) then run TransformerBlocks.
+        # Both paths use gradient checkpointing when use_checkpoint=True.
+        if self.factorised:
+            h = visible_tokens                                     # (B, W, N_vis, d_model)
+            for block in self.blocks:
+                if self.use_checkpoint and torch.is_grad_enabled():
+                    h = _cp_checkpoint(block, h, use_reentrant=False)
+                else:
+                    h = block(h)
+            h = h.reshape(B_sz, W_sz * N_vis, D)                  # (B, W*N_vis, d_model)
+        else:
+            h = visible_tokens.reshape(B_sz, W_sz * N_vis, D)     # (B, W*N_vis, d_model)
+            for block in self.blocks:
+                if self.use_checkpoint and torch.is_grad_enabled():
+                    h = _cp_checkpoint(block, h, use_reentrant=False)
+                else:
+                    h = block(h)
+
         h = self.norm(h)                                           # (B, W*N_vis, d_model)
-
         return h, masked_idx, visible_idx

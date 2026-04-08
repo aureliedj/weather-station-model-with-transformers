@@ -88,10 +88,16 @@ class StationMAE(nn.Module):
         num_vars:         Input variables per station (6).
         num_target_vars:  Predicted variables per station (5, excludes precip).
         fourier_dim:      Fourier feature dimension for temporal embedding.
-        use_checkpoint:   Enable gradient checkpointing on every transformer block.
-                          Recomputes block activations during backprop instead of
-                          storing them — cuts activation VRAM by ~66% at ~33% extra
-                          compute.  Recommended for enc_layers ≥ 6 on ≤ 30 GB GPUs.
+        use_checkpoint:          Enable gradient checkpointing on every transformer block.
+                                 Recomputes block activations during backprop instead of
+                                 storing them — cuts activation VRAM by ~66% at ~33% extra
+                                 compute.  Recommended for enc_layers ≥ 6 on ≤ 30 GB GPUs.
+        factorised_encoder:      Use FactorisedTransformerBlock (axial attention over the
+                                 W×N grid) instead of flat self-attention over W·N tokens.
+                                 ~100× cheaper at W=288, N=100.
+        cross_attention_decoder: Use CrossAttentionBlock (query tokens cross-attend to
+                                 encoder context) instead of concatenated self-attention.
+                                 Decoder sequence drops from W·N_vis+N·K to just N·K.
     """
 
     def __init__(
@@ -107,7 +113,9 @@ class StationMAE(nn.Module):
         num_vars:         int   = NUM_VARIABLES,
         num_target_vars:  int   = NUM_TARGET_VARIABLES,
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
-        use_checkpoint:   bool  = False,
+        use_checkpoint:          bool  = False,
+        factorised_encoder:      bool  = False,
+        cross_attention_decoder: bool  = False,
     ):
         super().__init__()
 
@@ -125,6 +133,7 @@ class StationMAE(nn.Module):
             num_vars=num_vars,
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
+            factorised=factorised_encoder,
         )
 
         self.decoder = StationMAEDecoder(
@@ -137,6 +146,7 @@ class StationMAE(nn.Module):
             num_target_vars=num_target_vars,
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
+            cross_attention=cross_attention_decoder,
         )
 
     # ------------------------------------------------------------------
