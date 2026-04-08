@@ -1,1 +1,2 @@
 epoch,train_loss,val_loss,val_rmse,epoch_secs
+1,0.674714,0.461888,0.679439,1016.0
