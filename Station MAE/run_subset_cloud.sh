@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# run_subset_cloud.sh — pipeline sanity check on cloud GPU (Linux/CUDA)
+# run_subset_cloud.sh — pipeline sanity check, full W=288 config
+#
+# Device is auto-selected by main.py: CUDA (GPU) → MPS (Apple Silicon) → CPU
+# Works on cloud GPU, Apple Silicon Mac, or CPU-only — no --device flag needed.
+# --amp enables AMP only when CUDA/MPS is active; safe to leave on everywhere.
 #
 # Usage:
 #   chmod +x run_subset_cloud.sh

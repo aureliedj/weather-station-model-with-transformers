@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-# run_subset.sh — pipeline sanity check on 2 years of data (local MPS run)
+# run_subset.sh — pipeline sanity check on 2 years of data (light local config)
+#
+# Device is auto-selected by main.py: CUDA (GPU) → MPS (Apple Silicon) → CPU
+# --amp is safe on all three; it enables AMP only when CUDA/MPS is active.
 #
 # Usage:
 #   chmod +x run_subset.sh
 #   ./run_subset.sh
 #
 # Tweak DATA_ROOT and SAVE_DIR before running.
-# Set NUM_WORKERS=0 on macOS to avoid shared-memory issues.
+# Use NUM_WORKERS=0 on macOS if you hit shared-memory issues (rare).
 
 set -euo pipefail
 
