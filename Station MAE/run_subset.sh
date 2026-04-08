@@ -20,7 +20,7 @@ python main.py \
     --window      12 \
     --max_delta   6 \
     --num_delta   3 \
-    --d_model     256 \
+    --d_model     128 \
     --enc_layers  6 \
     --dec_layers  2 \
     --batch_size  32 \
