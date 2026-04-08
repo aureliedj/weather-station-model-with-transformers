@@ -26,6 +26,7 @@ Masking strategy:
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as _cp_checkpoint
 from .embeddings import (
     PositionalEmbedding,
     StationEmbedding,
@@ -127,6 +128,9 @@ class StationMAEEncoder(nn.Module):
         station_char_dim:     Dimension of station characteristic features p2 (default 13).
         fourier_dim:          Fourier dimension for TemporalEmbedding (default 32).
         position_fourier_dim: Fourier features per coordinate for PositionalEmbedding (default 16).
+        use_checkpoint:       If True, use gradient checkpointing on each transformer block.
+                              Trades ~33% extra compute for ~66% less activation memory —
+                              enables larger batches / deeper models on limited GPU VRAM.
     """
 
     def __init__(
@@ -141,11 +145,13 @@ class StationMAEEncoder(nn.Module):
         station_char_dim:     int   = STATION_CHAR_DIM,
         fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
+        use_checkpoint:       bool  = False,
     ):
         super().__init__()
 
-        self.d_model    = d_model
-        self.mask_ratio = mask_ratio
+        self.d_model         = d_model
+        self.mask_ratio      = mask_ratio
+        self.use_checkpoint  = use_checkpoint
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
         self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
@@ -286,9 +292,16 @@ class StationMAEEncoder(nn.Module):
         # visible_tokens: (B, W*N_vis, d_model)
 
         # 3. Transformer blocks over visible tokens only
+        # Gradient checkpointing (use_checkpoint=True) avoids storing intermediate
+        # activations from each block; they are recomputed during backprop instead.
+        # This cuts activation memory by ~66% at ~33% extra compute — essential for
+        # deep encoders (enc_layers ≥ 6) or large windows on ≤ 30 GB GPUs.
         h = visible_tokens
         for block in self.blocks:
-            h = block(h)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                h = _cp_checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
         h = self.norm(h)                                           # (B, W*N_vis, d_model)
 
         return h, masked_idx, visible_idx

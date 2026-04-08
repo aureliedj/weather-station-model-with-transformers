@@ -54,9 +54,10 @@ Arguments
     --lr          FLT   Peak learning rate (default 1e-4)
     --weight_decay FLT  AdamW weight decay (default 0.05)
     --warmup_epochs INT Warmup epochs (default 5)
-    --grad_clip   FLT   Gradient clipping max norm (default 1.0)
-    --amp               Enable automatic mixed precision (flag, CUDA/MPS)
-    --device      STR   'cpu', 'cuda', or 'mps' (default: auto)
+    --grad_clip        FLT   Gradient clipping max norm (default 1.0)
+    --amp                    Enable automatic mixed precision (flag, CUDA/MPS)
+    --grad_checkpoint        Enable gradient checkpointing (~66% less VRAM, ~33% slower)
+    --device           STR   'cpu', 'cuda', or 'mps' (default: auto)
     --seed        INT   Random seed (default 42)
 
   Early stopping
@@ -124,9 +125,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_epochs",type=int,   default=5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
-    p.add_argument("--amp",          action="store_true")
-    p.add_argument("--device",       type=str,   default=None)
-    p.add_argument("--seed",         type=int,   default=42)
+    p.add_argument("--amp",             action="store_true")
+    p.add_argument("--grad_checkpoint", action="store_true",
+                   help="Enable gradient checkpointing on every transformer block. "
+                        "Trades ~33%% extra compute for ~66%% less activation VRAM — "
+                        "recommended for enc_layers >= 6 on <= 30 GB GPUs.")
+    p.add_argument("--device",          type=str,   default=None)
+    p.add_argument("--seed",            type=int,   default=42)
 
     # Early stopping
     p.add_argument("--patience",     type=int,   default=10,
@@ -279,7 +284,12 @@ def main() -> None:
         mask_ratio=args.mask_ratio,
         # Note: max_delta_steps is NOT passed to StationMAE — DeltaTimeEmbedding
         # uses continuous Fourier encoding over hours so no upper bound is needed.
+        use_checkpoint=args.grad_checkpoint,
     ).to(device)
+
+    if args.grad_checkpoint:
+        print("Gradient checkpointing: ON  "
+              "(recomputes block activations on backward — saves VRAM, ~33%% slower)")
 
     print(f"Model: {model.count_parameters():,} trainable parameters")
 

@@ -15,19 +15,20 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 SAVE_DIR="checkpoints/subset_run_remote"
 
 python main.py \
-    --data_root   "$DATA_ROOT" \
-    --cache_dir   "$DATA_ROOT" \
+    --data_root       "$DATA_ROOT" \
+    --cache_dir       "$DATA_ROOT" \
     --subset \
-    --window      288 \
-    --max_delta   18 \
-    --num_delta   3 \
-    --d_model     128 \
-    --enc_layers  6 \
-    --dec_layers  2 \
-    --batch_size  32 \
-    --num_workers 4 \
-    --epochs      20 \
-    --patience    5 \
-    --save_every  5 \
+    --window          288 \
+    --max_delta       18 \
+    --num_delta       3 \
+    --d_model         128 \
+    --enc_layers      6 \
+    --dec_layers      2 \
+    --batch_size      32 \
+    --num_workers     4 \
+    --epochs          20 \
+    --patience        5 \
+    --save_every      5 \
     --amp \
-    --save_dir    "$SAVE_DIR"
+    --grad_checkpoint \
+    --save_dir        "$SAVE_DIR"

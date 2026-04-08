@@ -88,6 +88,10 @@ class StationMAE(nn.Module):
         num_vars:         Input variables per station (6).
         num_target_vars:  Predicted variables per station (5, excludes precip).
         fourier_dim:      Fourier feature dimension for temporal embedding.
+        use_checkpoint:   Enable gradient checkpointing on every transformer block.
+                          Recomputes block activations during backprop instead of
+                          storing them — cuts activation VRAM by ~66% at ~33% extra
+                          compute.  Recommended for enc_layers ≥ 6 on ≤ 30 GB GPUs.
     """
 
     def __init__(
@@ -103,6 +107,7 @@ class StationMAE(nn.Module):
         num_vars:         int   = NUM_VARIABLES,
         num_target_vars:  int   = NUM_TARGET_VARIABLES,
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
+        use_checkpoint:   bool  = False,
     ):
         super().__init__()
 
@@ -119,6 +124,7 @@ class StationMAE(nn.Module):
             mask_ratio=mask_ratio,
             num_vars=num_vars,
             fourier_dim=fourier_dim,
+            use_checkpoint=use_checkpoint,
         )
 
         self.decoder = StationMAEDecoder(
@@ -130,6 +136,7 @@ class StationMAE(nn.Module):
             num_vars=num_vars,
             num_target_vars=num_target_vars,
             fourier_dim=fourier_dim,
+            use_checkpoint=use_checkpoint,
         )
 
     # ------------------------------------------------------------------

@@ -40,6 +40,7 @@ Why concatenate rather than cross-attend?
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as _cp_checkpoint
 
 from .embeddings import (
     PositionalEmbedding,
@@ -73,6 +74,7 @@ class StationMAEDecoder(nn.Module):
         fourier_dim:          Fourier dimension for TemporalEmbedding (default 32).
         delta_fourier_dim:    Fourier dimension for DeltaTimeEmbedding (default 16).
         position_fourier_dim: Fourier features per coordinate for PositionalEmbedding (default 16).
+        use_checkpoint:       If True, use gradient checkpointing on each decoder block.
     """
 
     def __init__(
@@ -88,12 +90,14 @@ class StationMAEDecoder(nn.Module):
         fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
         delta_fourier_dim:    int   = DELTA_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
+        use_checkpoint:       bool  = False,
     ):
         super().__init__()
 
         self.d_model         = d_model
         self.num_vars        = num_vars
         self.num_target_vars = num_target_vars
+        self.use_checkpoint  = use_checkpoint
 
         # ------------------------------------------------------------------
         # Learnable mask token — shared starting point for all station queries.
@@ -222,7 +226,10 @@ class StationMAEDecoder(nn.Module):
             full_seq = torch.cat([encoded_vis, queries], dim=1)     # (B, L_ctx+N, d_model)
             h = full_seq
             for block in self.blocks:
-                h = block(h)
+                if self.use_checkpoint and torch.is_grad_enabled():
+                    h = _cp_checkpoint(block, h, use_reentrant=False)
+                else:
+                    h = block(h)
             h = self.norm(h)
 
             station_tokens = h[:, -N:, :]                          # (B, N, d_model)
@@ -251,7 +258,10 @@ class StationMAEDecoder(nn.Module):
             full_seq = torch.cat([encoded_vis, queries_seq], dim=1)    # (B, L_ctx+N*K, d_model)
             h = full_seq
             for block in self.blocks:
-                h = block(h)
+                if self.use_checkpoint and torch.is_grad_enabled():
+                    h = _cp_checkpoint(block, h, use_reentrant=False)
+                else:
+                    h = block(h)
             h = self.norm(h)
 
             # Extract the last N*K tokens and project
