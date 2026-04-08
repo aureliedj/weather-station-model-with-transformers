@@ -31,10 +31,9 @@ python main.py \
     --enc_layers      6 \
     --dec_layers      2 \
     --batch_size      32 \
-    --num_workers     0 \
+    --num_workers     4 \
     --epochs          20 \
     --patience        5 \
     --save_every      5 \
     --amp \
-    --grad_checkpoint \
     --save_dir        "$SAVE_DIR"
