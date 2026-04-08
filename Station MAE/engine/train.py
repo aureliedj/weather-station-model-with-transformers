@@ -384,7 +384,7 @@ def train(
         val_loss = None
         val_rmse = None
         if val_loader is not None:
-            from evaluate import evaluate   # avoid circular import
+            from .evaluate import evaluate   # relative import within engine package
             metrics  = evaluate(model, val_loader, device)
             val_loss = metrics.get("avg_loss",     float("nan"))
             val_rmse = metrics.get("overall_rmse", float("nan"))
