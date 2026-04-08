@@ -164,14 +164,21 @@ def main() -> None:
     args = parse_args()
 
     # ---- Device & seed -------------------------------------------------
+    # Priority: CUDA (cloud GPU) > MPS (Apple Silicon) > CPU
     if args.device is None:
         device = torch.device(
-            "mps"  if torch.backends.mps.is_available() and torch.backends.mps.is_built() else
             "cuda" if torch.cuda.is_available() else
+            "mps"  if torch.backends.mps.is_available() and torch.backends.mps.is_built() else
             "cpu"
         )
     else:
         device = torch.device(args.device)
+
+    # CUDA-specific optimisations
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True    # faster matmuls on Ampere+
+        torch.backends.cudnn.allow_tf32       = True
+        torch.backends.cuda.enable_flash_sdp(True)      # Flash Attention where supported
 
     set_seed(args.seed)
     print(f"[Station-MAE]  device={device}  seed={args.seed}")

@@ -35,9 +35,10 @@ stations are used as context, not as supervision targets.
 Multi-delta training
 --------------------
 ``forward_multi_delta`` accepts K lead-times per sample (y/y_mask of shape
-(B, K, N, V)).  The encoder runs once; the decoder runs K times.  This
-amortises the expensive O(L²) encoder attention across multiple forecast
-horizons and improves gradient diversity within each step.
+(B, K, N, V)).  The encoder runs once; the decoder also runs once, processing
+all K lead-times in a single pass via N×K query tokens.  This amortises both
+the O(L²) encoder attention and the decoder attention across all horizons,
+improving gradient diversity while minimising per-step compute.
 
 Inference
 ---------
@@ -179,14 +180,16 @@ class StationMAE(nn.Module):
         delta_steps: torch.Tensor,   # (B, K)  long tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Multi-delta training forward: encoder runs once, decoder runs K times.
+        Multi-delta training forward: encoder once, decoder once for all K.
 
         The encoder processes the input window once (the expensive O(L²) step).
-        The decoder — which is much lighter — runs once per lead-time, producing
-        predictions for all K horizons.  The total loss is the mean over K.
+        The decoder also runs once — it builds N×K query tokens (one per
+        station × lead-time pair) and processes them all in a single transformer
+        pass, returning (B, K, N, num_target_vars) in one shot.
 
-        This amortises the encoder cost across forecast horizons and exposes
-        the model to a diverse range of lead-times within every gradient step.
+        This amortises both encoder and decoder attention across all K horizons
+        and exposes the model to a diverse range of lead-times within every
+        gradient step.
 
         Args:
             x, x_mask, spatial, x_hours : as in forward()
@@ -206,26 +209,22 @@ class StationMAE(nn.Module):
         encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
         # encoded: (B, W*N_vis, d_model)
 
-        # ── Decoder: runs K times ────────────────────────────────────────
-        preds_list = []
-        loss_acc   = torch.zeros(1, device=x.device, dtype=encoded.dtype).squeeze()
+        # ── Decoder: runs once for all K lead-times ──────────────────────
+        # decoder.forward() detects (B, K) inputs and builds N×K queries,
+        # returning (B, K, N, num_target_vars) in a single transformer pass.
+        preds_all = self.decoder(encoded, spatial, y_hours, delta_steps)
+        # preds_all: (B, K, N, num_target_vars)
 
+        # ── Loss: mean over K ────────────────────────────────────────────
+        loss_acc = torch.zeros(1, device=x.device, dtype=encoded.dtype).squeeze()
         for k in range(K):
-            preds_k = self.decoder(
-                encoded, spatial, y_hours[:, k], delta_steps[:, k]
-            )   # (B, N, num_target_vars)
-
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
+            loss_acc = loss_acc + self._masked_loss(
+                preds_all[:, k], y_target_k, y_mask_target_k, masked_idx
+            )
 
-            loss_k   = self._masked_loss(preds_k, y_target_k, y_mask_target_k, masked_idx)
-            loss_acc = loss_acc + loss_k
-            preds_list.append(preds_k)
-
-        loss      = loss_acc / K
-        preds_all = torch.stack(preds_list, dim=1)   # (B, K, N, num_target_vars)
-
-        return loss, preds_all, masked_idx
+        return loss_acc / K, preds_all, masked_idx
 
     # ------------------------------------------------------------------
     # Inference (no grad, no loss)

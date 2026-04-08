@@ -388,16 +388,21 @@ def main() -> None:
     args = parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-    # ── Device ───────────────────────────────────────────────────────────
+    # ── Device — priority: CUDA (cloud GPU) > MPS (Apple Silicon) > CPU ──
     if args.device is None:
         device = torch.device(
+            "cuda" if torch.cuda.is_available() else
             "mps"  if torch.backends.mps.is_available() and
                       torch.backends.mps.is_built() else
-            "cuda" if torch.cuda.is_available() else
             "cpu"
         )
     else:
         device = torch.device(args.device)
+
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32       = True
+        torch.backends.cuda.enable_flash_sdp(True)
 
     print(f"\n[test.py]  device={device}")
     os.makedirs(args.save_dir, exist_ok=True)
