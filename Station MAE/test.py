@@ -90,9 +90,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch_size",  type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
 
-    # Model architecture — must match the saved checkpoint
+    # Model architecture — must match the saved checkpoint.
+    # For Lightning checkpoints (.ckpt), arch flags are read from the saved
+    # hyper_parameters automatically; CLI flags serve as fallback defaults.
     p.add_argument("--checkpoint",  type=str, nargs="+", required=True,
-                   help="One or more .pt checkpoint paths to evaluate")
+                   help="One or more .pt / .ckpt checkpoint paths to evaluate")
     p.add_argument("--d_model",     type=int, default=128)
     p.add_argument("--enc_heads",   type=int, default=4)
     p.add_argument("--enc_layers",  type=int, default=4)
@@ -100,6 +102,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dec_layers",  type=int, default=2)
     p.add_argument("--mlp_ratio",   type=float, default=4.0)
     p.add_argument("--mask_ratio",  type=float, default=0.5)
+    p.add_argument("--factorised_encoder", action="store_true",
+                   help="Axial attention encoder (auto-detected from Lightning checkpoints)")
+    p.add_argument("--cross_attn_decoder", action="store_true",
+                   help="Cross-attention decoder (auto-detected from Lightning checkpoints)")
     p.add_argument("--device",      type=str, default=None)
 
     # Output
@@ -468,11 +474,35 @@ def main() -> None:
         print(f"\n{'='*60}")
         print(f"Checkpoint: {ckpt_path}")
 
-        # Load checkpoint metadata
-        ckpt = torch.load(ckpt_path, map_location=device)
-        ckpt_epoch    = ckpt.get("epoch",      "?")
-        ckpt_val_loss = ckpt.get("val_loss",   float("nan"))
-        print(f"  Saved at epoch {ckpt_epoch},  val_loss={ckpt_val_loss:.5f}")
+        # ── Load checkpoint (Lightning .ckpt or legacy .pt) ─────────────
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+        if "state_dict" in ckpt:
+            # Lightning format — weights stored under "state_dict" with "model." prefix
+            ckpt_epoch    = ckpt.get("epoch", "?")
+            ckpt_val_loss = float("nan")   # not directly stored; check best filename
+
+            # Arch flags: prefer saved hyper_parameters over CLI defaults
+            saved_cfg = ckpt.get("hyper_parameters", {}).get("cfg", {})
+            factorised = saved_cfg.get("factorised_encoder", args.factorised_encoder)
+            cross_attn = saved_cfg.get("cross_attn_decoder", args.cross_attn_decoder)
+
+            state_dict = {
+                k[len("model."):]: v
+                for k, v in ckpt["state_dict"].items()
+                if k.startswith("model.")
+            }
+        else:
+            # Legacy format saved by the old engine/train.py
+            ckpt_epoch    = ckpt.get("epoch",    "?")
+            ckpt_val_loss = ckpt.get("val_loss", float("nan"))
+            factorised    = args.factorised_encoder
+            cross_attn    = args.cross_attn_decoder
+            state_dict    = ckpt["model_state_dict"]
+
+        print(f"  Saved at epoch {ckpt_epoch}  "
+              + (f"val_loss={ckpt_val_loss:.5f}" if ckpt_val_loss == ckpt_val_loss else ""))
+        print(f"  factorised_encoder={factorised}  cross_attn_decoder={cross_attn}")
 
         # Build model
         from model.mae import StationMAE
@@ -485,8 +515,10 @@ def main() -> None:
             mlp_ratio=args.mlp_ratio,
             dropout=0.0,               # no dropout at inference
             mask_ratio=args.mask_ratio,
+            factorised_encoder=factorised,
+            cross_attention_decoder=cross_attn,
         ).to(device)
-        model.load_state_dict(ckpt["model_state_dict"])
+        model.load_state_dict(state_dict)
         print(f"  Parameters: {model.count_parameters():,}")
 
         # Run full evaluation

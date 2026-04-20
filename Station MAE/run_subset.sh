@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # run_subset.sh — pipeline sanity check on 2 years of data (light local config)
 #
-# Device is auto-selected by main.py: CUDA (GPU) → MPS (Apple Silicon) → CPU
-# --amp is safe on all three; it enables AMP only when CUDA/MPS is active.
+# Device is auto-selected by Lightning: CUDA (GPU) → MPS (Apple Silicon) → CPU
+# --amp enables fp16 AMP only when CUDA/MPS is active; safe to leave on everywhere.
+#
+# WandB: set --wandb_project to stream metrics to your WandB dashboard.
+#        Omit the flag entirely to log to CSV only (no WandB account needed).
 #
 # Usage:
 #   chmod +x run_subset.sh
 #   ./run_subset.sh
-#
-# Tweak DATA_ROOT and SAVE_DIR before running.
-# Use NUM_WORKERS=0 on macOS if you hit shared-memory issues (rare).
 
 set -euo pipefail
 
@@ -34,4 +34,6 @@ python main.py \
     --amp \
     --factorised_encoder \
     --cross_attn_decoder \
+    --wandb_project   station-mae \
+    --wandb_run_name  subset-local \
     --save_dir    "$SAVE_DIR"

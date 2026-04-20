@@ -23,12 +23,14 @@ from .embeddings import (
     TEMPORAL_FOURIER_DIM,
     DELTA_FOURIER_DIM,
 )
-from .encoder import StationMAEEncoder, TransformerBlock, FactorisedTransformerBlock
-from .decoder import StationMAEDecoder, CrossAttentionBlock
-from .mae    import StationMAE
+from .encoder          import StationMAEEncoder, TransformerBlock, FactorisedTransformerBlock
+from .decoder          import StationMAEDecoder, CrossAttentionBlock
+from .mae              import StationMAE
+from .lightning_module import StationMAELightning
 
 __all__ = [
     "StationMAE",
+    "StationMAELightning",
     "StationMAEEncoder",
     "StationMAEDecoder",
     "TransformerBlock",
