@@ -113,30 +113,25 @@ class StationMAELightning(pl.LightningModule):
         ym = y_mask[:, 0] if y_mask.dim() == 4 else y_mask
         yh = y_hours[:, 0] if y_hours.dim() == 2 else y_hours
 
-        loss, preds, masked_idx = self.model(
+        loss, preds, _ = self.model(
             x, x_mask, spatial, x_hours, y_, ym, yh, ds
         )
 
-        # Restrict to masked stations + present sensors
-        y_target      = y_[:, :, :NUM_TARGET_VARIABLES]
-        y_mask_target = ym[:, :, :NUM_TARGET_VARIABLES]
+        # Metrics over ALL N stations wherever sensors are present —
+        # consistent with the training objective which also covers all stations.
+        B, N = preds.shape[:2]
+        y_target      = y_[:, :, :NUM_TARGET_VARIABLES]    # (B, N, 5)
+        y_mask_target = ym[:, :, :NUM_TARGET_VARIABLES]    # (B, N, 5)
 
-        B = preds.size(0)
-        preds_list, targets_list, masks_list = [], [], []
-        for b in range(B):
-            mi = masked_idx[b]
-            preds_list.append(preds[b, mi])
-            targets_list.append(y_target[b, mi])
-            masks_list.append(y_mask_target[b, mi])
-
-        preds_all   = torch.cat(preds_list,   dim=0)           # (M, 5)
-        targets_all = torch.cat(targets_list, dim=0)
-        masks_all   = torch.cat(masks_list,   dim=0).bool()
+        # Flatten (B, N, V) → (B*N, V) for metric computation
+        preds_all   = preds.reshape(B * N, NUM_TARGET_VARIABLES)
+        targets_all = y_target.reshape(B * N, NUM_TARGET_VARIABLES)
+        masks_all   = y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).bool()
 
         # ── Log val loss (drives ModelCheckpoint + EarlyStopping) ──────
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
 
-        # ── Per-variable RMSE / MAE ─────────────────────────────────────
+        # ── Per-variable RMSE / MAE (all stations, present sensors only) ─
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
             m = masks_all[:, v]
             if m.sum() > 0:
@@ -146,7 +141,7 @@ class StationMAELightning(pl.LightningModule):
                 self.log(f"val/{var_name}_mae",  (p - t).abs().mean(),
                          on_epoch=True, sync_dist=True)
 
-        # ── Overall RMSE across all variables ──────────────────────────
+        # ── Overall RMSE across all variables and stations ─────────────
         if masks_all.sum() > 0:
             pf = preds_all[masks_all]
             tf = targets_all[masks_all]

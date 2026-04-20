@@ -467,22 +467,35 @@ class StationMAEDataset(Dataset):
         )
 
         # ------------------------------------------------------------------
-        # 2. Normalisation statistics — always from TRAINING years only
+        # 2. Normalisation statistics — ALWAYS from TRAINING years only
+        #
+        # Invariant that MUST be respected across all three splits:
+        #   • Training dataset  : obs_stats=None  → computed here from training
+        #                         years AFTER log1p has been applied above.
+        #   • Val / Test        : obs_stats=train_ds.obs_stats  → same stats,
+        #                         no recomputation.  Log1p is still applied
+        #                         (see step 1b above) before normalisation.
+        #
+        # Never pass obs_stats computed from raw (non-log1p) observations, or
+        # stats from a different training split — that would create a scale
+        # mismatch between the model's training distribution and inference.
+        #
+        # train_years must match the training run so that stats are anchored
+        # to the exact same data the model saw, avoiding drift between a
+        # subset run (e.g. [2020,2021]) and a full-data (2017–2021) job.
         # ------------------------------------------------------------------
-        # train_years controls which years are used for normalisation stats.
-        # For a subset run (e.g. train_years=[2020,2021]) this ensures stats
-        # are computed from the SAME data the model was trained on, avoiding
-        # scale drift if you later run a full (2017–2021) training job.
         effective_train_years = train_years if train_years is not None else TRAIN_YEARS
         if obs_stats is None:
             self.obs_stats = compute_obs_stats(
                 ds,
-                obs_full     = obs_full,
+                obs_full     = obs_full,       # already log1p-transformed above
                 mask_full    = mask_full,
                 timestamps   = timestamps_full,
                 train_years  = effective_train_years,
             )
         else:
+            # Stats passed in — assumed to be from train_ds.obs_stats
+            # (log1p-aware, same training years).
             self.obs_stats = obs_stats
 
         # ------------------------------------------------------------------

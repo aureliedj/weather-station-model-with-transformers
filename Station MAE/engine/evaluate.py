@@ -72,6 +72,10 @@ def evaluate(
     """
     Evaluate the model on one pass through `loader`.
 
+    Metrics are computed over **all N stations** wherever sensors are present
+    at the target timestep (y_mask == 1), consistent with the training loss
+    which also supervises all stations.
+
     Args:
         model:   StationMAE (or any nn.Module with the same forward signature).
                  Should already be moved to `device`.
@@ -79,22 +83,19 @@ def evaluate(
         device:  torch.device.
 
     Returns:
-        metrics: dict mapping metric names → float values.
-                 Keys: "avg_loss" (MSE, same scale as train loss),
-                       "{var}_rmse", "{var}_mae", "overall_rmse", "overall_mae".
+        metrics: dict — "avg_loss", "{var}_rmse", "{var}_mae",
+                        "overall_rmse", "overall_mae".
     """
     model.eval()
 
-    # Accumulate (masked_prediction, masked_target, sensor_mask) per variable
-    preds_list   = []   # list of (n_masked, V) tensors
+    preds_list   = []
     targets_list = []
-    masks_list   = []   # sensor presence at target step
+    masks_list   = []
 
-    total_loss = 0.0   # sum of per-batch MSE losses (same objective as training)
+    total_loss = 0.0
     n_batches  = 0
 
     for batch in loader:
-        # ---- Move to device ----------------------------------------
         x           = batch["x"].to(device)
         x_mask      = batch["x_mask"].to(device)
         spatial     = batch["spatial"].to(device)
@@ -105,61 +106,44 @@ def evaluate(
         delta_steps = batch["delta_steps"].to(device)
 
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
-            spatial = spatial[0]   # (N, 15)
+            spatial = spatial[0]
 
-        # ---- Forward (includes random masking in encoder) ----------
-        loss, preds, masked_idx = model(
+        loss, preds, _ = model(
             x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
         )
-        # loss:       scalar MSE (same objective as training)
-        # preds:      (B, N, V)
-        # masked_idx: (B, N_masked)
-
         total_loss += loss.item()
         n_batches  += 1
 
-        B = preds.size(0)
-
-        # Slice y and y_mask to target variables only — drops precipitation (last col).
-        # preds is already (B, N, NUM_TARGET_VARIABLES) from the decoder head;
-        # y and y_mask from the batch are still (B, N, 6) so they must match.
+        B, N = preds.shape[:2]
         y_target      = y[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
         y_mask_target = y_mask[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
 
-        # ---- Gather masked-station predictions per sample ----------
-        for b in range(B):
-            m_idx = masked_idx[b]                                    # (N_masked,)
-            preds_list.append(preds[b, m_idx].cpu())                 # (N_masked, 5)
-            targets_list.append(y_target[b, m_idx].cpu())            # (N_masked, 5)
-            masks_list.append(y_mask_target[b, m_idx].cpu())         # (N_masked, 5)
+        # Accumulate all N stations (vectorised — no per-sample masking loop)
+        preds_list.append(preds.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
+        targets_list.append(y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
+        masks_list.append(y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
 
-    # ---- Concatenate across all batches ----------------------------
-    preds_all   = torch.cat(preds_list,   dim=0)    # (total_masked, 5)
-    targets_all = torch.cat(targets_list, dim=0)    # (total_masked, 5)
-    masks_all   = torch.cat(masks_list,   dim=0).bool()  # (total_masked, 5)
+    preds_all   = torch.cat(preds_list,   dim=0)            # (total, 5)
+    targets_all = torch.cat(targets_list, dim=0)
+    masks_all   = torch.cat(masks_list,   dim=0).bool()
 
-    # ---- Per-variable metrics (present sensors only) ---------------
     metrics: dict[str, float] = {
-        "avg_loss": total_loss / max(n_batches, 1),   # MSE, same scale as train_loss
+        "avg_loss": total_loss / max(n_batches, 1),
     }
 
     for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
-        m = masks_all[:, v]              # (total_masked,) boolean
+        m = masks_all[:, v]
         if m.sum() == 0:
             metrics[f"{var_name}_rmse"] = float("nan")
             metrics[f"{var_name}_mae"]  = float("nan")
             continue
-
-        p = preds_all[m, v]
-        t = targets_all[m, v]
+        p, t = preds_all[m, v], targets_all[m, v]
         metrics[f"{var_name}_rmse"] = float((p - t).pow(2).mean().sqrt().item())
         metrics[f"{var_name}_mae"]  = float((p - t).abs().mean().item())
 
-    # ---- Overall metrics across all variables ----------------------
-    valid = masks_all                                       # (total_masked, V)
-    if valid.sum() > 0:
-        p_flat = preds_all[valid]
-        t_flat = targets_all[valid]
+    if masks_all.sum() > 0:
+        p_flat = preds_all[masks_all]
+        t_flat = targets_all[masks_all]
         metrics["overall_rmse"] = float((p_flat - t_flat).pow(2).mean().sqrt().item())
         metrics["overall_mae"]  = float((p_flat - t_flat).abs().mean().item())
     else:
@@ -236,9 +220,11 @@ def evaluate_full(
     """
     model.eval()
 
-    # Storage per sample: list of dicts so we can group by delta later
-    records = []    # each entry: {"pred": (n_m,5), "target": (n_m,5),
-                    #              "mask": (n_m,5), "delta": int}
+    # Records are stored per batch for the per-delta breakdown.
+    # Each entry covers ALL N stations in the batch (not just masked ones),
+    # consistent with the all-station training objective.
+    records = []    # each entry: {"pred": (B*N, 5), "target": (B*N, 5),
+                    #              "mask": (B*N, 5), "deltas": (B,) int list}
 
     total_loss = 0.0
     n_batches  = 0
@@ -256,37 +242,35 @@ def evaluate_full(
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
             spatial = spatial[0]
 
-        # Multi-delta batches: take only the first lead-time slice for evaluation
-        # (consistent with single-delta val_loader; avoids double-counting)
-        if y_raw.dim() == 4:          # (B, K, N, V) → use k=0
-            y_raw      = y_raw[:, 0]
-            y_mask_raw = y_mask_raw[:, 0]
-            y_hours    = y_hours[:, 0]
+        # Multi-delta batches: use the first lead-time slice only
+        if y_raw.dim() == 4:
+            y_raw       = y_raw[:, 0]
+            y_mask_raw  = y_mask_raw[:, 0]
+            y_hours     = y_hours[:, 0]
             delta_steps = delta_steps[:, 0]
 
-        loss, preds, masked_idx = model(
+        loss, preds, _ = model(
             x, x_mask, spatial, x_hours,
             y_raw, y_mask_raw, y_hours, delta_steps,
         )
         total_loss += loss.item()
         n_batches  += 1
 
+        B, N = preds.shape[:2]
         y_target      = y_raw[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
         y_mask_target = y_mask_raw[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
 
-        B = preds.size(0)
-        for b in range(B):
-            m_idx = masked_idx[b]
-            delta = int(delta_steps[b].item())
-            records.append({
-                "pred":   preds[b, m_idx].cpu(),             # (n_m, 5)
-                "target": y_target[b, m_idx].cpu(),          # (n_m, 5)
-                "mask":   y_mask_target[b, m_idx].cpu(),     # (n_m, 5) bool
-                "delta":  delta,
-            })
+        # Flatten all N stations — one row per (sample, station) pair
+        records.append({
+            "pred":   preds.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+            "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+            "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+            "deltas": delta_steps.tolist(),   # list of B delta values
+            "N":      N,
+        })
 
-    # ── Concatenate all samples ─────────────────────────────────────────
-    preds_all   = torch.cat([r["pred"]   for r in records], dim=0)   # (M, 5)
+    # ── Concatenate all batches ─────────────────────────────────────────
+    preds_all   = torch.cat([r["pred"]   for r in records], dim=0)
     targets_all = torch.cat([r["target"] for r in records], dim=0)
     masks_all   = torch.cat([r["mask"]   for r in records], dim=0).bool()
 
@@ -394,14 +378,29 @@ def evaluate_full(
                     metrics[k] = float("nan")
 
     # ── Per-delta-step breakdown ────────────────────────────────────────
-    unique_deltas = sorted({r["delta"] for r in records})
+    # Re-expand batch records to per-sample entries for delta grouping.
+    # Each batch record covers B samples × N stations; we split by sample
+    # so we can filter on the per-sample delta value.
+    sample_records: list[dict] = []
+    for r in records:
+        N_r = r["N"]
+        for b, d in enumerate(r["deltas"]):
+            sample_records.append({
+                "pred":   r["pred"]  [b * N_r : (b + 1) * N_r],    # (N, 5)
+                "target": r["target"][b * N_r : (b + 1) * N_r],
+                "mask":   r["mask"]  [b * N_r : (b + 1) * N_r],
+                "delta":  d,
+            })
+
+    unique_deltas = sorted({sr["delta"] for sr in sample_records})
     for d in unique_deltas:
-        recs_d = [r for r in records if r["delta"] == d]
+        recs_d = [sr for sr in sample_records if sr["delta"] == d]
         if not recs_d:
             continue
-        p_d = torch.cat([r["pred"]   for r in recs_d], dim=0)
-        t_d = torch.cat([r["target"] for r in recs_d], dim=0)
-        m_d = torch.cat([r["mask"]   for r in recs_d], dim=0).bool()
+
+        p_d = torch.cat([sr["pred"]   for sr in recs_d], dim=0)
+        t_d = torch.cat([sr["target"] for sr in recs_d], dim=0)
+        m_d = torch.cat([sr["mask"]   for sr in recs_d], dim=0).bool()
 
         if m_d.sum() == 0:
             metrics[f"delta_{d:02d}_overall_rmse_norm"] = float("nan")
@@ -411,22 +410,16 @@ def evaluate_full(
         metrics[f"delta_{d:02d}_overall_rmse_norm"] = float(
             err_d.pow(2).mean().sqrt().item()
         )
-        metrics[f"delta_{d:02d}_overall_mae_norm"] = float(
-            err_d.abs().mean().item()
-        )
-        metrics[f"delta_{d:02d}_n_samples"] = len(recs_d)
+        metrics[f"delta_{d:02d}_overall_mae_norm"]  = float(err_d.abs().mean().item())
+        metrics[f"delta_{d:02d}_n_samples"]         = len(recs_d)
 
-        # Per-variable RMSE at this delta
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
-            mv = m_d[:, v] if m_d.dim() == 2 else m_d
-            # m_d is (M_d, 5) after masking — already bool tensor of (total_masked_d, 5)
-            # Need per-column mask
-            m_d_v = torch.cat([r["mask"][:, v] for r in recs_d], dim=0).bool()
+            m_d_v = torch.cat([sr["mask"][:, v] for sr in recs_d], dim=0).bool()
             if m_d_v.sum() == 0:
                 metrics[f"delta_{d:02d}_{var_name}_rmse_norm"] = float("nan")
                 continue
-            p_dv = torch.cat([r["pred"][:, v]   for r in recs_d], dim=0)[m_d_v]
-            t_dv = torch.cat([r["target"][:, v] for r in recs_d], dim=0)[m_d_v]
+            p_dv = torch.cat([sr["pred"][:, v]   for sr in recs_d], dim=0)[m_d_v]
+            t_dv = torch.cat([sr["target"][:, v] for sr in recs_d], dim=0)[m_d_v]
             metrics[f"delta_{d:02d}_{var_name}_rmse_norm"] = float(
                 (p_dv - t_dv).pow(2).mean().sqrt().item()
             )
@@ -459,7 +452,7 @@ def print_full_metrics(metrics: dict[str, float], obs_stats: "dict | None" = Non
     unit_map = _VAR_UNITS if has_phys else {v: "norm" for v in TARGET_VARIABLE_NAMES}
 
     # ── Section 1: per-variable ─────────────────────────────────────────
-    print("\n── Per-variable metrics (masked stations) " + "─" * 30)
+    print("\n── Per-variable metrics (all stations, present sensors) " + "─" * 15)
     hdr = f"  {'Variable':<14}  {'RMSE':>8}  {'MAE':>8}  {'Bias':>8}  {'R²':>6}  Unit"
     print(hdr)
     print("  " + "-" * (len(hdr) - 2))

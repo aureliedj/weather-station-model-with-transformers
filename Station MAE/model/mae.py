@@ -22,7 +22,7 @@ Data flow
    preds  (B, N, num_target_vars)
         │
         ▼
-   _masked_loss  →  loss   (scalar, MSE on masked stations × present sensors)
+   _supervised_loss  →  loss   (scalar, MSE on all N stations × present sensors)
 
 
 Training objective
@@ -168,16 +168,17 @@ class StationMAE(nn.Module):
         Full training forward pass for a single lead-time per sample.
 
         Returns:
-            loss:           scalar — MSE on masked stations (present sensors only)
+            loss:           scalar — MSE on all N stations (present sensors only)
             preds:          (B, N, num_target_vars)
-            masked_indices: (B, N_masked)
+            masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
         encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
         preds = self.decoder(encoded, spatial, y_hours, delta_steps)
 
         y_target      = y[:, :, :self.num_target_vars]
         y_mask_target = y_mask[:, :, :self.num_target_vars]
-        loss = self._masked_loss(preds, y_target, y_mask_target, masked_idx)
+        # Loss over ALL N stations (visible + masked) wherever sensors present
+        loss = self._supervised_loss(preds, y_target, y_mask_target)
 
         return loss, preds, masked_idx
 
@@ -237,8 +238,9 @@ class StationMAE(nn.Module):
         for k in range(K):
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
-            loss_acc = loss_acc + self._masked_loss(
-                preds_all[:, k], y_target_k, y_mask_target_k, masked_idx
+            # Loss over ALL N stations (visible + masked) wherever sensors present
+            loss_acc = loss_acc + self._supervised_loss(
+                preds_all[:, k], y_target_k, y_mask_target_k
             )
 
         return loss_acc / K, preds_all, masked_idx
@@ -276,30 +278,31 @@ class StationMAE(nn.Module):
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _masked_loss(
-        preds:          torch.Tensor,   # (B, N, V)
-        y:              torch.Tensor,   # (B, N, V)
-        y_mask:         torch.Tensor,   # (B, N, V)  1.0 = sensor present
-        masked_indices: torch.Tensor,   # (B, N_masked)
+    def _supervised_loss(
+        preds:   torch.Tensor,   # (B, N, V)
+        y:       torch.Tensor,   # (B, N, V)
+        y_mask:  torch.Tensor,   # (B, N, V)  1.0 = sensor present at target step
     ) -> torch.Tensor:
         """
-        MSE loss restricted to:
-          (a) stations that were masked by the encoder, AND
-          (b) sensors that were present at the target timestep (y_mask == 1).
+        MSE loss over **all N stations** wherever sensors are present at the
+        target timestep (y_mask == 1).
 
-        Returns a scalar.
+        The encoder still masks a fraction of stations (they never see the
+        input window).  However, the decoder produces predictions for every
+        station, and the loss now supervises ALL of them — not just the masked
+        subset.  This gives richer gradient signal: visible stations are
+        regularised to predict accurately, and masked stations are forced to
+        reconstruct from spatial context alone.
+
+        The only exclusion is where the sensor was absent at the target step
+        (y_mask == 0) — those entries have no ground truth.
+
+        Returns a scalar (mean squared error over present sensor readings).
         """
-        B, N, V = preds.shape
-
-        station_masked = torch.zeros(B, N, dtype=torch.bool, device=preds.device)
-        station_masked.scatter_(1, masked_indices, True)              # (B, N)
-
-        sensor_ok = y_mask.bool()                                     # (B, N, V)
-        full_mask = station_masked.unsqueeze(-1) & sensor_ok          # (B, N, V)
-
-        sq_err = (preds - y).pow(2)
-        denom  = full_mask.float().sum().clamp(min=1.0)
-        return (sq_err * full_mask.float()).sum() / denom
+        sensor_ok = y_mask.bool()                        # (B, N, V)
+        sq_err    = (preds - y).pow(2)
+        denom     = sensor_ok.float().sum().clamp(min=1.0)
+        return (sq_err * sensor_ok.float()).sum() / denom
 
     # ------------------------------------------------------------------
     # Convenience

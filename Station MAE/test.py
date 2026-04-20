@@ -129,17 +129,16 @@ def compute_persistence_metrics(
     Compute metrics for the persistence baseline: predict the last observed
     value of the input window as the forecast at all lead-times.
 
-    The baseline is applied only to masked stations (same evaluation protocol
-    as the model) and only where sensor data is present at the target step.
+    Evaluated over ALL N stations wherever sensor data is present at the
+    target step, consistent with the model's all-station evaluation protocol.
 
     Returns dict with same key structure as evaluate_full() for easy comparison.
     """
     from model.embeddings import TARGET_VARIABLE_NAMES, NUM_TARGET_VARIABLES
 
-    std_t  = obs_stats["std"].cpu()
+    std_t = obs_stats["std"].cpu()
 
-    # Use records list (same approach as evaluate_full) so per-delta grouping
-    # works correctly on the masked-station level.
+    # Batch-level records matching evaluate_full() structure
     records: list[dict] = []
 
     for batch in loader:
@@ -148,7 +147,6 @@ def compute_persistence_metrics(
         y_mask_raw  = batch["y_mask"]
         delta_steps = batch["delta_steps"]  # (B,) or (B, K)
 
-        # Handle multi-delta: take first delta only
         if y_raw.dim() == 4:
             y_raw       = y_raw[:, 0]
             y_mask_raw  = y_mask_raw[:, 0]
@@ -156,20 +154,19 @@ def compute_persistence_metrics(
 
         B, W, N, V = x.shape
 
-        # Persistence: last input time-step → target (same for all lead-times)
+        # Persistence: last observed input step as forecast for every lead-time
         persist_pred  = x[:, -1, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
         y_target      = y_raw[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
         y_mask_target = y_mask_raw[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
 
-        n_masked = max(1, int(round(N * 0.5)))   # same ratio as model (mask_ratio=0.5)
-        for b in range(B):
-            m_idx = torch.randperm(N)[:n_masked]
-            records.append({
-                "pred":   persist_pred[b, m_idx],       # (n_m, 5)
-                "target": y_target[b, m_idx],
-                "mask":   y_mask_target[b, m_idx],
-                "delta":  int(delta_steps[b].item()),
-            })
+        # Flatten all N stations — no masking simulation needed
+        records.append({
+            "pred":   persist_pred.reshape(B * N, NUM_TARGET_VARIABLES),
+            "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES),
+            "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES),
+            "deltas": delta_steps.tolist(),
+            "N":      N,
+        })
 
     preds_all   = torch.cat([r["pred"]   for r in records], dim=0)
     targets_all = torch.cat([r["target"] for r in records], dim=0)
@@ -200,13 +197,24 @@ def compute_persistence_metrics(
             err_all.pow(2).mean().sqrt().item()
         )
 
-    # Per-delta (group records by delta)
-    unique_deltas = sorted({r["delta"] for r in records})
+    # Per-delta (expand batch records → per-sample then group by delta)
+    sample_records: list[dict] = []
+    for r in records:
+        N_r = r["N"]
+        for b, d in enumerate(r["deltas"]):
+            sample_records.append({
+                "pred":   r["pred"]  [b * N_r : (b + 1) * N_r],
+                "target": r["target"][b * N_r : (b + 1) * N_r],
+                "mask":   r["mask"]  [b * N_r : (b + 1) * N_r],
+                "delta":  d,
+            })
+
+    unique_deltas = sorted({sr["delta"] for sr in sample_records})
     for d in unique_deltas:
-        recs_d = [r for r in records if r["delta"] == d]
-        p_d = torch.cat([r["pred"]   for r in recs_d], dim=0)
-        t_d = torch.cat([r["target"] for r in recs_d], dim=0)
-        m_d = torch.cat([r["mask"]   for r in recs_d], dim=0).bool()
+        recs_d = [sr for sr in sample_records if sr["delta"] == d]
+        p_d = torch.cat([sr["pred"]   for sr in recs_d], dim=0)
+        t_d = torch.cat([sr["target"] for sr in recs_d], dim=0)
+        m_d = torch.cat([sr["mask"]   for sr in recs_d], dim=0).bool()
         if m_d.sum() > 0:
             err = p_d[m_d] - t_d[m_d]
             metrics[f"persist_delta_{d:02d}_overall_rmse_norm"] = float(
