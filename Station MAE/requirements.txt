@@ -1,8 +1,7 @@
 peakweather @ git+https://github.com/MeteoSwiss/PeakWeather.git@28a28c2d17f47b8bf33f22ee62fc92adac9b4778
 
 # Core deep learning
-torch==2.10.0
-torchvision==0.25.0
+torch>=2.2,<3.0
 
 # Training framework + experiment tracking
 pytorch-lightning>=2.2
@@ -18,5 +17,4 @@ rioxarray>=0.15
 matplotlib>=3.7
 
 # Notebooks
-numba>=0.59
 jupyterlab>=4.0

@@ -22,46 +22,60 @@ Usage
                    --checkpoint checkpoints/run1/best.pt checkpoints/run2/best.pt \\
                    --save_dir results/
 
+    # With Weights & Biases logging
+    python test.py --data_root /path/to/peakweather \\
+                   --checkpoint checkpoints/run1/best.pt \\
+                   --wandb_project station-mae --wandb_run_name test-best
+
 Arguments
 ---------
   Data
-    --data_root   STR   Path to PeakWeather data directory (required)
-    --cache_dir   STR   Pre-built tensor cache (defaults to data_root)
-    --window      INT   Input window steps (default 288 = 48 h at 10-min res)
-    --max_delta   INT   Max lead-time steps (default 18 = 3 h)
-    --batch_size  INT   Inference batch size (default 32)
-    --num_workers INT   DataLoader workers (default 4)
+    --data_root        STR   Path to PeakWeather data directory (required)
+    --cache_dir        STR   Pre-built tensor cache (defaults to data_root)
+    --window           INT   Input window steps (default 288 = 48 h at 10-min res)
+    --max_delta        INT   Max lead-time steps (default 18 = 3 h)
+    --batch_size       INT   Inference batch size (default 32)
+    --num_workers      INT   DataLoader workers (default 4)
 
   Model
-    --checkpoint  STR   Path to .pt checkpoint file (required; can be repeated)
-    --d_model     INT   Must match the saved model (default 128)
-    --enc_heads   INT   (default 4)
-    --enc_layers  INT   (default 4)
-    --dec_heads   INT   (default 4)
-    --dec_layers  INT   (default 2)
-    --mlp_ratio   FLT   (default 4.0)
-    --mask_ratio  FLT   Masking fraction used at eval (default 0.5)
+    --checkpoint       STR   Path to .pt/.ckpt checkpoint file (required; can be repeated)
+    --d_model          INT   Must match the saved model (default 128)
+    --enc_heads        INT   (default 4)
+    --enc_layers       INT   (default 4)
+    --dec_heads        INT   (default 4)
+    --dec_layers       INT   (default 2)
+    --mlp_ratio        FLT   (default 4.0)
+    --mask_ratio       FLT   Masking fraction used at eval (default 0.5)
 
   Output
-    --save_dir    STR   Directory for metrics CSV and plots (default "test_results")
-    --no_plots        Skip matplotlib plots
+    --save_dir         STR   Directory for metrics CSV and plots (default "test_results")
+    --no_plots               Skip matplotlib plots
+    --gap_fill_repeats INT   Random masks per window for gap-filling eval (default 3)
+    --wandb_project    STR   WandB project name; omit to disable WandB logging
+    --wandb_run_name   STR   WandB run name (default: "test-<checkpoint_stem>")
 
-Metrics computed
+Evaluation modes
 ----------------
-    Per variable (temperature, pressure, humidity, wind_u, wind_v):
-        RMSE, MAE, Bias (MBE), R²  — in both normalised and physical units
+  Standard (all deltas, all stations):
+    Per variable RMSE, MAE, Bias, R² — normalised + physical units.
+    Wind speed / direction.  Per-delta RMSE table.
+    Skill score vs persistence baseline.
+    → Saved to:  test_metrics.csv
 
-    Wind-derived:
-        Wind speed RMSE / MAE / Bias  (m/s, from denormalised u+v)
-        Wind direction MAE            (degrees, circular)
+  Lead-1 / 10-min forecast (delta = 1 step, all stations):
+    Same metrics as standard eval but restricted to a fixed 10-min lead-time.
+    → Saved to:  lead1_metrics.csv
 
-    Per lead-time (delta = 1..max_delta):
-        Overall RMSE (normalised), per-variable RMSE (normalised)
+  Spatial gap-filling (delta = 0, masked stations only):
+    Target = last input timestep; model reconstructs masked stations from context.
+    n_repeats independent random masks applied per window for stable estimates.
+    Metrics computed only on the hidden (masked) stations.
+    → Saved to:  gap_filling_metrics.csv
 
-    Persistence baseline:
-        Uses the last input time-step as the naive forecast.
-        Reports persistence RMSE per variable and skill score:
-            skill = 1 - RMSE_model / RMSE_persistence   (higher = better)
+  Persistence baseline:
+    Uses the last input time-step as the naive forecast.
+    Reports persistence RMSE per variable and skill score:
+        skill = 1 - RMSE_model / RMSE_persistence   (higher = better)
 """
 
 import argparse
@@ -109,8 +123,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device",      type=str, default=None)
 
     # Output
-    p.add_argument("--save_dir",    type=str, default="test_results")
-    p.add_argument("--no_plots",    action="store_true")
+    p.add_argument("--save_dir",          type=str, default="test_results")
+    p.add_argument("--no_plots",          action="store_true")
+    p.add_argument("--gap_fill_repeats",  type=int, default=3,
+                   help="Number of random masks per window for gap-filling eval (default 3)")
+    p.add_argument("--wandb_project",     type=str, default=None,
+                   help="WandB project name; omit to disable WandB logging")
+    p.add_argument("--wandb_run_name",    type=str, default=None,
+                   help="WandB run name (default: 'test-<checkpoint_stem>')")
 
     return p.parse_args()
 
@@ -278,6 +298,32 @@ def compute_skill_scores(
 # ---------------------------------------------------------------------------
 # CSV save
 # ---------------------------------------------------------------------------
+
+def save_extra_metrics_csv(
+    all_results: list[dict],   # list of {"label": str, "metrics": dict}
+    save_dir: str,
+    filename: str,
+) -> str:
+    """Save an auxiliary metrics table (lead-1 or gap-filling) to CSV."""
+    os.makedirs(save_dir, exist_ok=True)
+    path = os.path.join(save_dir, filename)
+
+    all_keys: list[str] = []
+    for r in all_results:
+        for k in r["metrics"]:
+            if k not in all_keys:
+                all_keys.append(k)
+
+    with open(path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["checkpoint"] + all_keys)
+        for r in all_results:
+            row = [r["label"]]
+            row += [f"{r['metrics'].get(k, float('nan')):.6f}" for k in all_keys]
+            writer.writerow(row)
+
+    return path
+
 
 def save_metrics_csv(
     all_results: list[dict],   # list of {"label": str, "metrics": dict, "skill": dict}
@@ -460,7 +506,31 @@ def main() -> None:
         prefetch_factor=(4 if _use_persistent else None),
     )
 
-    # ── Persistence baseline ─────────────────────────────────────────────
+    # ── Lead-1 (10-min forecast) dataset & loader ─────────────────────────
+    print("Building lead-1 test dataset (delta_steps=1, fixed) …")
+    lead1_ds = StationMAEDataset(
+        ds,
+        window_size=args.window,
+        delta_steps=1,
+        split="test",
+        obs_stats=obs_stats,
+        num_delta_per_sample=1,
+        max_delta_steps=1,          # clamp: only delta=1 ever sampled
+        cache_dir=cache_dir,
+    )
+    print(f"  lead-1 test samples: {len(lead1_ds):,}")
+
+    lead1_loader = DataLoader(
+        lead1_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=_use_persistent,
+        prefetch_factor=(4 if _use_persistent else None),
+    )
+
+    # ── Persistence baseline (standard loader — all deltas) ──────────────
     print("\nComputing persistence baseline …")
     persist_metrics = compute_persistence_metrics(test_loader, device, obs_stats)
 
@@ -472,7 +542,9 @@ def main() -> None:
     print(f"    {'[overall]':<14}  {persist_metrics.get('persist_overall_rmse_norm', float('nan')):.5f}")
 
     # ── Per-checkpoint evaluation ─────────────────────────────────────────
-    all_results: list[dict] = []
+    all_results:       list[dict] = []
+    all_lead1_results: list[dict] = []
+    all_gap_results:   list[dict] = []
 
     for ckpt_path in args.checkpoint:
         if not os.path.exists(ckpt_path):
@@ -529,9 +601,12 @@ def main() -> None:
         model.load_state_dict(state_dict)
         print(f"  Parameters: {model.count_parameters():,}")
 
-        # Run full evaluation
-        from engine.evaluate import evaluate_full, print_full_metrics
-        print("  Running evaluate_full() …")
+        # ── Standard full evaluation (all deltas, all stations) ─────────
+        from engine.evaluate import (
+            evaluate_full, print_full_metrics,
+            evaluate_gap_filling, print_gap_filling_metrics,
+        )
+        print("  Running evaluate_full() [all deltas, all stations] …")
         metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
 
         # Skill scores vs persistence
@@ -558,6 +633,90 @@ def main() -> None:
             "skill":   skill,
         })
 
+        # ── Lead-1 evaluation (delta = 1 step = 10 min, all stations) ───
+        print(f"\n  Running evaluate_full() [lead-1 / 10-min forecast, all stations] …")
+        lead1_metrics = evaluate_full(model, lead1_loader, device, obs_stats=obs_stats)
+
+        print("\n── Lead-1 (10-min forecast) · all stations ──────────────────────────")
+        print_full_metrics(lead1_metrics, obs_stats=obs_stats)
+
+        all_lead1_results.append({
+            "label":   label,
+            "metrics": lead1_metrics,
+        })
+
+        # ── Gap-filling evaluation (delta = 0, masked stations only) ────
+        print(f"\n  Running evaluate_gap_filling() "
+              f"[n_repeats={args.gap_fill_repeats}] …")
+        gap_metrics = evaluate_gap_filling(
+            model, test_loader, device,
+            obs_stats=obs_stats,
+            n_repeats=args.gap_fill_repeats,
+        )
+
+        print("\n── Spatial gap-filling · masked stations only ───────────────────────")
+        print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
+
+        all_gap_results.append({
+            "label":   label,
+            "metrics": gap_metrics,
+        })
+
+        # ── WandB logging (optional) ─────────────────────────────────────
+        if args.wandb_project:
+            try:
+                import wandb
+                run_name = args.wandb_run_name or f"test-{label}"
+                _wandb_run = wandb.init(
+                    project=args.wandb_project,
+                    name=run_name,
+                    job_type="evaluation",
+                    config={
+                        "checkpoint":         ckpt_path,
+                        "epoch":              ckpt_epoch,
+                        "window":             args.window,
+                        "max_delta":          args.max_delta,
+                        "mask_ratio":         args.mask_ratio,
+                        "gap_fill_repeats":   args.gap_fill_repeats,
+                        "factorised_encoder": factorised,
+                        "cross_attn_decoder": cross_attn,
+                    },
+                    reinit=True,
+                )
+
+                # -- Standard eval: log per-delta RMSE as a table + summary ──
+                delta_keys = sorted(
+                    k for k in metrics
+                    if k.startswith("delta_") and k.endswith("_overall_rmse_norm")
+                )
+                for dk in delta_keys:
+                    d    = int(dk.split("_")[1])
+                    rmse = metrics[dk]
+                    mae  = metrics.get(f"delta_{d:02d}_overall_mae_norm", float("nan"))
+                    wandb.log({
+                        "delta_min":          d * 10,
+                        "eval/rmse_norm":     rmse,
+                        "eval/mae_norm":      mae,
+                    })
+
+                # Summary: all flat metrics prefixed by mode
+                summary_flat: dict[str, float] = {}
+                for k, v in metrics.items():
+                    summary_flat[f"eval/{k}"] = v
+                for k, v in skill.items():
+                    summary_flat[f"eval/{k}"] = v
+                for k, v in lead1_metrics.items():
+                    summary_flat[f"lead1/{k}"] = v
+                for k, v in gap_metrics.items():
+                    summary_flat[f"gap/{k}"] = v
+
+                wandb.summary.update(summary_flat)
+                _wandb_run.finish()
+                print(f"  WandB run logged: {run_name} "
+                      f"(project={args.wandb_project})")
+            except ImportError:
+                print("  [WandB] wandb not installed — skipping logging")
+
     if not all_results:
         print("\nNo valid checkpoints evaluated.")
         return
@@ -565,6 +724,18 @@ def main() -> None:
     # ── Save CSV ─────────────────────────────────────────────────────────
     csv_path = save_metrics_csv(all_results, args.save_dir)
     print(f"\nMetrics saved to: {csv_path}")
+
+    if all_lead1_results:
+        lead1_csv = save_extra_metrics_csv(
+            all_lead1_results, args.save_dir, "lead1_metrics.csv"
+        )
+        print(f"Lead-1 metrics saved to: {lead1_csv}")
+
+    if all_gap_results:
+        gap_csv = save_extra_metrics_csv(
+            all_gap_results, args.save_dir, "gap_filling_metrics.csv"
+        )
+        print(f"Gap-filling metrics saved to: {gap_csv}")
 
     # ── Save persistence metrics too ─────────────────────────────────────
     persist_csv = os.path.join(args.save_dir, "persistence_metrics.csv")

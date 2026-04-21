@@ -428,6 +428,206 @@ def evaluate_full(
 
 
 # ---------------------------------------------------------------------------
+# Gap-filling evaluation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_gap_filling(
+    model:     nn.Module,
+    loader:    DataLoader,
+    device:    torch.device,
+    obs_stats: "dict | None" = None,
+    n_repeats: int = 3,
+) -> dict[str, float]:
+    """
+    Spatial gap-filling evaluation.
+
+    For every batch window the *last* input timestep is used as the
+    reconstruction target (delta = 0).  ``model.forward()`` is called
+    ``n_repeats`` times per batch; each call applies a *different* random
+    station mask (the encoder's ``_mask_stations()`` is unconditional, so
+    masking varies even in ``eval`` mode).
+
+    Metrics are computed **only on masked (hidden) stations** — the stations
+    the model had to reconstruct without direct access to their values.  This
+    isolates spatial interpolation skill from trivial copy-through of visible
+    context.
+
+    Args:
+        model:      StationMAE (or compatible) already moved to ``device``.
+        loader:     DataLoader from StationMAEDataset (any delta config;
+                    delta information is overridden inside this function).
+        device:     torch.device.
+        obs_stats:  dict with ``"mean"`` and ``"std"`` tensors of shape
+                    ``(NUM_VARIABLES,)``.  Pass ``train_ds.obs_stats`` for
+                    physical-unit metrics; ``None`` returns normalised only.
+        n_repeats:  Number of independent random masks per batch window.
+                    Higher values give more stable estimates at the cost of
+                    extra forward passes (default 3).
+
+    Returns:
+        metrics: dict[str, float] with keys:
+            gap_n_masked_evals                     — total (station, repeat) pairs
+            gap_{var}_norm_{rmse,mae,bias,r2}      — normalised space
+            gap_overall_{rmse,mae,bias}_norm
+            gap_{var}_{rmse,mae,bias,r2}           — physical units (if obs_stats)
+            gap_overall_{rmse,mae,bias}            — physical (if obs_stats)
+            gap_wind_speed_{rmse,mae,bias}         — m/s   (if obs_stats)
+            gap_wind_dir_mae_deg                   — degrees (if obs_stats)
+    """
+    model.eval()
+
+    all_preds:   list[torch.Tensor] = []   # (n_masked, 5) fragments
+    all_targets: list[torch.Tensor] = []
+    all_valid:   list[torch.Tensor] = []   # bool — sensor present at target step
+
+    for batch in loader:
+        x       = batch["x"].to(device)       # (B, W, N, V)
+        x_mask  = batch["x_mask"].to(device)  # (B, W, N, V)
+        spatial = batch["spatial"].to(device) # (N, F) or (B, N, F)
+        x_hours = batch["x_hours"].to(device) # (B, W)
+
+        if spatial.dim() == 3 and spatial.size(0) == x.size(0):
+            spatial = spatial[0]              # drop batch dim if accidentally stacked
+
+        B, W, N, V = x.shape
+
+        # Reconstruction target: last observed input step (delta = 0)
+        y_last  = x[:, -1, :, :]             # (B, N, V)
+        ym_last = x_mask[:, -1, :, :]        # (B, N, V)
+        yh_last = x_hours[:, -1]             # (B,)
+        delta_z = torch.zeros(B, dtype=torch.long, device=device)
+
+        for _ in range(n_repeats):
+            # Each forward() call samples a fresh random station mask
+            _, preds, masked_idx = model(
+                x, x_mask, spatial, x_hours,
+                y_last, ym_last, yh_last, delta_z,
+            )
+            # preds:      (B, N, 5)       — predictions for ALL stations
+            # masked_idx: (B, N_masked)   — indices of the hidden stations
+
+            for b in range(B):
+                m_idx = masked_idx[b].cpu()                          # (N_masked,)
+                all_preds.append(preds[b, m_idx, :].cpu())          # (N_masked, 5)
+                all_targets.append(
+                    y_last[b, m_idx, :NUM_TARGET_VARIABLES].cpu()   # (N_masked, 5)
+                )
+                all_valid.append(
+                    ym_last[b, m_idx, :NUM_TARGET_VARIABLES].cpu()  # (N_masked, 5)
+                )
+
+    if not all_preds:
+        return {"gap_n_masked_evals": 0.0}
+
+    preds_cat   = torch.cat(all_preds,   dim=0)   # (total_masked, 5)
+    targets_cat = torch.cat(all_targets, dim=0)
+    valid_cat   = torch.cat(all_valid,   dim=0).bool()
+
+    metrics: dict[str, float] = {
+        "gap_n_masked_evals": float(preds_cat.shape[0]),
+    }
+
+    # ── Inner helper: write rmse/mae/bias/r2 under a given prefix ──────
+    def _scalars(p: torch.Tensor, t: torch.Tensor, m: torch.Tensor,
+                 prefix: str, std_scale: float = 1.0) -> None:
+        if m.sum() == 0:
+            for k in ("rmse", "mae", "bias", "r2"):
+                metrics[f"{prefix}_{k}"] = float("nan")
+            return
+        pv  = p[m] * std_scale
+        tv  = t[m] * std_scale
+        err = pv - tv
+        metrics[f"{prefix}_rmse"] = float(err.pow(2).mean().sqrt().item())
+        metrics[f"{prefix}_mae"]  = float(err.abs().mean().item())
+        metrics[f"{prefix}_bias"] = float(err.mean().item())
+        ss_res = err.pow(2).sum()
+        ss_tot = (tv - tv.mean()).pow(2).sum()
+        metrics[f"{prefix}_r2"]   = (
+            float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
+        )
+
+    # ── Normalised per-variable metrics ────────────────────────────────
+    for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
+        _scalars(
+            preds_cat[:, v], targets_cat[:, v], valid_cat[:, v],
+            prefix=f"gap_{var_name}_norm",
+        )
+
+    # ── Overall normalised ─────────────────────────────────────────────
+    if valid_cat.sum() > 0:
+        p_flat   = preds_cat[valid_cat]
+        t_flat   = targets_cat[valid_cat]
+        err_flat = p_flat - t_flat
+        metrics["gap_overall_rmse_norm"] = float(err_flat.pow(2).mean().sqrt().item())
+        metrics["gap_overall_mae_norm"]  = float(err_flat.abs().mean().item())
+        metrics["gap_overall_bias_norm"] = float(err_flat.mean().item())
+    else:
+        metrics["gap_overall_rmse_norm"] = float("nan")
+        metrics["gap_overall_mae_norm"]  = float("nan")
+        metrics["gap_overall_bias_norm"] = float("nan")
+
+    # ── Physical-unit metrics (requires obs_stats) ─────────────────────
+    if obs_stats is not None:
+        mean_t = obs_stats["mean"].cpu()   # (NUM_VARIABLES,)
+        std_t  = obs_stats["std"].cpu()
+
+        for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
+            std_v = float(std_t[v].item())
+            _scalars(
+                preds_cat[:, v], targets_cat[:, v], valid_cat[:, v],
+                prefix=f"gap_{var_name}",
+                std_scale=std_v,
+            )
+
+        # Overall physical (pool rescaled errors across variables)
+        if valid_cat.sum() > 0:
+            errs_phys = []
+            for v in range(NUM_TARGET_VARIABLES):
+                std_v = float(std_t[v].item())
+                m = valid_cat[:, v]
+                if m.sum() > 0:
+                    errs_phys.append(
+                        (preds_cat[m, v] - targets_cat[m, v]) * std_v
+                    )
+            if errs_phys:
+                e = torch.cat(errs_phys)
+                metrics["gap_overall_rmse"] = float(e.pow(2).mean().sqrt().item())
+                metrics["gap_overall_mae"]  = float(e.abs().mean().item())
+                metrics["gap_overall_bias"] = float(e.mean().item())
+
+        # Wind speed / direction
+        ui   = _IDX.get("wind_u")
+        vi_i = _IDX.get("wind_v")
+        if ui is not None and vi_i is not None:
+            mean_u  = float(mean_t[ui].item());   std_u   = float(std_t[ui].item())
+            mean_v  = float(mean_t[vi_i].item()); std_v_w = float(std_t[vi_i].item())
+            m_uv = valid_cat[:, ui] & valid_cat[:, vi_i]
+            if m_uv.sum() > 0:
+                u_pred = preds_cat[m_uv, ui]   * std_u   + mean_u
+                u_true = targets_cat[m_uv, ui] * std_u   + mean_u
+                v_pred = preds_cat[m_uv, vi_i] * std_v_w + mean_v
+                v_true = targets_cat[m_uv, vi_i] * std_v_w + mean_v
+
+                ws_pred = (u_pred.pow(2) + v_pred.pow(2)).sqrt()
+                ws_true = (u_true.pow(2) + v_true.pow(2)).sqrt()
+                ws_err  = ws_pred - ws_true
+                metrics["gap_wind_speed_rmse"] = float(ws_err.pow(2).mean().sqrt().item())
+                metrics["gap_wind_speed_mae"]  = float(ws_err.abs().mean().item())
+                metrics["gap_wind_speed_bias"] = float(ws_err.mean().item())
+
+                wd_pred = _wind_dir_deg(u_pred, v_pred)
+                wd_true = _wind_dir_deg(u_true, v_true)
+                metrics["gap_wind_dir_mae_deg"] = _circular_mae_deg(wd_pred, wd_true)
+            else:
+                for k in ("gap_wind_speed_rmse", "gap_wind_speed_mae",
+                          "gap_wind_speed_bias", "gap_wind_dir_mae_deg"):
+                    metrics[k] = float("nan")
+
+    return metrics
+
+
+# ---------------------------------------------------------------------------
 # Pretty-print helpers
 # ---------------------------------------------------------------------------
 
@@ -438,6 +638,50 @@ def print_metrics(metrics: dict[str, float]) -> None:
     print("-" * (col_w + 14))
     for k, v in sorted(metrics.items()):
         print(f"{k:<{col_w}}  {v:>10.5f}")
+    print()
+
+
+def print_gap_filling_metrics(metrics: dict[str, float], obs_stats: "dict | None" = None) -> None:
+    """
+    Pretty-print evaluate_gap_filling() results.
+
+    Shows per-variable RMSE/MAE/Bias/R² for **masked stations only**,
+    in both normalised and physical units (if obs_stats provided).
+    """
+    has_phys = obs_stats is not None
+    unit_map  = _VAR_UNITS if has_phys else {v: "norm" for v in TARGET_VARIABLE_NAMES}
+    n_evals   = int(metrics.get("gap_n_masked_evals", 0))
+
+    print(f"\n── Gap-filling metrics (masked stations only · n_station_evals={n_evals:,}) " + "─" * 8)
+    hdr = f"  {'Variable':<14}  {'RMSE':>8}  {'MAE':>8}  {'Bias':>8}  {'R²':>6}  Unit"
+    print(hdr)
+    print("  " + "-" * (len(hdr) - 2))
+
+    for var_name in TARGET_VARIABLE_NAMES:
+        pfx  = (f"gap_{var_name}"
+                if (has_phys and f"gap_{var_name}_rmse" in metrics)
+                else f"gap_{var_name}_norm")
+        rmse = metrics.get(f"{pfx}_rmse", float("nan"))
+        mae  = metrics.get(f"{pfx}_mae",  float("nan"))
+        bias = metrics.get(f"{pfx}_bias", float("nan"))
+        r2   = metrics.get(f"{pfx}_r2",   float("nan"))
+        unit = unit_map.get(var_name, "norm")
+        print(f"  {var_name:<14}  {rmse:>8.4f}  {mae:>8.4f}  {bias:>+8.4f}  {r2:>6.3f}  {unit}")
+
+    rmse_ov = metrics.get("gap_overall_rmse",
+                          metrics.get("gap_overall_rmse_norm", float("nan")))
+    mae_ov  = metrics.get("gap_overall_mae",
+                          metrics.get("gap_overall_mae_norm",  float("nan")))
+    bias_ov = metrics.get("gap_overall_bias",
+                          metrics.get("gap_overall_bias_norm", float("nan")))
+    print(f"  {'[overall]':<14}  {rmse_ov:>8.4f}  {mae_ov:>8.4f}  {bias_ov:>+8.4f}  {'':>6}")
+
+    if has_phys and "gap_wind_speed_rmse" in metrics:
+        print(f"\n── Wind speed & direction (gap-filling) " + "─" * 31)
+        print(f"  {'wind_speed':<14}  RMSE={metrics['gap_wind_speed_rmse']:.4f} m/s  "
+              f"MAE={metrics['gap_wind_speed_mae']:.4f} m/s  "
+              f"Bias={metrics['gap_wind_speed_bias']:+.4f} m/s")
+        print(f"  {'wind_dir':<14}  MAE={metrics.get('gap_wind_dir_mae_deg', float('nan')):.2f}°")
     print()
 
 
