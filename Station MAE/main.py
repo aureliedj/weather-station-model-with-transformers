@@ -227,13 +227,17 @@ def main() -> None:
 
     _use_cuda     = torch.cuda.is_available()
     _persistent   = (args.num_workers > 0)
+    # pin_memory only helps when DataLoader workers are running (async transfer).
+    # With num_workers=0 it spawns pin_memory threads that consume /dev/shm,
+    # which is capped in containerised environments (Renku, Kubernetes, Docker).
+    _pin_memory   = _use_cuda and _persistent
 
     train_loader = DataLoader(
         train_ds,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=_use_cuda,
+        pin_memory=_pin_memory,
         drop_last=True,
         persistent_workers=_persistent,
         prefetch_factor=(4 if _persistent else None),
@@ -243,7 +247,7 @@ def main() -> None:
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        pin_memory=_use_cuda,
+        pin_memory=_pin_memory,
         persistent_workers=_persistent,
         prefetch_factor=(4 if _persistent else None),
     )

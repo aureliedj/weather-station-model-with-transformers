@@ -30,15 +30,15 @@
 
 set -euo pipefail
 
-DATA_ROOT="/home/renku/work/PeakWeatherDataset"
-SAVE_DIR="checkpoints/full_run"
+DATA_ROOT="/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset"
+SAVE_DIR="checkpoints/full_run_local"
 
 python main.py \
     --data_root        "$DATA_ROOT" \
     --cache_dir        "$DATA_ROOT" \
     --window           288 \
     --max_delta        36 \
-    --num_delta        3 \
+    --num_delta        6 \
     --d_model          128 \
     --enc_layers       6 \
     --dec_layers       2 \
@@ -46,13 +46,13 @@ python main.py \
     --dropout          0.1 \
     --batch_size       16 \
     --num_workers      0 \
-    --epochs           100 \
+    --epochs           50 \
     --lr               1e-4 \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --patience         15 \
-    --save_every       5 \
+    --patience         5 \
+    --save_every       2 \
     --amp \
     --factorised_encoder \
     --cross_attn_decoder \
