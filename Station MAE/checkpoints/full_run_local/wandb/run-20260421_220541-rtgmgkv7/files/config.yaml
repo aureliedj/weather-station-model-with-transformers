@@ -1,0 +1,214 @@
+_wandb:
+    value:
+        cli_version: 0.26.0
+        e:
+            8kleldozf0hay29r9s94uelsmw3coztc:
+                apple:
+                    ecpuCores: 4
+                    gpuCores: 32
+                    macModel: Mac16,6
+                    memoryGb: 36
+                    name: Apple M4 Max
+                    pcpuCores: 10
+                    ramTotalBytes: "38654705664"
+                    swapTotalBytes: "11811160064"
+                args:
+                    - --data_root
+                    - /Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset
+                    - --cache_dir
+                    - /Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset
+                    - --window
+                    - "288"
+                    - --max_delta
+                    - "36"
+                    - --num_delta
+                    - "6"
+                    - --d_model
+                    - "128"
+                    - --enc_layers
+                    - "6"
+                    - --dec_layers
+                    - "2"
+                    - --mask_ratio
+                    - "0.5"
+                    - --dropout
+                    - "0.1"
+                    - --batch_size
+                    - "16"
+                    - --num_workers
+                    - "0"
+                    - --epochs
+                    - "50"
+                    - --lr
+                    - "1e-4"
+                    - --warmup_epochs
+                    - "5"
+                    - --weight_decay
+                    - "0.05"
+                    - --grad_clip
+                    - "1.0"
+                    - --patience
+                    - "5"
+                    - --save_every
+                    - "2"
+                    - --amp
+                    - --factorised_encoder
+                    - --cross_attn_decoder
+                    - --wandb_project
+                    - station-mae
+                    - --wandb_run_name
+                    - full-run
+                    - --save_dir
+                    - checkpoints/full_run_local
+                codePath: Station MAE/main.py
+                codePathLocal: main.py
+                cpu_count: 14
+                cpu_count_logical: 14
+                disk:
+                    /:
+                        total: "994662584320"
+                        used: "214981799936"
+                email: adejong@ethz.ch
+                executable: /opt/anaconda3/envs/capstone/bin/python
+                git:
+                    commit: 9371349646a53f528b0e9703442bd6650f207e8e
+                    remote: https://github.com/aureliedj/weather-station-model-with-transformers.git
+                host: aurelies-macbook-pro.home
+                memory:
+                    total: "38654705664"
+                os: macOS-15.7.4-arm64-arm-64bit
+                program: /Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/main.py
+                python: CPython 3.12.12
+                root: checkpoints/full_run_local
+                startedAt: "2026-04-21T20:05:41.401460Z"
+                writerId: 8kleldozf0hay29r9s94uelsmw3coztc
+        m:
+            - "1": trainer/global_step
+              "6":
+                - 3
+              "7": []
+            - "2": '*'
+              "5": 1
+              "6":
+                - 1
+              "7": []
+        python_version: 3.12.12
+        t:
+            "1":
+                - 1
+                - 5
+                - 9
+                - 11
+                - 41
+                - 49
+                - 53
+                - 54
+                - 71
+                - 103
+            "2":
+                - 1
+                - 5
+                - 9
+                - 11
+                - 41
+                - 49
+                - 53
+                - 54
+                - 71
+                - 103
+            "3":
+                - 7
+                - 13
+                - 16
+                - 41
+                - 66
+            "4": 3.12.12
+            "5": 0.26.0
+            "6": 5.4.0
+            "12": 0.26.0
+            "13": darwin-arm64
+amp:
+    value: true
+batch_size:
+    value: 16
+cache_dir:
+    value: /Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset
+cfg:
+    value:
+        cross_attn_decoder: true
+        d_model: 128
+        dec_layers: 2
+        enc_layers: 6
+        epochs: 50
+        factorised_encoder: true
+        grad_checkpoint: false
+        lr: 0.0001
+        max_delta: 36
+        num_delta: 6
+        warmup_epochs: 5
+        weight_decay: 0.05
+        window: 288
+cross_attn_decoder:
+    value: true
+d_model:
+    value: 128
+data_root:
+    value: /Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset
+dec_heads:
+    value: 4
+dec_layers:
+    value: 2
+dropout:
+    value: 0.1
+enc_heads:
+    value: 4
+enc_layers:
+    value: 6
+epochs:
+    value: 50
+factorised_encoder:
+    value: true
+grad_checkpoint:
+    value: false
+grad_clip:
+    value: 1
+log_every_n_steps:
+    value: 50
+lr:
+    value: 0.0001
+mask_ratio:
+    value: 0.5
+max_delta:
+    value: 36
+min_delta:
+    value: 0.0001
+mlp_ratio:
+    value: 4
+num_delta:
+    value: 6
+num_workers:
+    value: 0
+patience:
+    value: 5
+resume:
+    value: null
+save_dir:
+    value: checkpoints/full_run_local
+save_every:
+    value: 2
+seed:
+    value: 42
+subset:
+    value: false
+train_years:
+    value: null
+wandb_project:
+    value: station-mae
+wandb_run_name:
+    value: full-run
+warmup_epochs:
+    value: 5
+weight_decay:
+    value: 0.05
+window:
+    value: 288

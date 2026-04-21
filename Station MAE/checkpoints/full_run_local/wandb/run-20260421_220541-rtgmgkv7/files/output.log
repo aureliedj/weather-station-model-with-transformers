@@ -1,0 +1,120 @@
+/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/callbacks/model_checkpoint.py:881: Checkpoint directory /Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/checkpoints/full_run_local exists and is not empty.
+Loading `train_dataloader` to estimate number of stepping batches.
+/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/utilities/_pytree.py:21: `isinstance(treespec, LeafSpec)` is deprecated, use `isinstance(treespec, TreeSpec) and treespec.is_leaf()` instead.
+/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:434: The 'train_dataloader' does not have many workers which may be a bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=13` in the `DataLoader` to improve performance.
+/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/utilities/model_summary/model_summary.py:242: Precision 16-mixed is not supported by the model summary.  Estimated model size in MB will not be accurate. Using 32 bits instead.
+┏━━━┳━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━┓
+┃[1;35m [0m[1;35m [0m[1;35m [0m┃[1;35m [0m[1;35mName [0m[1;35m [0m┃[1;35m [0m[1;35mType      [0m[1;35m [0m┃[1;35m [0m[1;35mParams[0m[1;35m [0m┃[1;35m [0m[1;35mMode [0m[1;35m [0m┃[1;35m [0m[1;35mFLOPs[0m[1;35m [0m┃
+┡━━━╇━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━╇━━━━━━━┩
+│[2m [0m[2m0[0m[2m [0m│ model │ StationMAE │  2.3 M │ train │     0 │
+└───┴───────┴────────────┴────────┴───────┴───────┘
+[1mTrainable params[0m: 2.3 M
+[1mNon-trainable params[0m: 0
+[1mTotal params[0m: 2.3 M
+[1mTotal estimated model params size (MB)[0m: 9
+[1mModules in train mode[0m: 168
+[1mModules in eval mode[0m: 0
+[1mTotal FLOPs[0m: 0
+[2K/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/connectors/data_connector.py:434: The 'val_dataloader' does not have many workers which may be a
+bottleneck. Consider increasing the value of the `num_workers` argument` to `num_workers=13` in the `DataLoader` to improve performance.
+[2KEpoch 0/49 [38;5;237m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━[0m 0/16333 [2m0:00:09 • -:--:--[0m [2;4m0.00it/s[0m [3mv_num: gkv7 val/loss: 1.167 val/overall_rmse: 1.080[0m
+[?25h
+Traceback (most recent call last):
+  File "/Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/main.py", line 397, in <module>
+    main()
+  File "/Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/main.py", line 383, in main
+    trainer.fit(
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 584, in fit
+    call._call_and_handle_interrupt(
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/call.py", line 49, in _call_and_handle_interrupt
+    return trainer_fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 630, in _fit_impl
+    self._run(model, ckpt_path=ckpt_path, weights_only=weights_only)
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 1079, in _run
+    results = self._run_stage()
+              ^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/trainer.py", line 1123, in _run_stage
+    self.fit_loop.run()
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/fit_loop.py", line 217, in run
+    self.advance()
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/fit_loop.py", line 465, in advance
+    self.epoch_loop.run(self._data_fetcher)
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/training_epoch_loop.py", line 153, in run
+    self.advance(data_fetcher)
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/training_epoch_loop.py", line 352, in advance
+    batch_output = self.automatic_optimization.run(trainer.optimizers[0], batch_idx, kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/optimization/automatic.py", line 192, in run
+    self._optimizer_step(batch_idx, closure)
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/optimization/automatic.py", line 270, in _optimizer_step
+    call._call_lightning_module_hook(
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/call.py", line 177, in _call_lightning_module_hook
+    output = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/core/module.py", line 1368, in optimizer_step
+    optimizer.step(closure=optimizer_closure)
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/core/optimizer.py", line 154, in step
+    step_output = self._strategy.optimizer_step(self._optimizer, closure, **kwargs)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/strategies/strategy.py", line 239, in optimizer_step
+    return self.precision_plugin.optimizer_step(optimizer, model=model, closure=closure, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/plugins/precision/amp.py", line 79, in optimizer_step
+    closure_result = closure()
+                     ^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/optimization/automatic.py", line 146, in __call__
+    self._result = self.closure(*args, **kwargs)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/optimization/automatic.py", line 131, in closure
+    step_output = self._step_fn()
+                  ^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/loops/optimization/automatic.py", line 319, in _training_step
+    training_step_output = call._call_strategy_hook(trainer, "training_step", *kwargs.values())
+                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/trainer/call.py", line 329, in _call_strategy_hook
+    output = fn(*args, **kwargs)
+             ^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/pytorch_lightning/strategies/strategy.py", line 391, in training_step
+    return self.lightning_module.training_step(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/model/lightning_module.py", line 91, in training_step
+    loss, _, _ = forward_fn(
+                 ^^^^^^^^^^^
+  File "/Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/model/mae.py", line 227, in forward_multi_delta
+    encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/model/encoder.py", line 409, in forward
+    h = block(h)
+        ^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/aureliedejong/PycharmProjects/weather-station-model-with-transformers/Station MAE/model/encoder.py", line 178, in forward
+    at, _  = self.attn_t(xt_n, xt_n, xt_n, need_weights=False)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1779, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/module.py", line 1790, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/modules/activation.py", line 1492, in forward
+    attn_output, attn_output_weights = F.multi_head_attention_forward(
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/anaconda3/envs/capstone/lib/python3.12/site-packages/torch/nn/functional.py", line 6682, in multi_head_attention_forward
+    attn_output = scaled_dot_product_attention(
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: MPS backend out of memory (MPS allocated: 44.13 GiB, other allocations: 1.29 GiB, max allowed: 45.90 GiB). Tried to allocate 1.54 GiB on private pool. Use PYTORCH_MPS_HIGH_WATERMARK_RATIO=0.0 to disable upper limit for memory allocations (may cause system failure).

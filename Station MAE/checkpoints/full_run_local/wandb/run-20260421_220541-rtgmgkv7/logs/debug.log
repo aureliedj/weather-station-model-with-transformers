@@ -1,0 +1,22 @@
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_setup.py:_flush():81] Current SDK version is 0.26.0
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_setup.py:_flush():81] Configure stats pid to 94026
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_setup.py:_flush():81] Loading settings from environment variables
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_init.py:setup_run_log_directory():721] Logging user logs to checkpoints/full_run_local/wandb/run-20260421_220541-rtgmgkv7/logs/debug.log
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_init.py:setup_run_log_directory():722] Logging internal logs to checkpoints/full_run_local/wandb/run-20260421_220541-rtgmgkv7/logs/debug-internal.log
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_init.py:init():848] calling init triggers
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_init.py:init():853] wandb.init called with sweep_config: {}
+config: {'data_root': '/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset', 'cache_dir': '/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset', 'window': 288, 'num_workers': 0, 'batch_size': 16, 'subset': False, 'train_years': None, 'd_model': 128, 'enc_heads': 4, 'enc_layers': 6, 'dec_heads': 4, 'dec_layers': 2, 'mlp_ratio': 4.0, 'dropout': 0.1, 'mask_ratio': 0.5, 'max_delta': 36, 'factorised_encoder': True, 'cross_attn_decoder': True, 'grad_checkpoint': False, 'num_delta': 6, 'epochs': 50, 'lr': 0.0001, 'weight_decay': 0.05, 'warmup_epochs': 5, 'grad_clip': 1.0, 'amp': True, 'seed': 42, 'patience': 5, 'min_delta': 0.0001, 'save_dir': 'checkpoints/full_run_local', 'save_every': 2, 'resume': None, 'wandb_project': 'station-mae', 'wandb_run_name': 'full-run', 'log_every_n_steps': 50, '_wandb': {}}
+2026-04-21 22:05:41,407 INFO    MainThread:94026 [wandb_init.py:init():896] starting backend
+2026-04-21 22:05:41,661 INFO    MainThread:94026 [wandb_init.py:init():911] sending inform_init request
+2026-04-21 22:05:41,688 INFO    MainThread:94026 [wandb_init.py:init():919] backend started and connected
+2026-04-21 22:05:41,690 INFO    MainThread:94026 [wandb_init.py:init():989] updated telemetry
+2026-04-21 22:05:41,710 INFO    MainThread:94026 [wandb_init.py:init():1013] communicating run to backend with 90.0 second timeout
+2026-04-21 22:05:42,633 INFO    MainThread:94026 [wandb_init.py:init():1058] starting run threads in backend
+2026-04-21 22:05:42,694 INFO    MainThread:94026 [wandb_run.py:_console_start():2542] atexit reg
+2026-04-21 22:05:42,694 INFO    MainThread:94026 [wandb_run.py:_redirect():2391] redirect: wrap_raw
+2026-04-21 22:05:42,694 INFO    MainThread:94026 [wandb_run.py:_redirect():2460] Wrapping output streams.
+2026-04-21 22:05:42,694 INFO    MainThread:94026 [wandb_run.py:_redirect():2483] Redirects installed.
+2026-04-21 22:05:42,696 INFO    MainThread:94026 [wandb_init.py:init():1098] run started, returning control to user process
+2026-04-21 22:05:42,798 INFO    MainThread:94026 [wandb_run.py:_config_callback():1403] config_cb None None {'cfg': {'lr': 0.0001, 'weight_decay': 0.05, 'epochs': 50, 'warmup_epochs': 5, 'factorised_encoder': True, 'cross_attn_decoder': True, 'grad_checkpoint': False, 'window': 288, 'max_delta': 36, 'num_delta': 6, 'd_model': 128, 'enc_layers': 6, 'dec_layers': 2}}
+2026-04-21 22:05:56,081 INFO    wandb-AsyncioManager-main:94026 [service_client.py:_forward_responses():134] Reached EOF.
+2026-04-21 22:05:56,085 INFO    wandb-AsyncioManager-main:94026 [mailbox.py:close():155] Closing mailbox, abandoning 1 handles.
