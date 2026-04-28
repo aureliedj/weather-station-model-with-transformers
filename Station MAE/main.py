@@ -80,6 +80,12 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
+# Use file-based tensor sharing between DataLoader workers instead of the
+# default shared-memory (/dev/shm) strategy.  This avoids the "bus error /
+# insufficient shm" crash in containerised environments (Renku, Kubernetes,
+# Docker with default shm-size=64 MB) while still allowing num_workers > 0.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -91,6 +97,12 @@ def parse_args() -> argparse.Namespace:
     # Data
     p.add_argument("--data_root",    type=str, required=True)
     p.add_argument("--cache_dir",    type=str, default=None)
+    p.add_argument("--local_cache_dir", type=str, default="/tmp/station_mae_cache",
+                   help="Fast local directory for split-specific numpy memmap files "
+                        "(default /tmp/station_mae_cache — a tmpfs RAM disk on Linux). "
+                        "Workers mmap .npy files directly from the OS page cache, "
+                        "eliminating IPC overhead for source data. "
+                        "Set to '' to disable and use the standard in-memory path.")
     p.add_argument("--window",       type=int, default=288)
     p.add_argument("--num_workers",  type=int, default=4)
     p.add_argument("--batch_size",   type=int, default=16)
@@ -111,6 +123,19 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_delta",    type=int,   default=18)
     p.add_argument("--factorised_encoder",  action="store_true",
                    help="Axial attention in encoder (~100× cheaper at W=288)")
+    p.add_argument("--temporal_window",     type=int, default=0,
+                   help="Local temporal attention window size in timesteps (0 = full). "
+                        "W must be divisible by this value. Odd encoder layers use a "
+                        "Swin-style half-window shift so tokens can communicate across "
+                        "chunk boundaries after two layers. Only applies with "
+                        "--factorised_encoder. Example: --window 72 --temporal_window 6 "
+                        "gives 12 one-hour chunks, 12x cheaper temporal attention.")
+    p.add_argument("--no_spatial_attn",     action="store_true",
+                   help="Disable spatial attention sub-layer in factorised encoder blocks. "
+                        "Each station is encoded independently from its own temporal window; "
+                        "cross-station reasoning is delegated entirely to the decoder. "
+                        "Only applies when --factorised_encoder is set. "
+                        "Reduces encoder cost from O(N·W²+W·N²) to O(N·W²).")
     p.add_argument("--cross_attn_decoder",  action="store_true",
                    help="Cross-attention decoder (query tokens attend to encoder context)")
     p.add_argument("--grad_checkpoint",     action="store_true",
@@ -124,6 +149,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--warmup_epochs",type=int,   default=5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
     p.add_argument("--amp",          action="store_true")
+    p.add_argument("--bf16",         action="store_true",
+                   help="Use bfloat16 mixed precision instead of float16. "
+                        "Requires --amp. Preferred on A100/H100/3090+ GPUs: same "
+                        "tensor-core speed as fp16 but wider dynamic range, no "
+                        "loss scaling needed. Falls back to fp16 on MPS.")
+    p.add_argument("--compile",      action="store_true",
+                   help="Wrap model with torch.compile (reduce-overhead mode). "
+                        "Fuses kernels and eliminates Python overhead — typically "
+                        "2-3× faster on A100/H100 after a one-time warm-up of "
+                        "~2-3 min on the first epoch. Requires PyTorch >= 2.0.")
     p.add_argument("--seed",         type=int,   default=42)
 
     # Early stopping
@@ -192,6 +227,14 @@ def main() -> None:
     print("Loading PeakWeather dataset …")
     ds = load_peakweather(root=args.data_root)
 
+    # Resolve fast cache dir — empty string disables it
+    fast_cache_dir = args.local_cache_dir.strip() or None
+    if fast_cache_dir:
+        print(f"Fast cache dir           : {fast_cache_dir}  "
+              f"(numpy memmap, workers bypass IPC queue for source data)")
+    else:
+        print("Fast cache dir           : disabled  (using standard in-memory path)")
+
     print("Building train dataset …")
     train_ds = StationMAEDataset(
         ds,
@@ -203,6 +246,7 @@ def main() -> None:
         cache_dir=cache_dir,
         train_years=train_years,
         shared_memory=False,
+        fast_cache_dir=fast_cache_dir,
     )
 
     print("Building val dataset …")
@@ -217,6 +261,7 @@ def main() -> None:
         cache_dir=cache_dir,
         train_years=train_years,
         shared_memory=False,
+        fast_cache_dir=fast_cache_dir,
     )
 
     print(f"  train: {len(train_ds):,} samples  "
@@ -267,16 +312,40 @@ def main() -> None:
         mask_ratio=args.mask_ratio,
         use_checkpoint=args.grad_checkpoint,
         factorised_encoder=args.factorised_encoder,
+        encoder_spatial_attn=not args.no_spatial_attn,
+        temporal_window=args.temporal_window,
         cross_attention_decoder=args.cross_attn_decoder,
     )
 
     if args.grad_checkpoint:
         print("Gradient checkpointing   : ON  (~33% extra compute, ~66% less VRAM)")
     if args.factorised_encoder:
-        print("Factorised encoder       : ON  (axial attention)")
+        _spatial_str = "temporal-only (--no_spatial_attn)" if args.no_spatial_attn \
+                       else "temporal + spatial"
+        _tw_str = f"  |  temporal_window={args.temporal_window}" \
+                  if args.temporal_window > 0 else ""
+        print(f"Factorised encoder       : ON  ({_spatial_str}{_tw_str})")
     if args.cross_attn_decoder:
         print("Cross-attention decoder  : ON")
     print(f"Model: {model.count_parameters():,} trainable parameters")
+
+    # ── torch.compile ────────────────────────────────────────────────────────
+    # Compile BEFORE wrapping in Lightning so that the compiled forward()
+    # is what Lightning calls.  reduce-overhead mode eliminates most Python
+    # dispatch cost; safe for all standard PyTorch ops used here.
+    # The first 2-3 batches are slow (kernel tracing/compilation), then fast.
+    if args.compile:
+        if not hasattr(torch, "compile"):
+            print("torch.compile            : SKIPPED  (requires PyTorch >= 2.0)")
+        else:
+            # Use "default" mode rather than "reduce-overhead":
+            # reduce-overhead relies on CUDA graph capture which is restricted
+            # inside MIG partitions and will silently fall back or error.
+            # "default" still fuses ops and removes Python overhead (~1.3-1.5×
+            # speedup) without needing CUDA graphs.
+            model = torch.compile(model, mode="default")
+            print("torch.compile            : ON  (default mode, MIG-safe) "
+                  "— first epoch warm-up ~1-2 min, then ~1.3-1.5× faster")
 
     cfg = {
         "lr":            args.lr,
@@ -285,6 +354,8 @@ def main() -> None:
         "warmup_epochs": args.warmup_epochs,
         # Informational — stored in checkpoint hyper_parameters for test.py
         "factorised_encoder":  args.factorised_encoder,
+        "no_spatial_attn":     args.no_spatial_attn,
+        "temporal_window":     args.temporal_window,
         "cross_attn_decoder":  args.cross_attn_decoder,
         "grad_checkpoint":     args.grad_checkpoint,
         "window":              args.window,
@@ -358,10 +429,16 @@ def main() -> None:
         print(f"EarlyStopping            : patience={args.patience}  min_delta={args.min_delta}")
 
     # ── Precision (AMP) ─────────────────────────────────────────────────────
-    # "16-mixed" = fp16 AMP (CUDA + MPS); "32-true" = full precision (CPU / no-amp)
-    if args.amp and (torch.cuda.is_available() or
-                     (torch.backends.mps.is_available() and torch.backends.mps.is_built())):
-        precision = "16-mixed"
+    # "bf16-mixed" — preferred on A100/H100/RTX 3090+: same tensor-core speed
+    #                as fp16 but wider dynamic range, no loss-scaling needed.
+    # "16-mixed"   — fp16 AMP for older CUDA GPUs and MPS (Apple Silicon).
+    # "32-true"    — full float32 (CPU or no --amp flag).
+    _mps_available = (torch.backends.mps.is_available()
+                      and torch.backends.mps.is_built())
+    if args.amp and torch.cuda.is_available():
+        precision = "bf16-mixed" if args.bf16 else "16-mixed"
+    elif args.amp and _mps_available:
+        precision = "16-mixed"   # MPS does not support bf16 AMP
     else:
         precision = "32-true"
 

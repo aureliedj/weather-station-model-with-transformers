@@ -285,6 +285,135 @@ def compute_obs_stats(
 _CACHE_FILENAME = "peakweather_obs_cache.pt"
 
 
+# ---------------------------------------------------------------------------
+# Fast local cache  (numpy memmap — direct worker access, no IPC overhead)
+# ---------------------------------------------------------------------------
+
+_FAST_CACHE_VERSION = "v1"
+# Bump this when the on-disk format changes to force a rebuild.
+
+
+def _fast_split_paths(fast_dir: str, split: str, train_years: list) -> dict:
+    """
+    Return a dict of expected file paths for one split's fast cache.
+
+    Files are keyed by split + training years so that different training
+    configurations (subset vs full) coexist in the same directory.
+    """
+    years_key = "_".join(str(y) for y in sorted(train_years))
+    prefix    = f"{split}_{years_key}"
+    return {
+        "obs":     os.path.join(fast_dir, f"{prefix}_obs.npy"),
+        "mask":    os.path.join(fast_dir, f"{prefix}_mask.npy"),
+        "hours":   os.path.join(fast_dir, f"{prefix}_hours.npy"),
+        "spatial": os.path.join(fast_dir, "spatial.pt"),   # shared across splits
+        "meta":    os.path.join(fast_dir, f"{prefix}_meta.pt"),
+    }
+
+
+def fast_cache_save(
+    fast_dir:        str,
+    split:           str,
+    train_years:     list,
+    obs_norm:        torch.Tensor,   # (T_split, N, V)  normalised
+    mask:            torch.Tensor,   # (T_split, N, V)
+    hours:           torch.Tensor,   # (T_split,)
+    spatial:         torch.Tensor,   # (N, 15)
+    spatial_stats:   dict,
+    obs_stats:       dict,
+    indices:         list,
+    window_size:     int,
+    max_delta_steps: int,
+) -> None:
+    """
+    Save split-specific normalised tensors as numpy .npy files.
+
+    Subsequent calls to ``fast_cache_load`` will mmap these files, so each
+    DataLoader worker reads directly from the OS page cache without any
+    inter-process tensor transfer for the source data.
+
+    Files are written to ``fast_dir`` (typically ``/tmp/station_mae_cache``
+    which is a tmpfs RAM disk on Linux).  Workers independently open the
+    same mmap files; the OS shares a single copy of the pages in the page
+    cache across all processes — zero duplication, no /dev/shm exhaustion.
+    """
+    os.makedirs(fast_dir, exist_ok=True)
+    paths = _fast_split_paths(fast_dir, split, train_years)
+    print(f"[FastCache] Saving '{split}' split to {fast_dir} …", flush=True)
+    t0 = time.time()
+
+    np.save(paths["obs"],   obs_norm.numpy())
+    np.save(paths["mask"],  mask.numpy())
+    np.save(paths["hours"], hours.numpy())
+
+    # spatial is the same for all splits — only write once
+    if not os.path.exists(paths["spatial"]):
+        torch.save(spatial, paths["spatial"])
+
+    torch.save({
+        "version":         _FAST_CACHE_VERSION,
+        "obs_stats":       obs_stats,
+        "spatial_stats":   spatial_stats,
+        "indices":         indices,
+        "window_size":     window_size,
+        "max_delta_steps": max_delta_steps,
+    }, paths["meta"])
+
+    print(f"[FastCache] Saved '{split}' in {time.time() - t0:.1f}s", flush=True)
+
+
+def fast_cache_load(
+    fast_dir:    str,
+    split:       str,
+    train_years: list,
+) -> "dict | None":
+    """
+    Load split-specific tensors as memory-mapped numpy arrays.
+
+    Returns a dict with keys obs / mask / hours / spatial / obs_stats /
+    spatial_stats / indices, or None if the cache files are absent or
+    outdated (caller should rebuild and call fast_cache_save).
+
+    The returned obs / mask / hours arrays use mmap_mode='c' (copy-on-write):
+    read pages are served from the OS page cache shared across all worker
+    processes; private writes go to a per-process in-memory buffer.
+    """
+    paths = _fast_split_paths(fast_dir, split, train_years)
+
+    if not all(os.path.exists(paths[k]) for k in paths):
+        return None   # cache miss — caller will build from scratch
+
+    t0 = time.time()
+    print(f"[FastCache] Loading '{split}' split from {fast_dir} …", flush=True)
+
+    meta = torch.load(paths["meta"], weights_only=False)
+    if meta.get("version") != _FAST_CACHE_VERSION:
+        print(f"[FastCache] Version mismatch — will rebuild '{split}'.", flush=True)
+        return None
+
+    # mmap_mode='c' — copy-on-write:
+    #   • Workers mmap the same .npy file; reads hit the OS page cache (one shared copy).
+    #   • No /dev/shm consumed for source data — only the small per-batch slice tensors
+    #     travel through the DataLoader queue.
+    obs  = np.load(paths["obs"],   mmap_mode="c")
+    mask = np.load(paths["mask"],  mmap_mode="c")
+    hrs  = np.load(paths["hours"], mmap_mode="c")
+    spatial = torch.load(paths["spatial"], weights_only=False)
+
+    print(f"[FastCache] Loaded '{split}' in {time.time() - t0:.2f}s  "
+          f"obs={obs.shape}", flush=True)
+
+    return {
+        "obs":           obs,
+        "mask":          mask,
+        "hours":         hrs,
+        "spatial":       spatial,
+        "obs_stats":     meta["obs_stats"],
+        "spatial_stats": meta["spatial_stats"],
+        "meta":          meta,   # includes indices, window_size, max_delta_steps, version
+    }
+
+
 def _load_or_build_cache(
     ds:        PeakWeatherDataset,
     cache_dir: str,
@@ -394,6 +523,15 @@ class StationMAEDataset(Dataset):
         cache_dir:            Directory for the preprocessed tensor cache.
                               First run builds and saves; subsequent runs load
                               from disk in seconds.
+        fast_cache_dir:       Optional fast local directory (e.g. ``/tmp/station_mae_cache``)
+                              for split-specific numpy memmap files.  When set, each
+                              DataLoader worker mmaps the .npy files directly from the
+                              OS page cache instead of receiving tensors through the
+                              inter-process queue — eliminating the file_system IPC
+                              overhead for source data.  On Linux, ``/tmp`` is usually
+                              a tmpfs (RAM-backed), so page faults are served at memory
+                              speed.  First call builds and saves the .npy files; all
+                              subsequent calls (and all workers) load instantly.
     """
 
     def __init__(
@@ -408,6 +546,7 @@ class StationMAEDataset(Dataset):
         cache_dir:            "str | None" = None,
         train_years:          "list[int] | None" = None,
         shared_memory:        bool = False,
+        fast_cache_dir:       "str | None" = None,
     ):
         super().__init__()
 
@@ -427,6 +566,55 @@ class StationMAEDataset(Dataset):
         # and random sampling in __getitem__
         self.max_delta_steps = max_delta_steps if max_delta_steps is not None \
                                else delta_steps
+
+        effective_train_years = train_years if train_years is not None else TRAIN_YEARS
+
+        # ------------------------------------------------------------------
+        # 0. Fast cache (numpy memmap on local storage)  —  try first
+        #
+        # Each DataLoader worker independently mmaps the same .npy files.
+        # Read pages are served from the OS page cache — one shared RAM copy
+        # across all processes, no /dev/shm consumed for source data.
+        # On Linux, /tmp is a tmpfs (RAM-backed), so reads are at memory speed.
+        # ------------------------------------------------------------------
+        if fast_cache_dir is not None:
+            cached = fast_cache_load(fast_cache_dir, split, effective_train_years)
+
+            # Validate: cache must be built for the same window / horizon
+            _cache_ok = (
+                cached is not None
+                and cached["meta"].get("window_size")     == window_size
+                and cached["meta"].get("max_delta_steps") == self.max_delta_steps
+            )
+            # For val/test: normalisation stats must match the train dataset's
+            if _cache_ok and obs_stats is not None:
+                cached_stats = cached["obs_stats"]
+                _cache_ok = (
+                    torch.allclose(cached_stats["mean"], obs_stats["mean"])
+                    and torch.allclose(cached_stats["std"],  obs_stats["std"])
+                )
+
+            if _cache_ok:
+                self.obs_stats     = cached["obs_stats"]
+                self.spatial       = cached["spatial"]
+                self.spatial_stats = cached["spatial_stats"]
+                self.indices       = cached["meta"]["indices"]
+
+                # Keep numpy mmap arrays alive (torch.from_numpy holds a weak ref
+                # to the numpy array; storing explicitly prevents GC).
+                self._obs_np    = cached["obs"]    # (T_split, N, V) mmap
+                self._mask_np   = cached["mask"]   # (T_split, N, V) mmap
+                self._hours_np  = cached["hours"]  # (T_split,)      mmap
+
+                # Torch tensors backed by the mmap file on /tmp.
+                # mmap_mode='c' returns a copy-on-write memmap — writeable flag
+                # is set, so torch.from_numpy() accepts it.  Workers that fork
+                # will each trigger page faults only on the pages they actually
+                # touch; the kernel serves them from the shared page cache.
+                self.obs   = torch.from_numpy(self._obs_np)
+                self.mask  = torch.from_numpy(self._mask_np)
+                self.hours = torch.from_numpy(self._hours_np)
+                return   # skip the build path entirely
 
         # ------------------------------------------------------------------
         # 1. Load (or build + cache) raw tensors
@@ -484,7 +672,6 @@ class StationMAEDataset(Dataset):
         # to the exact same data the model saw, avoiding drift between a
         # subset run (e.g. [2020,2021]) and a full-data (2017–2021) job.
         # ------------------------------------------------------------------
-        effective_train_years = train_years if train_years is not None else TRAIN_YEARS
         if obs_stats is None:
             self.obs_stats = compute_obs_stats(
                 ds,
@@ -571,6 +758,25 @@ class StationMAEDataset(Dataset):
             if start_year == target_year:
                 self.indices.append(i)
 
+        # ------------------------------------------------------------------
+        # 7. Save fast cache for future runs (if fast_cache_dir is set)
+        # ------------------------------------------------------------------
+        if fast_cache_dir is not None:
+            fast_cache_save(
+                fast_dir      = fast_cache_dir,
+                split         = split,
+                train_years   = effective_train_years,
+                obs_norm      = self.obs,
+                mask          = self.mask,
+                hours         = self.hours,
+                spatial       = spatial,
+                spatial_stats = spatial_stats,
+                obs_stats     = self.obs_stats,
+                indices       = self.indices,
+                window_size   = window_size,
+                max_delta_steps = self.max_delta_steps,
+            )
+
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
@@ -584,9 +790,13 @@ class StationMAEDataset(Dataset):
         K = self.num_delta_per_sample
 
         # ── Input window — shared across all K targets ─────────────────
-        x       = self.obs[i : i + W]      # (W, N, V)
-        x_mask  = self.mask[i : i + W]     # (W, N, V)
-        x_hours = self.hours[i : i + W]    # (W,)
+        # .clone() gives each slice its own storage rather than a view of the
+        # full backing tensor.  This is critical for the DataLoader's file_system
+        # sharing strategy: without it, the entire obs storage (hundreds of MB)
+        # may be written to /tmp for every batch instead of just the slice.
+        x       = self.obs  [i : i + W].clone()   # (W, N, V)
+        x_mask  = self.mask [i : i + W].clone()   # (W, N, V)
+        x_hours = self.hours[i : i + W].clone()   # (W,)
 
         # ── Target snapshot(s) ─────────────────────────────────────────
         if K == 1:

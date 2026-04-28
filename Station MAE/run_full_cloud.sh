@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# run_full_cloud.sh — optimised full training run for A100 80GB PCIe (MIG 3g.20gb)
+#
+# Hardware context
+# ----------------
+# The A100 is running in MIG mode. The allocated partition is 3g.20gb:
+#   • 19,968 MiB (~20 GB) VRAM  — NOT the full 80 GB
+#   • 28 / 108 streaming multiprocessors
+#   • No NVLink across MIG instances → single-GPU only
+#
+# Key flags:
+#
+#   CHANGE 1 — bfloat16 AMP  (--amp --bf16)
+#     A100 has native BF16 tensor cores. Same speed as FP16 but wider
+#     dynamic range — no loss scaling, more numerically stable.
+#
+#   CHANGE 2 — torch.compile default mode  (--compile)
+#     MIG partitions restrict CUDA graph capture, so "reduce-overhead" mode
+#     would silently fail. "default" mode still fuses ops and removes Python
+#     overhead (~1.3-1.5× speedup), no CUDA graphs needed.
+#     Warm-up cost: ~1-2 min on the first epoch.
+#
+#   CHANGE 3 — fast local cache  (--local_cache_dir /tmp/station_mae_cache)
+#     Saves split-normalised tensors as numpy mmap files on /tmp (tmpfs).
+#     Workers mmap directly from OS page cache — no IPC queue overhead for
+#     source data. First run writes files; all subsequent runs are instant.
+#
+#   CHANGE 4 — gradient checkpointing  (--grad_checkpoint)
+#     With only 20 GB VRAM, grad checkpointing trades ~33% extra compute
+#     for ~66% less activation memory, preventing OOM.
+#
+# Encoder architecture options (require --factorised_encoder):
+#
+#   --no_spatial_attn
+#     Removes the spatial attention sub-layer from every encoder block.
+#     Each station is encoded independently from its own temporal window;
+#     cross-station reasoning is delegated entirely to the decoder.
+#     Saves ~27% per encoder block — the single most impactful speed flag.
+#     Recommended with --cross_attn_decoder.
+#
+#   --temporal_window N
+#     Local windowed temporal attention: splits W timesteps into chunks of N.
+#     Odd layers use a Swin-style half-window shift so tokens communicate
+#     across chunk boundaries after two layers. W must be divisible by N.
+#     At W=144, tw=6 gives 24 one-hour chunks. Score computation drops 24×
+#     (still modest savings vs FFN/QKV, but worthwhile at this window size).
+#     At W=288, tw=6 gives 48 chunks — savings become substantial.
+#
+# Resuming an interrupted run:
+#   ./run_full_cloud.sh   (Lightning restores from last.ckpt automatically)
+#
+# Usage:
+#   chmod +x run_full_cloud.sh
+#   ./run_full_cloud.sh
+
+set -euo pipefail
+
+DATA_ROOT="/path/to/PeakWeatherDataset"   # ← update this
+SAVE_DIR="checkpoints/full_run_cloud"
+LOCAL_CACHE="/tmp/station_mae_cache"
+
+# ── Optional encoder flags ────────────────────────────────────────────────────
+# Uncomment to remove spatial attention (~27% faster per encoder block):
+# SPATIAL=""
+SPATIAL="--no_spatial_attn"
+
+# Uncomment to enable local windowed temporal attention:
+# W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
+# TEMPORAL_WINDOW="--temporal_window 6"
+TEMPORAL_WINDOW=""
+# ─────────────────────────────────────────────────────────────────────────────
+
+python main.py \
+    --data_root        "$DATA_ROOT" \
+    --cache_dir        "$DATA_ROOT" \
+    --local_cache_dir  "$LOCAL_CACHE" \
+    --window           144 \
+    --max_delta        36 \
+    --num_delta        3 \
+    --d_model          128 \
+    --enc_layers       6 \
+    --dec_layers       2 \
+    --mask_ratio       0.5 \
+    --dropout          0.1 \
+    --batch_size       16 \
+    --num_workers      4 \
+    --epochs           100 \
+    --lr               1e-4 \
+    --warmup_epochs    5 \
+    --weight_decay     0.05 \
+    --grad_clip        1.0 \
+    --patience         15 \
+    --save_every       5 \
+    --amp \
+    --bf16 \
+    --compile \
+    --grad_checkpoint \
+    --factorised_encoder \
+    --cross_attn_decoder \
+    $SPATIAL \
+    $TEMPORAL_WINDOW \
+    --wandb_project    station-mae \
+    --wandb_run_name   full-run-cloud \
+    --save_dir         "$SAVE_DIR"
+
+# ─── If still OOM: switch to window=72 (12 h context) ────────────────────────
+# Replace --window 144 with --window 72 and remove --grad_checkpoint.
+# Temporal attention drops 4×, decoder KV halves, frees ~3-4 GB VRAM.
+# The model still forecasts up to 6 h ahead via DeltaTimeEmbedding.
+# Epoch time roughly halves compared to window=144 without grad_checkpoint.

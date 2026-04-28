@@ -115,6 +115,8 @@ class StationMAE(nn.Module):
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
         use_checkpoint:          bool  = False,
         factorised_encoder:      bool  = False,
+        encoder_spatial_attn:    bool  = True,
+        temporal_window:         int   = 0,
         cross_attention_decoder: bool  = False,
     ):
         super().__init__()
@@ -134,6 +136,8 @@ class StationMAE(nn.Module):
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
             factorised=factorised_encoder,
+            spatial_attn=encoder_spatial_attn,
+            temporal_window=temporal_window,
         )
 
         self.decoder = StationMAEDecoder(

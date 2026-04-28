@@ -1,61 +1,73 @@
 #!/usr/bin/env bash
-# run_full.sh — full training run on all available years (2017–2024)
-#
-# Key differences from run_subset.sh:
-#   • No --subset flag          → uses all training years (2017–2021)
-#   • --window 288              → 48-hour input window (vs 12 steps / 2h in subset)
-#   • --max_delta 36            → 6-hour forecast horizon (vs 30 min in subset)
-#   • --num_delta 3             → 3 lead-times per sample; encoder runs once,
-#                                 decoder runs 3×  — amortises O(L²) attention cost
-#   • --epochs 100              → longer training budget
-#   • --patience 15             → more patience on the larger dataset
-#   • --save_every 10           → less frequent snapshots
-#   • --num_workers 4           → more DataLoader workers for full dataset I/O
-#   • --batch_size 16           → reduced from 32; larger windows use more memory
+# run_full_local.sh — full training run on all years, optimised for local machine
 #
 # Device is auto-selected: CUDA (GPU) → MPS (Apple Silicon) → CPU
 # --amp enables fp16 AMP; safe to leave on everywhere (no-op on CPU).
 #
-# WandB: credentials are picked up from ~/.netrc after `wandb login`.
-#        Omit --wandb_project to fall back to CSV logging only.
+# Encoder architecture options (require --factorised_encoder):
+#
+#   --no_spatial_attn
+#     Removes the spatial attention sub-layer from every encoder block.
+#     Each station is encoded independently from its own temporal window;
+#     cross-station reasoning is delegated entirely to the decoder.
+#     Saves ~27% per encoder block — the single most impactful speed flag.
+#     Recommended with --cross_attn_decoder.
+#
+#   --temporal_window N
+#     Local windowed temporal attention: splits W timesteps into chunks of N.
+#     Odd layers use a Swin-style half-window shift so tokens communicate
+#     across chunk boundaries after two layers. W must be divisible by N.
+#     At W=36, tw=6 gives 6 chunks — modest ~6% block speedup.
+#     More impactful at larger W (see run_full_cloud.sh).
 #
 # Resuming an interrupted run:
-#   ./run_full.sh   (just re-run; Lightning restores from last.ckpt automatically)
-# or pass explicitly:
-#   bash run_full.sh --resume checkpoints/full_run/last.ckpt
+#   ./run_full_local.sh   (Lightning restores from last.ckpt automatically)
 #
 # Usage:
-#   chmod +x run_full.sh
-#   ./run_full.sh
+#   chmod +x run_full_local.sh
+#   ./run_full_local.sh
 
 set -euo pipefail
 
 DATA_ROOT="/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset"
 SAVE_DIR="checkpoints/full_run_local"
 
+# ── Optional encoder flags ────────────────────────────────────────────────────
+# Uncomment to remove spatial attention (~27% faster per encoder block):
+# SPATIAL=""
+SPATIAL="--no_spatial_attn"
+
+# Uncomment to enable local windowed temporal attention:
+# W=36 / tw=6 → 6 chunks; modest speedup at this window size.
+# TEMPORAL_WINDOW="--temporal_window 6"
+TEMPORAL_WINDOW=""
+# ─────────────────────────────────────────────────────────────────────────────
+
 python main.py \
     --data_root        "$DATA_ROOT" \
     --cache_dir        "$DATA_ROOT" \
-    --window           288 \
+    --window           36 \
     --max_delta        36 \
     --num_delta        6 \
     --d_model          128 \
-    --enc_layers       6 \
+    --enc_layers       4 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.1 \
     --batch_size       16 \
-    --num_workers      0 \
+    --num_workers      4 \
     --epochs           50 \
     --lr               1e-4 \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --patience         5 \
+    --patience         15 \
     --save_every       2 \
     --amp \
     --factorised_encoder \
     --cross_attn_decoder \
-    --wandb_project    station-mae \
-    --wandb_run_name   full-run \
+    $SPATIAL \
+    $TEMPORAL_WINDOW \
+    --wandb_project    station-mae-local \
+    --wandb_run_name   full-run-local \
     --save_dir         "$SAVE_DIR"

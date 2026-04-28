@@ -111,33 +111,59 @@ class FactorisedTransformerBlock(nn.Module):
       1. Temporal attention  — each station independently attends over its W
          timesteps → reshape to (B·N, W, d), run MHA, reshape back.
 
+         Optionally uses *local windowed attention* (``temporal_window`` > 0):
+         the W-step sequence is split into non-overlapping chunks of size tw,
+         and attention runs only within each chunk.  Complexity drops from
+         O(N·W²) to O(N·(W/tw)·tw²) = O(N·W·tw) — e.g. tw=6, W=72 → 12×
+         cheaper.  Adjacent layers use a Swin-style half-window shift so that
+         information can propagate across chunk boundaries after 2 layers.
+
       2. Spatial attention   — all N stations attend to each other at every
          timestep → reshape to (B·W, N, d), run MHA, reshape back.
+         Can be disabled via ``spatial_attn=False`` to make the encoder
+         purely temporal (station-independent).  Spatial reasoning is then
+         left entirely to the decoder's cross- or self-attention.
 
       3. Shared FFN applied element-wise over the last dimension.
 
-    Complexity: O(N·W² + W·N²)  vs  O((W·N)²) for flat self-attention.
+    Complexity with both sub-layers: O(N·W² + W·N²)  vs  O((W·N)²) for flat.
+    Complexity with spatial_attn=False: O(N·W²) — purely temporal.
+    Complexity with temporal_window=tw: O(N·W·tw + W·N²) — local temporal.
     At W=288, N_vis≈100: ~8.3M vs ~830M attention pairs — roughly 100× cheaper.
 
-    Temporal and spatial sub-layers each have their own LayerNorm and MHA
-    (separate parameters) so the model can learn distinct inductive biases for
-    the time and space axes.
-
     Args:
-        d_model:   Model dimension.
-        num_heads: Attention heads (shared across both sub-layers).
-        mlp_ratio: FFN hidden-dim ratio (default 4.0).
-        dropout:   Dropout in attention and FFN (default 0.1).
+        d_model:         Model dimension.
+        num_heads:       Attention heads (shared across both sub-layers).
+        mlp_ratio:       FFN hidden-dim ratio (default 4.0).
+        dropout:         Dropout in attention and FFN (default 0.1).
+        spatial_attn:    If False, skip the spatial sub-layer entirely.
+                         Reduces encoder cost from O(N·W²+W·N²) to O(N·W²).
+        temporal_window: Local attention window size in timesteps (0 = full).
+                         W must be exactly divisible by temporal_window.
+                         Example: W=72, temporal_window=6 → 12 chunks of 6
+                         steps (1-hour windows at 10-min resolution).
+        shift:           If True, apply a half-window circular shift before
+                         chunking (Swin-style).  Alternate layers should have
+                         shift=True so tokens across chunk boundaries can
+                         communicate after two layers.
     """
 
     def __init__(
         self,
-        d_model:   int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout:   float = 0.1,
+        d_model:          int,
+        num_heads:        int,
+        mlp_ratio:        float = 4.0,
+        dropout:          float = 0.1,
+        spatial_attn:     bool  = True,
+        temporal_window:  int   = 0,
+        shift:            bool  = False,
     ):
         super().__init__()
+
+        self.spatial_attn    = spatial_attn
+        self.temporal_window = temporal_window
+        # shift only makes sense when windowing is active
+        self.shift           = shift and (temporal_window > 0)
 
         # ── Temporal sub-layer (each station over W timesteps) ────────────
         self.norm_t = nn.LayerNorm(d_model)
@@ -146,10 +172,12 @@ class FactorisedTransformerBlock(nn.Module):
         )
 
         # ── Spatial sub-layer (all N stations at each timestep) ──────────
-        self.norm_s = nn.LayerNorm(d_model)
-        self.attn_s = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True
-        )
+        # Only instantiated when spatial_attn=True to avoid unused parameters.
+        if spatial_attn:
+            self.norm_s = nn.LayerNorm(d_model)
+            self.attn_s = nn.MultiheadAttention(
+                d_model, num_heads, dropout=dropout, batch_first=True
+            )
 
         # ── Shared FFN ────────────────────────────────────────────────────
         self.norm_ff = nn.LayerNorm(d_model)
@@ -160,6 +188,49 @@ class FactorisedTransformerBlock(nn.Module):
             nn.Linear(int(d_model * mlp_ratio), d_model),
             nn.Dropout(dropout),
         )
+
+    def _temporal_attn(self, xt: torch.Tensor) -> torch.Tensor:
+        """
+        Self-attention along the temporal axis, full or windowed.
+
+        Args:
+            xt: (B·N, W, d_model)
+        Returns:
+            (B·N, W, d_model)  — residual NOT yet added (caller adds it)
+        """
+        BN, W, D = xt.shape
+        tw = self.temporal_window
+
+        if tw == 0 or tw >= W:
+            # ── Full temporal attention ───────────────────────────────────
+            at, _ = self.attn_t(xt, xt, xt, need_weights=False)
+            return at
+
+        # ── Local windowed temporal attention ────────────────────────────
+        # Each station's W-step sequence is split into non-overlapping chunks
+        # of size tw.  Attention runs only within each chunk → O(W·tw) instead
+        # of O(W²).  Swin-style half-window shift (when self.shift=True) lets
+        # adjacent layers bridge chunk boundaries.
+        assert W % tw == 0, (
+            f"temporal_window={tw} must divide W={W} exactly.  "
+            f"Choose a value that divides your --window size."
+        )
+        shift_size = tw // 2 if self.shift else 0
+
+        if shift_size > 0:
+            xt = torch.roll(xt, shifts=-shift_size, dims=1)
+
+        num_chunks = W // tw
+        # (BN, W, D) → (BN·num_chunks, tw, D)
+        xt_c = xt.reshape(BN * num_chunks, tw, D)
+        at_c, _ = self.attn_t(xt_c, xt_c, xt_c, need_weights=False)
+        # (BN·num_chunks, tw, D) → (BN, W, D)
+        at = at_c.reshape(BN, W, D)
+
+        if shift_size > 0:
+            at = torch.roll(at, shifts=shift_size, dims=1)
+
+        return at
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -173,20 +244,21 @@ class FactorisedTransformerBlock(nn.Module):
         # ── 1. Temporal attention: (B·N, W, D) ───────────────────────────
         # Permute so N is before W, then merge B and N into a single batch dim.
         # Each of the B·N sequences has length W (the temporal axis).
-        xt     = x.permute(0, 2, 1, 3).reshape(B * N, W, D)   # (B·N, W, D)
-        xt_n   = self.norm_t(xt)
-        at, _  = self.attn_t(xt_n, xt_n, xt_n, need_weights=False)
-        xt     = xt + at
-        x      = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)   # (B, W, N, D)
+        xt    = x.permute(0, 2, 1, 3).reshape(B * N, W, D)    # (B·N, W, D)
+        xt_n  = self.norm_t(xt)
+        xt    = xt + self._temporal_attn(xt_n)
+        x     = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)    # (B, W, N, D)
 
         # ── 2. Spatial attention: (B·W, N, D) ────────────────────────────
         # Merge B and W into a single batch dim.
         # Each of the B·W sequences has length N (the station axis).
-        xs     = x.reshape(B * W, N, D)                        # (B·W, N, D)
-        xs_n   = self.norm_s(xs)
-        as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
-        xs     = xs + as_
-        x      = xs.reshape(B, W, N, D)                        # (B, W, N, D)
+        # Skipped entirely when spatial_attn=False.
+        if self.spatial_attn:
+            xs     = x.reshape(B * W, N, D)                    # (B·W, N, D)
+            xs_n   = self.norm_s(xs)
+            as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
+            xs     = xs + as_
+            x      = xs.reshape(B, W, N, D)                    # (B, W, N, D)
 
         # ── 3. FFN (applied over last dim, works on any leading shape) ────
         x = x + self.ffn(self.norm_ff(x))
@@ -229,6 +301,20 @@ class StationMAEEncoder(nn.Module):
                               cheaper at W=288, N=100.  Tokens remain in (B,W,N,d) shape
                               through the blocks; flattened to (B,W·N_vis,d) at output to
                               preserve the decoder interface.
+        spatial_attn:         Only used when factorised=True.  If False, the spatial
+                              sub-layer is removed from every FactorisedTransformerBlock —
+                              each station is encoded independently from its own temporal
+                              window with no cross-station mixing in the encoder.  Reduces
+                              encoder cost from O(N·W²+W·N²) to O(N·W²).  All spatial
+                              reasoning is then delegated to the decoder.
+        temporal_window:      Only used when factorised=True.  Local attention window
+                              size in timesteps (0 = full attention over all W steps).
+                              W must be exactly divisible by temporal_window.
+                              Odd-indexed blocks automatically use a Swin-style
+                              half-window shift so tokens can communicate across
+                              chunk boundaries after two layers.
+                              Example: W=72, temporal_window=6 → 12 one-hour chunks
+                              at 10-min resolution, 12× cheaper temporal attention.
     """
 
     def __init__(
@@ -245,6 +331,8 @@ class StationMAEEncoder(nn.Module):
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
         use_checkpoint:       bool  = False,
         factorised:           bool  = False,
+        spatial_attn:         bool  = True,
+        temporal_window:      int   = 0,
     ):
         super().__init__()
 
@@ -269,11 +357,25 @@ class StationMAEEncoder(nn.Module):
         # FactorisedTransformerBlock (axial attention over W×N grid) is used when
         # factorised=True; otherwise fall back to flat TransformerBlock for
         # backward compatibility with existing checkpoints.
-        _block_cls = FactorisedTransformerBlock if factorised else TransformerBlock
-        self.blocks = nn.ModuleList([
-            _block_cls(d_model, num_heads, mlp_ratio, dropout)
-            for _ in range(num_layers)
-        ])
+        # spatial_attn=False removes the spatial sub-layer (station-independent encoder).
+        # temporal_window > 0 enables local windowed temporal attention; odd-indexed
+        # blocks use a half-window Swin shift so cross-chunk communication emerges
+        # after two layers.  Ignored when factorised=False.
+        if factorised:
+            self.blocks = nn.ModuleList([
+                FactorisedTransformerBlock(
+                    d_model, num_heads, mlp_ratio, dropout,
+                    spatial_attn=spatial_attn,
+                    temporal_window=temporal_window,
+                    shift=(i % 2 == 1),   # alternate shift: even=no-shift, odd=shifted
+                )
+                for i in range(num_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                TransformerBlock(d_model, num_heads, mlp_ratio, dropout)
+                for _ in range(num_layers)
+            ])
 
         self.norm = nn.LayerNorm(d_model)
 
