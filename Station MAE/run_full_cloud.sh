@@ -55,7 +55,7 @@
 
 set -euo pipefail
 
-DATA_ROOT="/path/to/PeakWeatherDataset"   # ← update this
+DATA_ROOT="/home/renku/work/PeakWeatherDataset"   # ← update this
 SAVE_DIR="checkpoints/full_run_cloud"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
