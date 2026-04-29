@@ -1,68 +1,50 @@
 #!/usr/bin/env bash
-# run_full_cloud.sh — optimised full training run for a 20 GB GPU
+# run_full_cloud.sh — optimised full training run for A100 80GB PCIe (MIG 3g.20gb)
 #
 # Hardware context
 # ----------------
-# Platform reports "GPU 20GB" — exact model unconfirmed.
-#   • ~20 GB VRAM
-#   • 7 CPUs, 70 GB RAM, single GPU
+# The A100 is running in MIG mode. The allocated partition is 3g.20gb:
+#   • 19,968 MiB (~20 GB) VRAM  — NOT the full 80 GB
+#   • 28 / 108 streaming multiprocessors
+#   • No NVLink across MIG instances → single-GPU only
 #
 # Key flags:
 #
-#   --amp
-#     Automatic Mixed Precision.  Lightning chooses the best supported mode:
-#       • bf16-mixed  if the GPU has native BF16 tensor cores (A100/H100/RTX 30+)
-#       • 16-mixed    (FP16) otherwise — works on any CUDA-capable GPU.
-#     Check the Lightning startup log to confirm which mode is active.
+#   CHANGE 1 — bfloat16 AMP  (--amp --bf16)
+#     A100 has native BF16 tensor cores. Same speed as FP16 but wider
+#     dynamic range — no loss scaling, more numerically stable.
 #
-#   --bf16  (OPTIONAL — safe to remove if GPU is not confirmed Ampere/A100)
-#     Forces bf16-mixed precision.  Wider dynamic range than FP16, no loss
-#     scaling needed.  Requires native BF16 tensor cores.
-#     If your GPU does not support it, PyTorch errors at startup:
-#       RuntimeError: BF16 is not supported on this GPU
-#     → remove --bf16 and rely on --amp alone (FP16 fallback is automatic).
+#   CHANGE 2 — torch.compile default mode  (--compile)
+#     MIG partitions restrict CUDA graph capture, so "reduce-overhead" mode
+#     would silently fail. "default" mode still fuses ops and removes Python
+#     overhead (~1.3-1.5× speedup), no CUDA graphs needed.
+#     Warm-up cost: ~1-2 min on the first epoch.
 #
-#   --compile
-#     torch.compile "default" mode fuses ops and removes Python dispatch
-#     overhead (~1.3–1.5× speedup), no CUDA graphs needed.
-#     Warm-up cost: ~1–2 min on the first epoch.
+#   CHANGE 3 — fast local cache  (--local_cache_dir /tmp/station_mae_cache)
+#     Saves split-normalised tensors as numpy mmap files on /tmp (tmpfs).
+#     Workers mmap directly from OS page cache — no IPC queue overhead for
+#     source data. First run writes files; all subsequent runs are instant.
 #
-#   --local_cache_dir /tmp/station_mae_cache
-#     Saves split-normalised tensors as numpy mmap files on /tmp (RAM-backed).
-#     Workers mmap from OS page cache — no IPC queue overhead.
-#     /tmp is tmpfs — counts against RAM (70 GB), not disk (50 GB).
-#
-# Speed improvements vs original config (estimated ~60 min/epoch → ~26 min):
-#
-#   Removed --grad_checkpoint  (+18% speed)
-#     W=72 + mlp_ratio=2.0 + batch=32 → ~2.4 GB activations — well within
-#     20 GB VRAM.  Grad checkpointing is only needed for W≥144 or very large
-#     batches.  Removing it saves the ~33% extra backward compute it adds.
-#     Re-add it (with --batch_size 16) only if you hit OOM.
-#
-#   --batch_size 32  (+36% speed, was 16)
-#     Doubles GPU utilisation; halves steps/epoch.  Net gain ~1.6×.
-#     If OOM: revert to 16 and re-add --grad_checkpoint.
-#
-#   --temporal_window 6  (+8% speed)
-#     W=72 / tw=6 → 12 two-hour chunks; attention score cost drops 12×.
-#     Odd encoder layers use Swin-style half-window shift for cross-chunk
-#     communication.  W=72 is divisible by tw=6 ✓.
-#
-#   --num_delta 3  (+7% speed, was 6)
-#     Decoder builds N×K = 156×3 = 468 query tokens (was 936).
-#     Still samples 3 distinct lead-times per sample for multi-delta training.
-#     To always predict at exactly Δt=36: use --num_delta 1 --max_delta 36.
+#   CHANGE 4 — gradient checkpointing  (--grad_checkpoint)
+#     With only 20 GB VRAM, grad checkpointing trades ~33% extra compute
+#     for ~66% less activation memory, preventing OOM.
 #
 # Encoder architecture options (require --factorised_encoder):
 #
 #   --no_spatial_attn
-#     Encodes each station independently; cross-station reasoning delegated
-#     entirely to the decoder.  Saves ~27% per encoder block.
+#     Removes the spatial attention sub-layer from every encoder block.
+#     Each station is encoded independently from its own temporal window;
+#     cross-station reasoning is delegated entirely to the decoder.
+#     Saves ~27% per encoder block — the single most impactful speed flag.
 #     Recommended with --cross_attn_decoder.
 #
 #   --temporal_window N
-#     Local windowed temporal attention (see above).  W must be divisible by N.
+#     Local windowed temporal attention: splits W timesteps into chunks of N.
+#     Odd layers use a Swin-style half-window shift so tokens communicate
+#     across chunk boundaries after two layers. W must be divisible by N.
+#     At W=144, tw=6 gives 24 one-hour chunks. Score computation drops 24×
+#     (still modest savings vs FFN/QKV, but worthwhile at this window size).
+#     At W=288, tw=6 gives 48 chunks — savings become substantial.
 #
 # Resuming an interrupted run:
 #   ./run_full_cloud.sh   (Lightning restores from last.ckpt automatically)
@@ -77,21 +59,15 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"   # ← update this
 SAVE_DIR="checkpoints/full_run_cloud"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
-# ── Precision ─────────────────────────────────────────────────────────────────
-# Remove --bf16 if you see "RuntimeError: BF16 is not supported on this GPU"
-# --amp alone will then use FP16 mixed precision, which works on any CUDA GPU.
-PRECISION="--amp --bf16"
-# PRECISION="--amp"   # ← safe fallback for non-Ampere GPUs
-# ─────────────────────────────────────────────────────────────────────────────
-
 # ── Optional encoder flags ────────────────────────────────────────────────────
-# Remove spatial attention (~27% faster per encoder block):
+# Uncomment to remove spatial attention (~27% faster per encoder block):
+# SPATIAL=""
 SPATIAL="--no_spatial_attn"
-# SPATIAL=""   # ← uncomment to restore full spatial attention
 
-# Windowed temporal attention: W=72 / tw=6 → 12 two-hour chunks (~8% faster):
-TEMPORAL_WINDOW="--temporal_window 6"
-#TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
+# Uncomment to enable local windowed temporal attention:
+# W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
+# TEMPORAL_WINDOW="--temporal_window 6"
+TEMPORAL_WINDOW=""
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
@@ -103,23 +79,25 @@ python main.py \
     --num_delta        6 \
     --mlp_ratio        2.0 \
     --d_model          128 \
-    --enc_layers       4 \
+    --enc_layers       6 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.1 \
-    --batch_size       32 \
+    --batch_size       16 \
     --num_workers      5 \
-    --epochs           20 \
+    --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --val_check_interval 2000 \
-    --save_every_steps   2000 \
-    --patience           5 \
+    --val_check_interval 4000 \
+    --save_every_steps   4000 \
+    --patience           3 \
     --min_lr             1e-6 \
-    $PRECISION \
+    --amp \
+    --bf16 \
     --compile \
+    --grad_checkpoint \
     --factorised_encoder \
     --cross_attn_decoder \
     $SPATIAL \
@@ -128,17 +106,23 @@ python main.py \
     --wandb_run_name   full-run-cloud \
     --save_dir         "$SAVE_DIR"
 
-# ─── Sub-epoch validation + checkpointing ────────────────────────────────────
+# ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
 #
-# With batch_size=32 and ~105K train samples → ~3281 steps/epoch (~26 min).
-# val_check_interval=2000 steps ≈ 0.61 epochs ≈ ~16 min per check.
-# patience=5 checks → stops after ~80 min without improvement.
+# One full epoch on this config takes ~50 min.  To get validation feedback and
+# checkpoint saves every ~30 min instead of every epoch, add these flags:
 #
-# Adjust to taste:
-#   2000 steps → val every ~16 min, patience=5 → ~80 min tolerance
-#   3000 steps → val every ~24 min, patience=3 → ~72 min tolerance
+#   --val_check_interval 4000   # run val every 4000 training steps (~30 min)
+#   --save_every_steps   4000   # save step_NNNNNNN.ckpt at the same interval
+#   --patience           3      # stop after 3 checks (~90 min) without improvement
+#   --min_lr             1e-6   # LR floor: cosine decays to 1e-6 not 0
+#
+# With batch_size=16 and ~105K train samples → ~6562 steps/epoch.
+# 4000 steps ≈ 0.61 epochs ≈ 30 min.  Adjust if your step-time differs.
+# EarlyStopping patience now counts "validation checks" not epochs, so
+# patience=3 → stop after ~90 min without improvement.
 
-# ─── If OOM at batch_size=32 ─────────────────────────────────────────────────
-# Revert to --batch_size 16 and re-add --grad_checkpoint.
-# With batch=16: ~6562 steps/epoch; set val_check_interval=4000 (~30 min).
-# Grad checkpointing trades ~33% extra compute for ~66% less activation memory.
+# ─── If still OOM: switch to window=72 (12 h context) ────────────────────────
+# Replace --window 144 with --window 72 and remove --grad_checkpoint.
+# Temporal attention drops 4×, decoder KV halves, frees ~3-4 GB VRAM.
+# The model still forecasts up to 6 h ahead via DeltaTimeEmbedding.
+# Epoch time roughly halves compared to window=144 without grad_checkpoint.
