@@ -77,14 +77,14 @@ python main.py \
     --window           72 \
     --max_delta        36 \
     --num_delta        6 \
-    --mlp_ratio 2.0 \
+    --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.1 \
     --batch_size       16 \
-    --num_workers      4 \
+    --num_workers      5 \
     --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    5 \
