@@ -100,10 +100,10 @@ python main.py \
     --local_cache_dir  "$LOCAL_CACHE" \
     --window           72 \
     --max_delta        36 \
-    --num_delta        1 \
+    --num_delta        6 \
     --mlp_ratio        2.0 \
     --d_model          128 \
-    --enc_layers       6 \
+    --enc_layers       4 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.1 \
