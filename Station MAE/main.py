@@ -58,12 +58,20 @@ Arguments
     --seed           INT   Random seed (default 42)
 
   Early stopping
-    --patience       INT   Epochs without val/loss improvement before stopping; 0 = off (default 10)
+    --patience       INT   Checks without val/loss improvement before stopping; 0 = off (default 10)
+                           Counts "validation checks" not epochs — with --val_check_interval N,
+                           patience=3 means 3×N steps without improvement before stopping.
     --min_delta      FLT   Minimum improvement to reset patience counter (default 1e-4)
 
   Checkpointing
     --save_dir       STR   Directory for checkpoints (default "checkpoints")
     --save_every     INT   Save a numbered snapshot every N epochs (default 5)
+                           Ignored when --save_every_steps > 0.
+    --save_every_steps INT Save a numbered snapshot every N training steps (default 0 = off)
+                           When set, replaces --save_every.  Useful for long epochs (>30 min):
+                           set equal to --val_check_interval so checkpoints align with
+                           validation runs.  Example: --val_check_interval 4000
+                           --save_every_steps 4000  → check + save every ~30 min on A100.
     --resume         STR   Path to Lightning .ckpt file to resume from
 
   Logging / WandB
@@ -148,6 +156,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_epochs",type=int,   default=5)
     p.add_argument("--grad_clip",    type=float, default=1.0)
+    p.add_argument("--min_lr",        type=float, default=1e-6,
+                   help="Minimum LR floor for cosine decay schedule (default 1e-6). "
+                        "Prevents the LR from decaying all the way to zero near end of "
+                        "training. Expressed as an absolute LR value, not a ratio. "
+                        "Set to 0.0 to disable (original behaviour: decay to zero).")
     p.add_argument("--amp",          action="store_true")
     p.add_argument("--bf16",         action="store_true",
                    help="Use bfloat16 mixed precision instead of float16. "
@@ -166,9 +179,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--min_delta",    type=float, default=1e-4)
 
     # Checkpointing
-    p.add_argument("--save_dir",     type=str,   default="checkpoints")
-    p.add_argument("--save_every",   type=int,   default=5)
-    p.add_argument("--resume",       type=str,   default=None)
+    p.add_argument("--save_dir",        type=str, default="checkpoints")
+    p.add_argument("--save_every",      type=int, default=5)
+    p.add_argument("--save_every_steps", type=int, default=0,
+                   help="Save a periodic checkpoint every N training steps (0 = off, "
+                        "use --save_every epochs instead). Useful when one epoch is "
+                        ">30 min: set to the same value as --val_check_interval so "
+                        "checkpoints always align with a validation run.")
+    p.add_argument("--resume",          type=str, default=None)
+
+    # Sub-epoch validation / checkpointing
+    p.add_argument("--val_check_interval", type=int, default=0,
+                   help="Run validation every N training steps instead of every epoch "
+                        "(0 = once per epoch, the default). EarlyStopping patience "
+                        "then counts in validation-checks, not epochs. Example for a "
+                        "50-min epoch on A100 (~6500 steps): use 4000 for ~30-min "
+                        "checks. Set --save_every_steps to the same value to also save "
+                        "checkpoints at each validation point.")
 
     # Logging / WandB
     p.add_argument("--wandb_project",   type=str, default=None,
@@ -348,10 +375,12 @@ def main() -> None:
                   "— first epoch warm-up ~1-2 min, then ~1.3-1.5× faster")
 
     cfg = {
-        "lr":            args.lr,
-        "weight_decay":  args.weight_decay,
-        "epochs":        args.epochs,
-        "warmup_epochs": args.warmup_epochs,
+        "lr":                  args.lr,
+        "min_lr":              args.min_lr,
+        "weight_decay":        args.weight_decay,
+        "epochs":              args.epochs,
+        "warmup_epochs":       args.warmup_epochs,
+        "log_every_n_steps":   args.log_every_n_steps,   # used by wandb.watch()
         # Informational — stored in checkpoint hyper_parameters for test.py
         "factorised_encoder":  args.factorised_encoder,
         "no_spatial_attn":     args.no_spatial_attn,
@@ -394,6 +423,16 @@ def main() -> None:
 
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # ── Sub-epoch validation / checkpointing ──────────────────────────────
+    # When --val_check_interval N is set, Lightning runs validation every N
+    # training steps instead of once per epoch.  EarlyStopping patience then
+    # counts "validation checks" (i.e. every N steps), not full epochs.
+    # Example: 50-min epoch ≈ 6500 steps, val_check_interval=4000 → val every ~30 min.
+    _step_based = args.val_check_interval > 0
+    if _step_based:
+        print(f"Val check interval       : every {args.val_check_interval} steps "
+              f"(~{args.val_check_interval * args.batch_size / 1000:.0f}k samples between checks)")
+
     callbacks = [
         # Best checkpoint by val/loss
         ModelCheckpoint(
@@ -405,12 +444,21 @@ def main() -> None:
             save_last=True,             # also writes last.ckpt after every epoch
             verbose=True,
         ),
-        # Periodic numbered snapshots
-        ModelCheckpoint(
-            dirpath=args.save_dir,
-            filename="epoch_{epoch:03d}",
-            every_n_epochs=args.save_every,
-            save_top_k=-1,              # keep all periodic snapshots
+        # Periodic numbered snapshots — epoch-based or step-based
+        *(
+            [ModelCheckpoint(
+                dirpath=args.save_dir,
+                filename="step_{step:07d}",
+                every_n_train_steps=args.save_every_steps,
+                save_top_k=-1,
+            )]
+            if args.save_every_steps > 0 else
+            [ModelCheckpoint(
+                dirpath=args.save_dir,
+                filename="epoch_{epoch:03d}",
+                every_n_epochs=args.save_every,
+                save_top_k=-1,
+            )]
         ),
         # Learning rate monitor — logs train/lr to WandB automatically
         LearningRateMonitor(logging_interval="step"),
@@ -426,7 +474,11 @@ def main() -> None:
                 verbose=True,
             )
         )
-        print(f"EarlyStopping            : patience={args.patience}  min_delta={args.min_delta}")
+        _patience_unit = "steps" if _step_based else "epochs"
+        _patience_val  = (args.patience * args.val_check_interval
+                          if _step_based else args.patience)
+        print(f"EarlyStopping            : patience={args.patience} checks  "
+              f"(= {_patience_val} {_patience_unit})  min_delta={args.min_delta}")
 
     # ── Precision (AMP) ─────────────────────────────────────────────────────
     # "bf16-mixed" — preferred on A100/H100/RTX 3090+: same tensor-core speed
@@ -442,7 +494,17 @@ def main() -> None:
     else:
         precision = "32-true"
 
+    # ── LR floor reporting ───────────────────────────────────────────────────
+    if args.min_lr > 0:
+        print(f"LR schedule              : warmup {args.warmup_epochs} ep → "
+              f"cosine → floor {args.min_lr:.2e}  "
+              f"(ratio {args.min_lr / args.lr:.4f})")
+
     # ── Trainer ─────────────────────────────────────────────────────────────
+    _trainer_kwargs = {}
+    if args.val_check_interval > 0:
+        _trainer_kwargs["val_check_interval"] = args.val_check_interval
+
     trainer = pl.Trainer(
         max_epochs=args.epochs,
         accelerator="auto",             # auto-selects CUDA → MPS → CPU
@@ -454,6 +516,7 @@ def main() -> None:
         log_every_n_steps=args.log_every_n_steps,
         enable_progress_bar=True,
         deterministic=False,            # True slows training; seed already set
+        **_trainer_kwargs,
     )
 
     print(f"\n[Station-MAE]  seed={args.seed}  precision={precision}")

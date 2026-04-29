@@ -103,6 +103,21 @@ python main.py \
     --wandb_run_name   full-run-cloud \
     --save_dir         "$SAVE_DIR"
 
+# ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
+#
+# One full epoch on this config takes ~50 min.  To get validation feedback and
+# checkpoint saves every ~30 min instead of every epoch, add these flags:
+#
+#   --val_check_interval 4000   # run val every 4000 training steps (~30 min)
+#   --save_every_steps   4000   # save step_NNNNNNN.ckpt at the same interval
+#   --patience           3      # stop after 3 checks (~90 min) without improvement
+#   --min_lr             1e-6   # LR floor: cosine decays to 1e-6 not 0
+#
+# With batch_size=16 and ~105K train samples → ~6562 steps/epoch.
+# 4000 steps ≈ 0.61 epochs ≈ 30 min.  Adjust if your step-time differs.
+# EarlyStopping patience now counts "validation checks" not epochs, so
+# patience=3 → stop after ~90 min without improvement.
+
 # ─── If still OOM: switch to window=72 (12 h context) ────────────────────────
 # Replace --window 144 with --window 72 and remove --grad_checkpoint.
 # Temporal attention drops 4×, decoder KV halves, frees ~3-4 GB VRAM.

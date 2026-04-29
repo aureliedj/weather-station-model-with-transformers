@@ -15,11 +15,20 @@ whatever logger is attached to the Trainer (WandB, CSV, …).
 WandB dashboard panels
 -----------------------
     train/loss          — per-step and per-epoch training MSE
+    train/overall_rmse  — epoch train RMSE (comparable with val/overall_rmse)
     train/lr            — learning rate (per step)
     val/loss            — epoch validation MSE  (used for ModelCheckpoint / EarlyStopping)
     val/overall_rmse    — epoch overall RMSE across all target variables
     val/{var}_rmse      — per-variable RMSE (temperature, pressure, …)
     val/{var}_mae       — per-variable MAE
+
+WandB model watching
+---------------------
+    wandb.watch() is called automatically in on_train_start() when a WandbLogger
+    is attached.  It streams gradient histograms to the WandB run every
+    cfg["log_every_n_steps"] training steps.  Gradient norms appear under the
+    "Gradients" tab in the WandB run dashboard and help diagnose vanishing /
+    exploding gradients early in training.
 """
 
 import math
@@ -55,6 +64,32 @@ class StationMAELightning(pl.LightningModule):
         self.save_hyperparameters(ignore=["model"])
 
     # ------------------------------------------------------------------
+    # Hooks
+    # ------------------------------------------------------------------
+
+    def on_train_start(self) -> None:
+        """
+        Called once before the first training step.
+
+        If a WandbLogger is attached, registers gradient and parameter
+        histogram watching via wandb.watch().  This streams gradient
+        norms to the WandB "Gradients" tab, making it easy to spot
+        vanishing or exploding gradients in the encoder / decoder.
+        """
+        try:
+            from pytorch_lightning.loggers import WandbLogger
+        except ImportError:
+            return
+        if not isinstance(self.logger, WandbLogger):
+            return
+        import wandb
+        log_freq = self.cfg.get("log_every_n_steps", 50)
+        # Unwrap torch.compile wrapper if present (_orig_mod attribute)
+        underlying = getattr(self.model, "_orig_mod", self.model)
+        wandb.watch(underlying, log="gradients", log_freq=log_freq)
+        print(f"wandb.watch() registered — gradient histograms every {log_freq} steps")
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -88,13 +123,33 @@ class StationMAELightning(pl.LightningModule):
         is_multi   = delta_steps.dim() == 2
         forward_fn = self.model.forward_multi_delta if is_multi else self.model.forward
 
-        loss, _, _ = forward_fn(
+        loss, preds, _ = forward_fn(
             x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
         )
 
         lr = self.optimizers().param_groups[0]["lr"]
         self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train/lr",   lr,   on_step=True, on_epoch=False, prog_bar=False)
+
+        # ── train/overall_rmse — logged per epoch, mirrors val/overall_rmse ───
+        # Use first delta for consistent comparison with val (which uses K=1).
+        # This lets WandB show train RMSE and val RMSE on the same chart.
+        with torch.no_grad():
+            if is_multi:
+                p_flat = preds[:, 0].reshape(-1, NUM_TARGET_VARIABLES)
+                t_flat = y[:, 0, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES)
+                m_flat = y_mask[:, 0, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES).bool()
+            else:
+                p_flat = preds.reshape(-1, NUM_TARGET_VARIABLES)
+                t_flat = y[:, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES)
+                m_flat = y_mask[:, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES).bool()
+            if m_flat.sum() > 0:
+                mask_any = m_flat.any(dim=-1)
+                self.log(
+                    "train/overall_rmse",
+                    (p_flat[mask_any] - t_flat[mask_any]).pow(2).mean().sqrt(),
+                    on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
+                )
 
         return loss
 
@@ -156,11 +211,13 @@ class StationMAELightning(pl.LightningModule):
 
     def configure_optimizers(self):
         lr            = self.cfg.get("lr",            1e-4)
+        min_lr        = self.cfg.get("min_lr",        0.0)
         weight_decay  = self.cfg.get("weight_decay",  0.05)
         warmup_epochs = self.cfg.get("warmup_epochs", 5)
 
-        # Separate decay / no-decay parameter groups (standard transformer recipe)
-        # Biases, LayerNorm, embeddings and mask tokens are excluded from weight decay.
+        # ── Parameter groups: standard transformer recipe ──────────────────
+        # Biases, LayerNorm params, embeddings, and mask_token are excluded
+        # from weight decay.  Decaying embeddings or norms can harm training.
         decay_params, nodecay_params = [], []
         no_decay_kw = ("bias", "norm", "embedding", "mask_token", "lambdas")
         for name, param in self.model.named_parameters():
@@ -169,6 +226,13 @@ class StationMAELightning(pl.LightningModule):
             bucket = nodecay_params if any(kw in name for kw in no_decay_kw) else decay_params
             bucket.append(param)
 
+        # ── Optimizer: AdamW with MAE-tuned betas ─────────────────────────
+        # betas=(0.9, 0.95): higher β₂ dampens the squared-gradient running
+        # mean less aggressively than the default 0.999.  This is the recipe
+        # from the original MAE paper (He et al. 2022) and works well for
+        # transformer models trained with cosine-decay schedules.
+        # weight_decay=0.05: applied only to weight matrices (not biases /
+        # norms / embeddings).  Provides L2 regularisation on model weights.
         optimizer = torch.optim.AdamW(
             [
                 {"params": decay_params,   "weight_decay": weight_decay},
@@ -179,18 +243,28 @@ class StationMAELightning(pl.LightningModule):
             eps=1e-8,
         )
 
+        # ── LR schedule: linear warmup → cosine decay → floor at min_lr ───
         # Lightning provides estimated_stepping_batches = epochs × steps_per_epoch
         # accounting for gradient accumulation, so the schedule is always correct.
-        total_steps  = self.trainer.estimated_stepping_batches
-        epochs       = self.cfg.get("epochs", 100)
-        steps_per_ep = max(total_steps // epochs, 1)
-        warmup_steps = warmup_epochs * steps_per_ep
+        #
+        # min_lr floor: prevents the LR from decaying all the way to zero near
+        # the end of training.  Setting min_lr = lr × 0.01 (e.g. 1e-6 for
+        # lr=1e-4) keeps fine-tuning capacity in the final epochs and avoids
+        # the model stalling when the LR is near numerical precision.
+        total_steps   = self.trainer.estimated_stepping_batches
+        epochs        = self.cfg.get("epochs", 100)
+        steps_per_ep  = max(total_steps // epochs, 1)
+        warmup_steps  = warmup_epochs * steps_per_ep
+        min_lr_ratio  = min_lr / max(lr, 1e-12)   # LR multiplier floor
 
         def _lr_lambda(step: int) -> float:
             if step < warmup_steps:
+                # Linear warm-up from 0 → peak LR
                 return float(step) / max(warmup_steps, 1)
             progress = float(step - warmup_steps) / max(total_steps - warmup_steps, 1)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Floor at min_lr so the schedule never decays below it
+            return max(cosine, min_lr_ratio)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, _lr_lambda)
 
