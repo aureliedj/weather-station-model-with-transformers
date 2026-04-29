@@ -107,7 +107,7 @@ python main.py \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.1 \
-    --batch_size       32 \
+    --batch_size       16 \
     --num_workers      5 \
     --epochs           100 \
     --lr               1e-4 \
