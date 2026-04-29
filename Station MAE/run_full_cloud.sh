@@ -91,7 +91,7 @@ SPATIAL="--no_spatial_attn"
 
 # Windowed temporal attention: W=72 / tw=6 → 12 two-hour chunks (~8% faster):
 #TEMPORAL_WINDOW="--temporal_window 6"
-# TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
+TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
