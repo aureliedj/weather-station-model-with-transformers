@@ -91,7 +91,7 @@ SPATIAL="--no_spatial_attn"
 
 # Windowed temporal attention: W=72 / tw=6 → 12 two-hour chunks (~8% faster):
 #TEMPORAL_WINDOW="--temporal_window 6"
- TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
+# TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
@@ -100,7 +100,7 @@ python main.py \
     --local_cache_dir  "$LOCAL_CACHE" \
     --window           72 \
     --max_delta        36 \
-    --num_delta        6 \
+    --num_delta        1 \
     --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
