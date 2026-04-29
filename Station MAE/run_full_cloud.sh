@@ -74,9 +74,10 @@ python main.py \
     --data_root        "$DATA_ROOT" \
     --cache_dir        "$DATA_ROOT" \
     --local_cache_dir  "$LOCAL_CACHE" \
-    --window           144 \
+    --window           72 \
     --max_delta        36 \
-    --num_delta        3 \
+    --num_delta        6 \
+    --mlp_ratio 2.0 \
     --d_model          128 \
     --enc_layers       6 \
     --dec_layers       2 \
@@ -89,8 +90,10 @@ python main.py \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --patience         15 \
-    --save_every       5 \
+    --val_check_interval 4000 \
+    --save_every_steps   4000 \
+    --patience           3 \
+    --min_lr             1e-6 \
     --amp \
     --bf16 \
     --compile \
