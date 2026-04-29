@@ -80,7 +80,7 @@ LOCAL_CACHE="/tmp/station_mae_cache"
 # ── Precision ─────────────────────────────────────────────────────────────────
 # Remove --bf16 if you see "RuntimeError: BF16 is not supported on this GPU"
 # --amp alone will then use FP16 mixed precision, which works on any CUDA GPU.
-PRECISION="--amp --bf16"
+PRECISION="--bf16"
 # PRECISION="--amp"   # ← safe fallback for non-Ampere GPUs
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -90,8 +90,8 @@ SPATIAL="--no_spatial_attn"
 # SPATIAL=""   # ← uncomment to restore full spatial attention
 
 # Windowed temporal attention: W=72 / tw=6 → 12 two-hour chunks (~8% faster):
-TEMPORAL_WINDOW="--temporal_window 6"
-# TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
+#TEMPORAL_WINDOW="--temporal_window 6"
+ TEMPORAL_WINDOW=""   # ← uncomment to disable windowed attention
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
@@ -100,7 +100,7 @@ python main.py \
     --local_cache_dir  "$LOCAL_CACHE" \
     --window           72 \
     --max_delta        36 \
-    --num_delta        3 \
+    --num_delta        6 \
     --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
