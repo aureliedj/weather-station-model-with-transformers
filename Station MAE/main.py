@@ -83,6 +83,8 @@ Arguments
 import argparse
 import os
 import random
+import threading
+import time
 
 import numpy as np
 import torch
@@ -522,6 +524,36 @@ def main() -> None:
     print(f"\n[Station-MAE]  seed={args.seed}  precision={precision}")
     print(f"Saving checkpoints to: {args.save_dir}\n")
 
+    # ── CPU keepalive (cloud/Renku idle-timeout guard) ───────────────────────
+    # On Renku / Kubernetes, sessions are paused when the CPU appears idle for
+    # too long.  With torch.compile + fast mmap cache, the CPU is nearly idle
+    # during GPU-bound training: DataLoader workers fill the prefetch queue in
+    # milliseconds, then block; the main thread dispatches CUDA kernels with
+    # negligible Python overhead.  The platform idle detector can mis-classify
+    # this as an inactive session and pause the job mid-epoch.
+    #
+    # The keepalive thread wakes every 20 seconds and performs a tiny CPU
+    # computation (a dot-product on a small float32 vector) — enough to register
+    # meaningful CPU utilisation without meaningfully affecting training speed.
+    # The thread is daemonised so it exits automatically when the main process
+    # finishes or is killed.
+    _keepalive_stop = threading.Event()
+
+    def _keepalive_fn(stop_event: threading.Event, interval: int = 20) -> None:
+        _dummy = [float(i) for i in range(512)]
+        while not stop_event.wait(timeout=interval):
+            # Tiny CPU work: sum a small list — invisible overhead, visible activity
+            _ = sum(_dummy)
+
+    _keepalive_thread = threading.Thread(
+        target=_keepalive_fn,
+        args=(_keepalive_stop,),
+        name="cpu-keepalive",
+        daemon=True,
+    )
+    _keepalive_thread.start()
+    print("CPU keepalive            : ON  (wakes every 20 s — guards against idle timeout)")
+
     # ── Fit ─────────────────────────────────────────────────────────────────
     # Pass ckpt_path to resume a Lightning checkpoint (full training state).
     trainer.fit(
@@ -530,6 +562,8 @@ def main() -> None:
         val_dataloaders=val_loader,
         ckpt_path=args.resume,          # None = start fresh
     )
+
+    _keepalive_stop.set()   # signal the keepalive thread to exit cleanly
 
     print(f"\nTraining complete.  Checkpoints saved to: {args.save_dir}")
     if args.wandb_project:
