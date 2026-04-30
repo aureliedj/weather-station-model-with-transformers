@@ -12,23 +12,20 @@ Responsibilities
 All metrics are emitted via self.log() and are automatically streamed to
 whatever logger is attached to the Trainer (WandB, CSV, …).
 
-WandB dashboard panels
------------------------
-    train/loss          — per-step and per-epoch training MSE
-    train/overall_rmse  — epoch train RMSE (comparable with val/overall_rmse)
-    train/lr            — learning rate (per step)
-    val/loss            — epoch validation MSE  (used for ModelCheckpoint / EarlyStopping)
+WandB metric names
+------------------
+Lightning adds _step / _epoch suffixes automatically when BOTH on_step=True
+and on_epoch=True are set on the same metric — so "train/loss" would appear
+as "train/loss_step" and "train/loss_epoch" in WandB.  To keep names clean,
+each metric is logged with exactly one mode:
+
+    train/loss          — per-step training MSE     (on_step=True, on_epoch=False)
+    train/overall_rmse  — epoch-level train RMSE    (on_step=False, on_epoch=True)
+    train/lr            — learning rate per step    (on_step=True, on_epoch=False)
+    val/loss            — epoch validation MSE      (drives ModelCheckpoint / EarlyStopping)
     val/overall_rmse    — epoch overall RMSE across all target variables
     val/{var}_rmse      — per-variable RMSE (temperature, pressure, …)
     val/{var}_mae       — per-variable MAE
-
-WandB model watching
----------------------
-    wandb.watch() is called automatically in on_train_start() when a WandbLogger
-    is attached.  It streams gradient histograms to the WandB run every
-    cfg["log_every_n_steps"] training steps.  Gradient norms appear under the
-    "Gradients" tab in the WandB run dashboard and help diagnose vanishing /
-    exploding gradients early in training.
 """
 
 import math
@@ -62,32 +59,6 @@ class StationMAELightning(pl.LightningModule):
         self.cfg   = cfg
         # Persists cfg into Lightning checkpoints (readable in test.py)
         self.save_hyperparameters(ignore=["model"])
-
-    # ------------------------------------------------------------------
-    # Hooks
-    # ------------------------------------------------------------------
-
-    def on_train_start(self) -> None:
-        """
-        Called once before the first training step.
-
-        If a WandbLogger is attached, registers gradient and parameter
-        histogram watching via wandb.watch().  This streams gradient
-        norms to the WandB "Gradients" tab, making it easy to spot
-        vanishing or exploding gradients in the encoder / decoder.
-        """
-        try:
-            from pytorch_lightning.loggers import WandbLogger
-        except ImportError:
-            return
-        if not isinstance(self.logger, WandbLogger):
-            return
-        import wandb
-        log_freq = self.cfg.get("log_every_n_steps", 50)
-        # Unwrap torch.compile wrapper if present (_orig_mod attribute)
-        underlying = getattr(self.model, "_orig_mod", self.model)
-        wandb.watch(underlying, log="gradients", log_freq=log_freq)
-        print(f"wandb.watch() registered — gradient histograms every {log_freq} steps")
 
     # ------------------------------------------------------------------
     # Helpers
@@ -128,12 +99,14 @@ class StationMAELightning(pl.LightningModule):
         )
 
         lr = self.optimizers().param_groups[0]["lr"]
-        self.log("train/loss", loss, on_step=True, on_epoch=True, prog_bar=True)
+
+        # on_step=True, on_epoch=False → metric appears as "train/loss" in WandB
+        # (no _step suffix — Lightning only adds suffixes when both modes are True)
+        self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True)
         self.log("train/lr",   lr,   on_step=True, on_epoch=False, prog_bar=False)
 
-        # ── train/overall_rmse — logged per epoch, mirrors val/overall_rmse ───
+        # ── train/overall_rmse — epoch-level, mirrors val/overall_rmse ────────
         # Use first delta for consistent comparison with val (which uses K=1).
-        # This lets WandB show train RMSE and val RMSE on the same chart.
         with torch.no_grad():
             if is_multi:
                 p_flat = preds[:, 0].reshape(-1, NUM_TARGET_VARIABLES)
