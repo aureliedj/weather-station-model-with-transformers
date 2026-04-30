@@ -547,6 +547,7 @@ class StationMAEDataset(Dataset):
         train_years:          "list[int] | None" = None,
         shared_memory:        bool = False,
         fast_cache_dir:       "str | None" = None,
+        exclude_stations:     "list | None" = None,
     ):
         super().__init__()
 
@@ -614,6 +615,11 @@ class StationMAEDataset(Dataset):
                 self.obs   = torch.from_numpy(self._obs_np)
                 self.mask  = torch.from_numpy(self._mask_np)
                 self.hours = torch.from_numpy(self._hours_np)
+                # Apply station exclusion before returning from fast-cache path
+                if exclude_stations:
+                    keep = StationMAEDataset._resolve_keep_indices(
+                        ds, exclude_stations)
+                    self._apply_station_exclusion(keep, exclude_stations)
                 return   # skip the build path entirely
 
         # ------------------------------------------------------------------
@@ -775,6 +781,77 @@ class StationMAEDataset(Dataset):
                 indices       = self.indices,
                 window_size   = window_size,
                 max_delta_steps = self.max_delta_steps,
+            )
+
+        # ── Station exclusion (normal build path) ─────────────────────────────
+        if exclude_stations:
+            keep = StationMAEDataset._resolve_keep_indices(ds, exclude_stations)
+            self._apply_station_exclusion(keep, exclude_stations)
+
+    # ------------------------------------------------------------------
+    # Station exclusion helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_keep_indices(
+        ds: PeakWeatherDataset,
+        exclude_stations: list,
+    ) -> list:
+        """
+        Return a sorted list of station *positions* to keep after dropping
+        ``exclude_stations``.
+
+        Each entry in ``exclude_stations`` is matched (case-insensitive) against:
+          1. The stations_table index  (station ID / numeric code)
+          2. The ``name`` column        (full station name)
+          3. The ``abbr`` column        (short abbreviation)
+
+        Raises a warning if no stations were matched.
+        """
+        stns       = ds.stations_table
+        excl_upper = {str(s).upper() for s in exclude_stations}
+        drop       = set()
+
+        for pos, (idx, row) in enumerate(stns.iterrows()):
+            candidates = {str(idx).upper()}
+            for col in ("name", "abbr", "station_name"):
+                if col in row.index and not pd.isna(row[col]):
+                    candidates.add(str(row[col]).upper())
+            if candidates & excl_upper:
+                drop.add(pos)
+
+        if not drop:
+            import warnings
+            warnings.warn(
+                f"[StationFilter] No stations matched {exclude_stations} — "
+                f"nothing was excluded.  Check against ds.stations_table.",
+                UserWarning, stacklevel=4,
+            )
+
+        return [i for i in range(len(stns)) if i not in drop]
+
+    def _apply_station_exclusion(
+        self,
+        keep: list,
+        exclude_stations: list,
+    ) -> None:
+        """
+        Drop excluded stations from obs, mask, and spatial in-place.
+
+        Uses advanced indexing which always returns a new contiguous tensor,
+        so the result is safe regardless of the backing storage (mmap or RAM).
+        """
+        keep_t       = torch.tensor(keep, dtype=torch.long)
+        n_before     = self.obs.shape[1]
+        self.obs     = self.obs    [:, keep_t, :].contiguous()
+        self.mask    = self.mask   [:, keep_t, :].contiguous()
+        self.spatial = self.spatial[keep_t, :]   .contiguous()
+        dropped      = n_before - len(keep)
+        if dropped > 0:
+            print(
+                f"[StationFilter] Excluded {dropped} station(s) "
+                f"{exclude_stations}  → N={len(keep)} (was {n_before})",
+                flush=True,
             )
 
     # ------------------------------------------------------------------

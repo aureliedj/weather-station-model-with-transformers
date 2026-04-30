@@ -59,6 +59,14 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"   # ← update this
 SAVE_DIR="checkpoints/full_run_cloud"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
+# ── Station exclusion ────────────────────────────────────────────────────────
+# Drop stations with insufficient historical coverage before training.
+# Matched case-insensitively against the stations_table index / name / abbr.
+# Add more names separated by spaces: EXCLUDE="110 BAS KLO"
+EXCLUDE="--exclude_stations 110"
+# EXCLUDE=""   # ← uncomment to disable exclusion
+# ─────────────────────────────────────────────────────────────────────────────
+
 # ── Optional encoder flags ────────────────────────────────────────────────────
 # Uncomment to remove spatial attention (~27% faster per encoder block):
 # SPATIAL=""
@@ -75,8 +83,8 @@ python main.py \
     --cache_dir        "$DATA_ROOT" \
     --local_cache_dir  "$LOCAL_CACHE" \
     --window           72 \
-    --max_delta        36 \
-    --num_delta        6 \
+    --max_delta        0 \
+    --num_delta        1 \
     --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
@@ -85,15 +93,15 @@ python main.py \
     --dropout          0.1 \
     --batch_size       16 \
     --num_workers      5 \
-    --epochs           100 \
+    --epochs           20 \
     --lr               1e-4 \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
     --val_check_interval 4000 \
-    --save_every_steps   4000 \
-    --patience           3 \
-    --min_lr             1e-6 \
+    --save_every       1 \
+    --patience         15 \
+    --min_lr           1e-6 \
     --amp \
     --bf16 \
     --compile \
@@ -102,6 +110,7 @@ python main.py \
     --cross_attn_decoder \
     $SPATIAL \
     $TEMPORAL_WINDOW \
+    $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   full-run-cloud \
     --save_dir         "$SAVE_DIR"

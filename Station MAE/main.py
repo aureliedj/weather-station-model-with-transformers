@@ -120,6 +120,11 @@ def parse_args() -> argparse.Namespace:
     # Subset / quick-check
     p.add_argument("--subset",       action="store_true")
     p.add_argument("--train_years",  type=int, nargs="+", default=None, metavar="YEAR")
+    p.add_argument("--exclude_stations", type=str, nargs="+", default=None, metavar="NAME",
+                   help="Station name(s) to drop from ALL splits before training. "
+                        "Matched case-insensitively against the stations_table index, "
+                        "'name', and 'abbr' columns. "
+                        "Example: --exclude_stations 110  or  --exclude_stations KLO BAS")
 
     # Model
     p.add_argument("--d_model",      type=int,   default=128)
@@ -264,6 +269,10 @@ def main() -> None:
     else:
         print("Fast cache dir           : disabled  (using standard in-memory path)")
 
+    if args.exclude_stations:
+        print(f"Excluding stations       : {args.exclude_stations}  "
+              f"(matched against stations_table index / name / abbr)")
+
     print("Building train dataset …")
     train_ds = StationMAEDataset(
         ds,
@@ -276,6 +285,7 @@ def main() -> None:
         train_years=train_years,
         shared_memory=False,
         fast_cache_dir=fast_cache_dir,
+        exclude_stations=args.exclude_stations,
     )
 
     print("Building val dataset …")
@@ -291,6 +301,7 @@ def main() -> None:
         train_years=train_years,
         shared_memory=False,
         fast_cache_dir=fast_cache_dir,
+        exclude_stations=args.exclude_stations,
     )
 
     print(f"  train: {len(train_ds):,} samples  "
@@ -395,6 +406,7 @@ def main() -> None:
         "d_model":             args.d_model,
         "enc_layers":          args.enc_layers,
         "dec_layers":          args.dec_layers,
+        "exclude_stations":    args.exclude_stations or [],
     }
 
     lit_model = StationMAELightning(model=model, cfg=cfg)
