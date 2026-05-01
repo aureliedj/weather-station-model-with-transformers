@@ -528,11 +528,17 @@ def main() -> None:
     _mlp_ratio  = _resolve(args.mlp_ratio,  "mlp_ratio",  4.0)
     _mask_ratio = _resolve(args.mask_ratio, "mask_ratio", 0.5)
 
-    print(f"  window={window}  max_delta={max_delta}  "
+    # ── Evaluation mode ───────────────────────────────────────────────────
+    # max_delta == 0 → pure spatial inpainting (gap-filling):
+    #   • no lead-times to sweep, no persistence baseline, no skill scores
+    #   • gap-filling (masked stations only) is the primary metric
+    # max_delta  > 0 → temporal forecasting:
+    #   • full delta sweep, lead-1, persistence baseline + skill scores
+    #   • gap-filling is a secondary metric
+    _is_inpainting = (max_delta == 0)
+    _mode_str = "inpainting (max_delta=0)" if _is_inpainting else f"forecasting (max_delta={max_delta})"
+    print(f"  window={window}  max_delta={max_delta}  mode={_mode_str}  "
           f"d_model={_d_model}  enc_layers={_enc_layers}  dec_layers={_dec_layers}")
-    if exclude_stations:
-        print(f"  exclude_stations={exclude_stations}  "
-              f"(matched against stations_table index / name / abbr)")
 
     # ── Data ─────────────────────────────────────────────────────────────
     from data.dataset import load_peakweather, StationMAEDataset
@@ -576,41 +582,47 @@ def main() -> None:
         prefetch_factor=(4 if _use_persistent else None),
     )
 
-    # ── Lead-1 (10-min forecast) dataset & loader ─────────────────────────
-    print("Building lead-1 test dataset (delta_steps=1, fixed) …")
-    lead1_ds = StationMAEDataset(
-        ds,
-        window_size=window,
-        delta_steps=1,
-        split="test",
-        obs_stats=obs_stats,
-        num_delta_per_sample=1,
-        max_delta_steps=1,          # clamp: only delta=1 ever sampled
-        cache_dir=cache_dir,
-        exclude_stations=exclude_stations,
-    )
-    print(f"  lead-1 test samples: {len(lead1_ds):,}")
-
-    lead1_loader = DataLoader(
-        lead1_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=_use_persistent,
-        prefetch_factor=(4 if _use_persistent else None),
-    )
-
-    # ── Persistence baseline (standard loader — all deltas) ──────────────
-    print("\nComputing persistence baseline …")
-    persist_metrics = compute_persistence_metrics(test_loader, device, obs_stats)
-
     from model.embeddings import TARGET_VARIABLE_NAMES
-    print("  Persistence RMSE (normalised):")
-    for var_name in TARGET_VARIABLE_NAMES:
-        r = persist_metrics.get(f"persist_{var_name}_rmse_norm", float("nan"))
-        print(f"    {var_name:<14}  {r:.5f}")
-    print(f"    {'[overall]':<14}  {persist_metrics.get('persist_overall_rmse_norm', float('nan')):.5f}")
+
+    # ── Lead-1 dataset + persistence baseline (forecasting mode only) ────
+    lead1_loader   = None
+    persist_metrics: dict = {}
+
+    if not _is_inpainting:
+        print("Building lead-1 test dataset (delta_steps=1, fixed) …")
+        lead1_ds = StationMAEDataset(
+            ds,
+            window_size=window,
+            delta_steps=1,
+            split="test",
+            obs_stats=obs_stats,
+            num_delta_per_sample=1,
+            max_delta_steps=1,          # clamp: only delta=1 ever sampled
+            cache_dir=cache_dir,
+            exclude_stations=exclude_stations,
+        )
+        print(f"  lead-1 test samples: {len(lead1_ds):,}")
+
+        lead1_loader = DataLoader(
+            lead1_ds,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=_use_persistent,
+            prefetch_factor=(4 if _use_persistent else None),
+        )
+
+        print("\nComputing persistence baseline …")
+        persist_metrics = compute_persistence_metrics(test_loader, device, obs_stats)
+        print("  Persistence RMSE (normalised):")
+        for var_name in TARGET_VARIABLE_NAMES:
+            r = persist_metrics.get(f"persist_{var_name}_rmse_norm", float("nan"))
+            print(f"    {var_name:<14}  {r:.5f}")
+        print(f"    {'[overall]':<14}  "
+              f"{persist_metrics.get('persist_overall_rmse_norm', float('nan')):.5f}")
+    else:
+        print("  [Inpainting mode] Skipping lead-1 dataset and persistence baseline.")
 
     # ── Per-checkpoint evaluation ─────────────────────────────────────────
     all_results:       list[dict] = []
@@ -706,30 +718,66 @@ def main() -> None:
         model.load_state_dict(state_dict)
         print(f"  Parameters: {model.count_parameters():,}")
 
-        # ── Standard full evaluation (all deltas, all stations) ─────────
         from engine.evaluate import (
             evaluate_full, print_full_metrics,
             evaluate_gap_filling, print_gap_filling_metrics,
         )
-        print("  Running evaluate_full() [all deltas, all stations] …")
-        metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
 
-        # Skill scores vs persistence
-        skill = compute_skill_scores(metrics, persist_metrics)
+        label  = os.path.splitext(os.path.basename(ckpt_path))[0]
+        skill:         dict = {}
+        lead1_metrics: dict = {}
+        gap_metrics:   dict = {}
 
-        # Print
-        print_full_metrics(metrics, obs_stats=obs_stats)
+        if _is_inpainting:
+            # ── Inpainting mode: gap-filling is the primary metric ───────
+            # evaluate_full() gives all-station context metrics.
+            # evaluate_gap_filling() is the real score: masked stations only.
+            print("  Running evaluate_full() [all stations, delta=0] …")
+            metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
+            print_full_metrics(metrics, obs_stats=obs_stats)
 
-        print("── Skill scores vs persistence (higher = better, 1.0 = perfect) ──")
-        for var_name in TARGET_VARIABLE_NAMES:
-            s = skill.get(f"skill_{var_name}", float("nan"))
-            bar_len = max(0, int(s * 20)) if not (s != s) else 0  # NaN guard
-            bar = "█" * bar_len
-            print(f"  {var_name:<14}  {s:+.3f}  {bar}")
-        s_ov = skill.get("skill_overall", float("nan"))
-        print(f"  {'[overall]':<14}  {s_ov:+.3f}")
+            print(f"\n  Running evaluate_gap_filling() "
+                  f"[PRIMARY · masked stations only · n_repeats={args.gap_fill_repeats}] …")
+            gap_metrics = evaluate_gap_filling(
+                model, test_loader, device,
+                obs_stats=obs_stats,
+                n_repeats=args.gap_fill_repeats,
+            )
+            print("\n── Spatial inpainting · masked stations only (PRIMARY) ──────────────")
+            print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
 
-        label = os.path.splitext(os.path.basename(ckpt_path))[0]
+        else:
+            # ── Forecasting mode: full delta sweep + lead-1 + gap-filling ─
+            print("  Running evaluate_full() [all deltas, all stations] …")
+            metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
+
+            skill = compute_skill_scores(metrics, persist_metrics)
+            print_full_metrics(metrics, obs_stats=obs_stats)
+
+            print("── Skill scores vs persistence (higher = better, 1.0 = perfect) ──")
+            for var_name in TARGET_VARIABLE_NAMES:
+                s = skill.get(f"skill_{var_name}", float("nan"))
+                bar_len = max(0, int(s * 20)) if not (s != s) else 0
+                bar = "█" * bar_len
+                print(f"  {var_name:<14}  {s:+.3f}  {bar}")
+            s_ov = skill.get("skill_overall", float("nan"))
+            print(f"  {'[overall]':<14}  {s_ov:+.3f}")
+
+            print(f"\n  Running evaluate_full() [lead-1 / 10-min forecast, all stations] …")
+            lead1_metrics = evaluate_full(model, lead1_loader, device, obs_stats=obs_stats)
+            print("\n── Lead-1 (10-min forecast) · all stations ──────────────────────────")
+            print_full_metrics(lead1_metrics, obs_stats=obs_stats)
+
+            print(f"\n  Running evaluate_gap_filling() "
+                  f"[delta=0, masked stations only · n_repeats={args.gap_fill_repeats}] …")
+            gap_metrics = evaluate_gap_filling(
+                model, test_loader, device,
+                obs_stats=obs_stats,
+                n_repeats=args.gap_fill_repeats,
+            )
+            print("\n── Spatial gap-filling · masked stations only ───────────────────────")
+            print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
+
         all_results.append({
             "label":   label,
             "path":    ckpt_path,
@@ -737,35 +785,10 @@ def main() -> None:
             "metrics": metrics,
             "skill":   skill,
         })
-
-        # ── Lead-1 evaluation (delta = 1 step = 10 min, all stations) ───
-        print(f"\n  Running evaluate_full() [lead-1 / 10-min forecast, all stations] …")
-        lead1_metrics = evaluate_full(model, lead1_loader, device, obs_stats=obs_stats)
-
-        print("\n── Lead-1 (10-min forecast) · all stations ──────────────────────────")
-        print_full_metrics(lead1_metrics, obs_stats=obs_stats)
-
-        all_lead1_results.append({
-            "label":   label,
-            "metrics": lead1_metrics,
-        })
-
-        # ── Gap-filling evaluation (delta = 0, masked stations only) ────
-        print(f"\n  Running evaluate_gap_filling() "
-              f"[n_repeats={args.gap_fill_repeats}] …")
-        gap_metrics = evaluate_gap_filling(
-            model, test_loader, device,
-            obs_stats=obs_stats,
-            n_repeats=args.gap_fill_repeats,
-        )
-
-        print("\n── Spatial gap-filling · masked stations only ───────────────────────")
-        print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
-
-        all_gap_results.append({
-            "label":   label,
-            "metrics": gap_metrics,
-        })
+        if lead1_metrics:
+            all_lead1_results.append({"label": label, "metrics": lead1_metrics})
+        if gap_metrics:
+            all_gap_results.append({"label": label, "metrics": gap_metrics})
 
         # ── WandB logging (optional) ─────────────────────────────────────
         if args.wandb_project:
@@ -779,9 +802,10 @@ def main() -> None:
                     config={
                         "checkpoint":         ckpt_path,
                         "epoch":              ckpt_epoch,
-                        "window":             args.window,
-                        "max_delta":          args.max_delta,
-                        "mask_ratio":         args.mask_ratio,
+                        "mode":               "inpainting" if _is_inpainting else "forecasting",
+                        "window":             window,
+                        "max_delta":          max_delta,
+                        "mask_ratio":         c_mask_ratio,
                         "gap_fill_repeats":   args.gap_fill_repeats,
                         "factorised_encoder": factorised,
                         "cross_attn_decoder": cross_attn,
@@ -789,31 +813,35 @@ def main() -> None:
                     reinit=True,
                 )
 
-                # -- Standard eval: log per-delta RMSE as a table + summary ──
-                delta_keys = sorted(
-                    k for k in metrics
-                    if k.startswith("delta_") and k.endswith("_overall_rmse_norm")
-                )
-                for dk in delta_keys:
-                    d    = int(dk.split("_")[1])
-                    rmse = metrics[dk]
-                    mae  = metrics.get(f"delta_{d:02d}_overall_mae_norm", float("nan"))
-                    wandb.log({
-                        "delta_min":          d * 10,
-                        "eval/rmse_norm":     rmse,
-                        "eval/mae_norm":      mae,
-                    })
-
-                # Summary: all flat metrics prefixed by mode
                 summary_flat: dict[str, float] = {}
-                for k, v in metrics.items():
-                    summary_flat[f"eval/{k}"] = v
-                for k, v in skill.items():
-                    summary_flat[f"eval/{k}"] = v
-                for k, v in lead1_metrics.items():
-                    summary_flat[f"lead1/{k}"] = v
-                for k, v in gap_metrics.items():
-                    summary_flat[f"gap/{k}"] = v
+
+                if _is_inpainting:
+                    # Primary metric: gap-filling on masked stations
+                    for k, v in gap_metrics.items():
+                        summary_flat[f"gap/{k}"] = v
+                    for k, v in metrics.items():
+                        summary_flat[f"eval/{k}"] = v
+                else:
+                    # Per-delta RMSE curve
+                    delta_keys = sorted(
+                        k for k in metrics
+                        if k.startswith("delta_") and k.endswith("_overall_rmse_norm")
+                    )
+                    for dk in delta_keys:
+                        d    = int(dk.split("_")[1])
+                        rmse = metrics[dk]
+                        mae  = metrics.get(f"delta_{d:02d}_overall_mae_norm", float("nan"))
+                        wandb.log({"delta_min": d * 10,
+                                   "eval/rmse_norm": rmse,
+                                   "eval/mae_norm":  mae})
+                    for k, v in metrics.items():
+                        summary_flat[f"eval/{k}"] = v
+                    for k, v in skill.items():
+                        summary_flat[f"eval/{k}"] = v
+                    for k, v in lead1_metrics.items():
+                        summary_flat[f"lead1/{k}"] = v
+                    for k, v in gap_metrics.items():
+                        summary_flat[f"gap/{k}"] = v
 
                 wandb.summary.update(summary_flat)
                 _wandb_run.finish()
@@ -837,22 +865,24 @@ def main() -> None:
         print(f"Lead-1 metrics saved to: {lead1_csv}")
 
     if all_gap_results:
+        gap_filename = ("inpainting_metrics.csv" if _is_inpainting
+                        else "gap_filling_metrics.csv")
         gap_csv = save_extra_metrics_csv(
-            all_gap_results, args.save_dir, "gap_filling_metrics.csv"
+            all_gap_results, args.save_dir, gap_filename
         )
-        print(f"Gap-filling metrics saved to: {gap_csv}")
+        print(f"{'Inpainting' if _is_inpainting else 'Gap-filling'} metrics saved to: {gap_csv}")
 
-    # ── Save persistence metrics too ─────────────────────────────────────
-    persist_csv = os.path.join(args.save_dir, "persistence_metrics.csv")
-    with open(persist_csv, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["metric", "value"])
-        for k, v in sorted(persist_metrics.items()):
-            writer.writerow([k, f"{v:.6f}"])
-    print(f"Persistence metrics saved to: {persist_csv}")
+    if not _is_inpainting and persist_metrics:
+        persist_csv = os.path.join(args.save_dir, "persistence_metrics.csv")
+        with open(persist_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["metric", "value"])
+            for k, v in sorted(persist_metrics.items()):
+                writer.writerow([k, f"{v:.6f}"])
+        print(f"Persistence metrics saved to: {persist_csv}")
 
-    # ── Plots ─────────────────────────────────────────────────────────────
-    if not args.no_plots:
+    # ── Plots (forecasting mode only — delta RMSE curve needs lead-times) ─
+    if not args.no_plots and not _is_inpainting:
         print("\nGenerating plots …")
         plot_delta_rmse(all_results, persist_metrics, args.save_dir)
 

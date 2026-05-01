@@ -83,8 +83,8 @@ python main.py \
     --cache_dir        "$DATA_ROOT" \
     --local_cache_dir  "$LOCAL_CACHE" \
     --window           72 \
-    --max_delta        0 \
-    --num_delta        1 \
+    --max_delta        36 \
+    --num_delta        6 \
     --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
@@ -93,13 +93,13 @@ python main.py \
     --dropout          0.1 \
     --batch_size       16 \
     --num_workers      5 \
-    --epochs           20 \
+    --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
     --val_check_interval 4000 \
-    --save_every       1 \
+    --save_every       2 \
     --patience         15 \
     --min_lr           1e-6 \
     --amp \
@@ -112,7 +112,7 @@ python main.py \
     $TEMPORAL_WINDOW \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   full-run-cloud \
+    --wandb_run_name   baseline-cloud \
     --save_dir         "$SAVE_DIR"
 
 # ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
