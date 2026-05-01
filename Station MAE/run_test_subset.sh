@@ -22,16 +22,16 @@
 set -euo pipefail
 
 DATA_ROOT="/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset"
-CKPT_DIR="checkpoints/subset_run"
-SAVE_DIR="test_results/subset_run"
+CKPT_DIR="checkpoints/full_run_cloud"
+SAVE_DIR="test_results/full_run_cloud"
 
 python test.py \
     --data_root        "$DATA_ROOT" \
     --cache_dir        "$DATA_ROOT" \
     --checkpoint       "$CKPT_DIR/best.ckpt" \
-    --window           12 \
-    --max_delta        3 \
-    --batch_size       32 \
+    --window           72 \
+    --max_delta        6 \
+    --batch_size       16 \
     --num_workers      2 \
     --d_model          128 \
     --enc_layers       6 \
@@ -41,5 +41,5 @@ python test.py \
     --cross_attn_decoder \
     --gap_fill_repeats 3 \
     --wandb_project    station-mae \
-    --wandb_run_name   test-subset-best \
+    --wandb_run_name   test-full-cloud-best \
     --save_dir         "$SAVE_DIR"

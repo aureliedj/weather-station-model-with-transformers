@@ -60,9 +60,10 @@ python main.py \
     --cache_dir        "$DATA_ROOT" \
     --local_cache_dir  "$LOCAL_CACHE" \
     --subset \
-    --window           144 \
-    --max_delta        6 \
+    --window           72 \
+    --max_delta        0 \
     --num_delta        1 \
+    --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
     --dec_layers       2 \

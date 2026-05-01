@@ -22,10 +22,13 @@ each metric is logged with exactly one mode:
     train/loss          — per-step training MSE     (on_step=True, on_epoch=False)
     train/overall_rmse  — epoch-level train RMSE    (on_step=False, on_epoch=True)
     train/lr            — learning rate per step    (on_step=True, on_epoch=False)
-    val/loss            — epoch validation MSE      (drives ModelCheckpoint / EarlyStopping)
-    val/overall_rmse    — epoch overall RMSE across all target variables
-    val/{var}_rmse      — per-variable RMSE (temperature, pressure, …)
-    val/{var}_mae       — per-variable MAE
+    val/loss              — epoch validation MSE      (drives ModelCheckpoint / EarlyStopping)
+    val/overall_rmse      — epoch overall RMSE across all target variables
+    val/{var}_rmse        — per-variable RMSE (normalized, dimensionless)
+    val/{var}_mae         — per-variable MAE  (normalized, dimensionless)
+    val/{var}_rmse_phys   — per-variable RMSE in physical units (RMSE_norm × obs_std[v])
+    val/{var}_mae_phys    — per-variable MAE  in physical units (MAE_norm  × obs_std[v])
+                            Physical metrics require cfg["obs_stats_std"] set by main.py.
 """
 
 import math
@@ -159,15 +162,35 @@ class StationMAELightning(pl.LightningModule):
         # ── Log val loss (drives ModelCheckpoint + EarlyStopping) ──────
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
 
+        # ── Per-variable std for unnormalization ────────────────────────
+        # obs_stats_std is a list[float] of length num_vars stored in cfg by main.py.
+        # If absent (old checkpoints), we fall back to 1.0 (metrics stay normalized).
+        _obs_std_list = self.cfg.get("obs_stats_std", None)
+        if _obs_std_list is not None:
+            obs_std = torch.tensor(
+                _obs_std_list[:NUM_TARGET_VARIABLES],
+                dtype=preds_all.dtype,
+                device=preds_all.device,
+            )  # (V,)
+        else:
+            obs_std = None
+
         # ── Per-variable RMSE / MAE (all stations, present sensors only) ─
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
             m = masks_all[:, v]
             if m.sum() > 0:
                 p, t = preds_all[m, v], targets_all[m, v]
-                self.log(f"val/{var_name}_rmse", (p - t).pow(2).mean().sqrt(),
-                         on_epoch=True, sync_dist=True)
-                self.log(f"val/{var_name}_mae",  (p - t).abs().mean(),
-                         on_epoch=True, sync_dist=True)
+                rmse_norm = (p - t).pow(2).mean().sqrt()
+                mae_norm  = (p - t).abs().mean()
+                self.log(f"val/{var_name}_rmse", rmse_norm, on_epoch=True, sync_dist=True)
+                self.log(f"val/{var_name}_mae",  mae_norm,  on_epoch=True, sync_dist=True)
+                # Physical units: multiply normalized error by the training-split std
+                if obs_std is not None:
+                    std_v = obs_std[v]
+                    self.log(f"val/{var_name}_rmse_phys", rmse_norm * std_v,
+                             on_epoch=True, sync_dist=True)
+                    self.log(f"val/{var_name}_mae_phys",  mae_norm  * std_v,
+                             on_epoch=True, sync_dist=True)
 
         # ── Overall RMSE across all variables and stations ─────────────
         if masks_all.sum() > 0:

@@ -8,23 +8,22 @@ reports a comprehensive set of metrics in both normalised and physical units.
 
 Usage
 -----
-    # Evaluate best checkpoint from a training run
-    python test.py --data_root /path/to/peakweather --checkpoint checkpoints/run1/best.pt
+    # Minimal — all settings auto-read from the Lightning checkpoint
+    python test.py --data_root /path/to/peakweather --checkpoint checkpoints/run1/best.ckpt
 
-    # Evaluate last checkpoint, custom window/delta
+    # Override a specific setting (e.g. larger batch for faster inference)
     python test.py --data_root /path/to/peakweather \\
-                   --checkpoint checkpoints/run1/last.pt \\
-                   --window 288 --max_delta 18 \\
-                   --save_dir results/run1
+                   --checkpoint checkpoints/run1/best.ckpt \\
+                   --batch_size 64 --save_dir results/run1
 
-    # Multi-checkpoint comparison (runs sequentially, saves individual CSVs)
+    # Multi-checkpoint comparison (settings read from each checkpoint individually)
     python test.py --data_root /path/to/peakweather \\
-                   --checkpoint checkpoints/run1/best.pt checkpoints/run2/best.pt \\
+                   --checkpoint checkpoints/run1/best.ckpt checkpoints/run2/best.ckpt \\
                    --save_dir results/
 
     # With Weights & Biases logging
     python test.py --data_root /path/to/peakweather \\
-                   --checkpoint checkpoints/run1/best.pt \\
+                   --checkpoint checkpoints/run1/best.ckpt \\
                    --wandb_project station-mae --wandb_run_name test-best
 
 Arguments
@@ -32,20 +31,24 @@ Arguments
   Data
     --data_root        STR   Path to PeakWeather data directory (required)
     --cache_dir        STR   Pre-built tensor cache (defaults to data_root)
-    --window           INT   Input window steps (default 288 = 48 h at 10-min res)
-    --max_delta        INT   Max lead-time steps (default 18 = 3 h)
+    --window           INT   Input window steps (auto-read from checkpoint; fallback 288)
+    --max_delta        INT   Max lead-time steps (auto-read from checkpoint; fallback 18)
     --batch_size       INT   Inference batch size (default 32)
     --num_workers      INT   DataLoader workers (default 4)
 
   Model
-    --checkpoint       STR   Path to .pt/.ckpt checkpoint file (required; can be repeated)
-    --d_model          INT   Must match the saved model (default 128)
-    --enc_heads        INT   (default 4)
-    --enc_layers       INT   (default 4)
-    --dec_heads        INT   (default 4)
-    --dec_layers       INT   (default 2)
-    --mlp_ratio        FLT   (default 4.0)
-    --mask_ratio       FLT   Masking fraction used at eval (default 0.5)
+    --checkpoint       STR   Path to .ckpt checkpoint file (required; can be repeated).
+                             For Lightning checkpoints all arch + data settings are
+                             auto-detected; only --data_root is strictly required.
+    --d_model          INT   Auto-read from checkpoint (override if needed)
+    --enc_heads        INT   Auto-read from checkpoint
+    --enc_layers       INT   Auto-read from checkpoint
+    --dec_heads        INT   Auto-read from checkpoint
+    --dec_layers       INT   Auto-read from checkpoint
+    --mlp_ratio        FLT   Auto-read from checkpoint
+    --mask_ratio       FLT   Auto-read from checkpoint
+    --no_spatial_attn        Auto-read from checkpoint
+    --temporal_window  INT   Auto-read from checkpoint
 
   Output
     --save_dir         STR   Directory for metrics CSV and plots (default "test_results")
@@ -99,26 +102,36 @@ def parse_args() -> argparse.Namespace:
     # Data
     p.add_argument("--data_root",   type=str, required=True)
     p.add_argument("--cache_dir",   type=str, default=None)
-    p.add_argument("--window",      type=int, default=288)
-    p.add_argument("--max_delta",   type=int, default=18)
+    # default=None → auto-read from checkpoint; explicit CLI value always wins
+    p.add_argument("--window",      type=int, default=None,
+                   help="Input window in 10-min steps (default: read from checkpoint, "
+                        "fallback 288 = 48 h)")
+    p.add_argument("--max_delta",   type=int, default=None,
+                   help="Max lead-time in 10-min steps (default: read from checkpoint, "
+                        "fallback 18 = 3 h)")
     p.add_argument("--batch_size",  type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
 
-    # Model architecture — must match the saved checkpoint.
-    # For Lightning checkpoints (.ckpt), arch flags are read from the saved
-    # hyper_parameters automatically; CLI flags serve as fallback defaults.
+    # Model architecture — all flags are auto-detected from Lightning checkpoints.
+    # Pass any of these explicitly to override the saved value.
     p.add_argument("--checkpoint",  type=str, nargs="+", required=True,
-                   help="One or more .pt / .ckpt checkpoint paths to evaluate")
-    p.add_argument("--d_model",     type=int, default=128)
-    p.add_argument("--enc_heads",   type=int, default=4)
-    p.add_argument("--enc_layers",  type=int, default=4)
-    p.add_argument("--dec_heads",   type=int, default=4)
-    p.add_argument("--dec_layers",  type=int, default=2)
-    p.add_argument("--mlp_ratio",   type=float, default=4.0)
-    p.add_argument("--mask_ratio",  type=float, default=0.5)
-    p.add_argument("--factorised_encoder", action="store_true",
+                   help="One or more .pt / .ckpt checkpoint paths to evaluate. "
+                        "For Lightning checkpoints all arch and data settings are "
+                        "read automatically; only --data_root is required alongside.")
+    p.add_argument("--d_model",     type=int,   default=None)
+    p.add_argument("--enc_heads",   type=int,   default=None)
+    p.add_argument("--enc_layers",  type=int,   default=None)
+    p.add_argument("--dec_heads",   type=int,   default=None)
+    p.add_argument("--dec_layers",  type=int,   default=None)
+    p.add_argument("--mlp_ratio",   type=float, default=None)
+    p.add_argument("--mask_ratio",  type=float, default=None)
+    p.add_argument("--factorised_encoder", action="store_true", default=None,
                    help="Axial attention encoder (auto-detected from Lightning checkpoints)")
-    p.add_argument("--cross_attn_decoder", action="store_true",
+    p.add_argument("--no_spatial_attn", action="store_true", default=None,
+                   help="Temporal-only encoder (auto-detected from Lightning checkpoints)")
+    p.add_argument("--temporal_window", type=int, default=None,
+                   help="Local temporal attention window (auto-detected from Lightning checkpoints)")
+    p.add_argument("--cross_attn_decoder", action="store_true", default=None,
                    help="Cross-attention decoder (auto-detected from Lightning checkpoints)")
     p.add_argument("--device",      type=str, default=None)
 
@@ -133,6 +146,23 @@ def parse_args() -> argparse.Namespace:
                    help="WandB run name (default: 'test-<checkpoint_stem>')")
 
     return p.parse_args()
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint cfg helper
+# ---------------------------------------------------------------------------
+
+def _read_lightning_cfg(path: str) -> dict:
+    """
+    Load a Lightning .ckpt and return its saved hyper_parameters["cfg"] dict.
+    Returns {} if the file is not a Lightning checkpoint or the key is absent.
+    Does NOT load model weights — only the cfg sub-dict is read.
+    """
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        return ckpt.get("hyper_parameters", {}).get("cfg", {})
+    except Exception:
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -467,6 +497,43 @@ def main() -> None:
     print(f"\n[test.py]  device={device}")
     os.makedirs(args.save_dir, exist_ok=True)
 
+    # ── Auto-read settings from first Lightning checkpoint ────────────────
+    # Loads only the cfg sub-dict (no weights); fast even for large checkpoints.
+    # CLI flags always win when explicitly provided (non-None).
+    _ckpt_cfg: dict = {}
+    for _p in args.checkpoint:
+        if os.path.exists(_p):
+            _ckpt_cfg = _read_lightning_cfg(_p)
+            if _ckpt_cfg:
+                print(f"Auto-detected settings from checkpoint: {_p}")
+                break
+
+    def _resolve(cli_val, cfg_key: str, fallback):
+        """Return CLI value if set (not None), else checkpoint cfg, else fallback."""
+        if cli_val is not None:
+            return cli_val
+        return _ckpt_cfg.get(cfg_key, fallback)
+
+    # Data settings — resolved before datasets are built
+    window          = _resolve(args.window,    "window",    288)
+    max_delta       = _resolve(args.max_delta, "max_delta", 18)
+    exclude_stations = _ckpt_cfg.get("exclude_stations", None) or None
+
+    # Arch settings — resolved per-checkpoint below, but define defaults here
+    _d_model    = _resolve(args.d_model,    "d_model",    128)
+    _enc_heads  = _resolve(args.enc_heads,  "enc_heads",  4)
+    _enc_layers = _resolve(args.enc_layers, "enc_layers", 4)
+    _dec_heads  = _resolve(args.dec_heads,  "dec_heads",  4)
+    _dec_layers = _resolve(args.dec_layers, "dec_layers", 2)
+    _mlp_ratio  = _resolve(args.mlp_ratio,  "mlp_ratio",  4.0)
+    _mask_ratio = _resolve(args.mask_ratio, "mask_ratio", 0.5)
+
+    print(f"  window={window}  max_delta={max_delta}  "
+          f"d_model={_d_model}  enc_layers={_enc_layers}  dec_layers={_dec_layers}")
+    if exclude_stations:
+        print(f"  exclude_stations={exclude_stations}  "
+              f"(matched against stations_table index / name / abbr)")
+
     # ── Data ─────────────────────────────────────────────────────────────
     from data.dataset import load_peakweather, StationMAEDataset
 
@@ -475,23 +542,26 @@ def main() -> None:
     print("Loading PeakWeather dataset …")
     ds = load_peakweather(root=args.data_root)
 
-    # Build train_ds only to get obs_stats (do not iterate over it)
+    # Build train_ds only to get obs_stats (do not iterate over it).
+    # Exclude the same stations as training so normalisation stats match exactly.
     print("Building train dataset for normalisation statistics …")
     train_ds = StationMAEDataset(
-        ds, window_size=args.window, delta_steps=args.max_delta, split="train",
-        num_delta_per_sample=1, max_delta_steps=args.max_delta,
+        ds, window_size=window, delta_steps=max_delta, split="train",
+        num_delta_per_sample=1, max_delta_steps=max_delta,
         cache_dir=cache_dir,
+        exclude_stations=exclude_stations,
     )
     obs_stats = train_ds.obs_stats
     print("  obs_stats ready (train split)")
 
     print("Building test dataset …")
     test_ds = StationMAEDataset(
-        ds, window_size=args.window, delta_steps=args.max_delta, split="test",
+        ds, window_size=window, delta_steps=max_delta, split="test",
         obs_stats=obs_stats,
         num_delta_per_sample=1,          # random delta in [1, max_delta] per sample
-        max_delta_steps=args.max_delta,
+        max_delta_steps=max_delta,
         cache_dir=cache_dir,
+        exclude_stations=exclude_stations,
     )
     print(f"  test samples: {len(test_ds):,}")
 
@@ -510,13 +580,14 @@ def main() -> None:
     print("Building lead-1 test dataset (delta_steps=1, fixed) …")
     lead1_ds = StationMAEDataset(
         ds,
-        window_size=args.window,
+        window_size=window,
         delta_steps=1,
         split="test",
         obs_stats=obs_stats,
         num_delta_per_sample=1,
         max_delta_steps=1,          # clamp: only delta=1 ever sampled
         cache_dir=cache_dir,
+        exclude_stations=exclude_stations,
     )
     print(f"  lead-1 test samples: {len(lead1_ds):,}")
 
@@ -560,42 +631,76 @@ def main() -> None:
         if "state_dict" in ckpt:
             # Lightning format — weights stored under "state_dict" with "model." prefix
             ckpt_epoch    = ckpt.get("epoch", "?")
-            ckpt_val_loss = float("nan")   # not directly stored; check best filename
+            ckpt_val_loss = float("nan")
 
-            # Arch flags: prefer saved hyper_parameters over CLI defaults
+            # All arch settings: checkpoint cfg wins, CLI flags override when set
             saved_cfg = ckpt.get("hyper_parameters", {}).get("cfg", {})
-            factorised = saved_cfg.get("factorised_encoder", args.factorised_encoder)
-            cross_attn = saved_cfg.get("cross_attn_decoder", args.cross_attn_decoder)
 
-            state_dict = {
-                k[len("model."):]: v
-                for k, v in ckpt["state_dict"].items()
-                if k.startswith("model.")
-            }
+            def _arch(cli_val, cfg_key: str, fallback):
+                if cli_val is not None:
+                    return cli_val
+                return saved_cfg.get(cfg_key, fallback)
+
+            c_d_model    = _arch(args.d_model,    "d_model",           _d_model)
+            c_enc_heads  = _arch(args.enc_heads,  "enc_heads",         _enc_heads)
+            c_enc_layers = _arch(args.enc_layers, "enc_layers",        _enc_layers)
+            c_dec_heads  = _arch(args.dec_heads,  "dec_heads",         _dec_heads)
+            c_dec_layers = _arch(args.dec_layers, "dec_layers",        _dec_layers)
+            c_mlp_ratio  = _arch(args.mlp_ratio,  "mlp_ratio",         _mlp_ratio)
+            c_mask_ratio = _arch(args.mask_ratio, "mask_ratio",        _mask_ratio)
+            factorised   = _arch(args.factorised_encoder, "factorised_encoder", False)
+            no_spatial   = _arch(args.no_spatial_attn,   "no_spatial_attn",    False)
+            temp_window  = _arch(args.temporal_window,   "temporal_window",    0)
+            cross_attn   = _arch(args.cross_attn_decoder,"cross_attn_decoder", False)
+
+            # Strip "model." prefix (Lightning) and then "_orig_mod." prefix
+            # (torch.compile wraps parameters under OptimizedModule).
+            state_dict = {}
+            for k, v in ckpt["state_dict"].items():
+                if not k.startswith("model."):
+                    continue
+                k = k[len("model."):]
+                if k.startswith("_orig_mod."):
+                    k = k[len("_orig_mod."):]
+                state_dict[k] = v
         else:
             # Legacy format saved by the old engine/train.py
             ckpt_epoch    = ckpt.get("epoch",    "?")
             ckpt_val_loss = ckpt.get("val_loss", float("nan"))
-            factorised    = args.factorised_encoder
-            cross_attn    = args.cross_attn_decoder
-            state_dict    = ckpt["model_state_dict"]
+            c_d_model    = _d_model
+            c_enc_heads  = _enc_heads
+            c_enc_layers = _enc_layers
+            c_dec_heads  = _dec_heads
+            c_dec_layers = _dec_layers
+            c_mlp_ratio  = _mlp_ratio
+            c_mask_ratio = _mask_ratio
+            factorised   = bool(args.factorised_encoder)
+            no_spatial   = bool(args.no_spatial_attn)
+            temp_window  = args.temporal_window or 0
+            cross_attn   = bool(args.cross_attn_decoder)
+            state_dict   = ckpt["model_state_dict"]
 
         print(f"  Saved at epoch {ckpt_epoch}  "
               + (f"val_loss={ckpt_val_loss:.5f}" if ckpt_val_loss == ckpt_val_loss else ""))
-        print(f"  factorised_encoder={factorised}  cross_attn_decoder={cross_attn}")
+        print(f"  d_model={c_d_model}  enc_layers={c_enc_layers}  dec_layers={c_dec_layers}  "
+              f"mlp_ratio={c_mlp_ratio}")
+        print(f"  factorised_encoder={factorised}  no_spatial_attn={no_spatial}  "
+              f"temporal_window={temp_window}  cross_attn_decoder={cross_attn}")
 
         # Build model
         from model.mae import StationMAE
         model = StationMAE(
-            d_model=args.d_model,
-            enc_heads=args.enc_heads,
-            enc_layers=args.enc_layers,
-            dec_heads=args.dec_heads,
-            dec_layers=args.dec_layers,
-            mlp_ratio=args.mlp_ratio,
+            d_model=c_d_model,
+            enc_heads=c_enc_heads,
+            enc_layers=c_enc_layers,
+            dec_heads=c_dec_heads,
+            dec_layers=c_dec_layers,
+            mlp_ratio=c_mlp_ratio,
             dropout=0.0,               # no dropout at inference
-            mask_ratio=args.mask_ratio,
+            mask_ratio=c_mask_ratio,
             factorised_encoder=factorised,
+            encoder_spatial_attn=not no_spatial,
+            temporal_window=temp_window,
             cross_attention_decoder=cross_attn,
         ).to(device)
         model.load_state_dict(state_dict)

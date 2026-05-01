@@ -210,6 +210,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb_run_name",  type=str, default=None)
     p.add_argument("--log_every_n_steps", type=int, default=50)
 
+    # Profiling
+    p.add_argument("--profiler", type=str, default="none",
+                   choices=["none", "simple", "pytorch"],
+                   help="Lightning profiler: 'none' (default) = off; "
+                        "'simple' = wall-clock summary per op; "
+                        "'pytorch' = full CUDA kernel trace (export_to_chrome=True). "
+                        "Use with --limit_train_batches for a mini profiling run.")
+    p.add_argument("--limit_train_batches", type=int, default=0,
+                   help="Cap training to N batches per epoch (0 = unlimited, default). "
+                        "Useful with --profiler to run a short representative trace "
+                        "without waiting for a full epoch.")
+
     return p.parse_args()
 
 
@@ -387,13 +399,20 @@ def main() -> None:
             print("torch.compile            : ON  (default mode, MIG-safe) "
                   "— first epoch warm-up ~1-2 min, then ~1.3-1.5× faster")
 
+    # Pass per-variable normalisation statistics into cfg so that
+    # lightning_module.py can log physically-unnormalized val metrics.
+    # obs_stats["std"] shape: (num_variables,) — index matches TARGET_VARIABLE_NAMES.
+    _obs_stats = train_ds.obs_stats
     cfg = {
         "lr":                  args.lr,
         "min_lr":              args.min_lr,
         "weight_decay":        args.weight_decay,
         "epochs":              args.epochs,
         "warmup_epochs":       args.warmup_epochs,
-        "log_every_n_steps":   args.log_every_n_steps,   # used by wandb.watch()
+        "log_every_n_steps":   args.log_every_n_steps,
+        # Normalisation stats for unnormalized WandB metrics
+        "obs_stats_std":       _obs_stats["std"].tolist(),   # list[float], len=num_vars
+        "obs_stats_mean":      _obs_stats["mean"].tolist(),  # stored for test.py use
         # Informational — stored in checkpoint hyper_parameters for test.py
         "factorised_encoder":  args.factorised_encoder,
         "no_spatial_attn":     args.no_spatial_attn,
@@ -404,8 +423,13 @@ def main() -> None:
         "max_delta":           args.max_delta,
         "num_delta":           args.num_delta,
         "d_model":             args.d_model,
+        "enc_heads":           args.enc_heads,
         "enc_layers":          args.enc_layers,
+        "dec_heads":           args.dec_heads,
         "dec_layers":          args.dec_layers,
+        "mlp_ratio":           args.mlp_ratio,
+        "mask_ratio":          args.mask_ratio,
+        "dropout":             args.dropout,
         "exclude_stations":    args.exclude_stations or [],
     }
 
@@ -514,10 +538,45 @@ def main() -> None:
               f"cosine → floor {args.min_lr:.2e}  "
               f"(ratio {args.min_lr / args.lr:.4f})")
 
+    # ── Profiler ─────────────────────────────────────────────────────────────
+    # "none"    → no profiling overhead
+    # "simple"  → wall-clock table per Lightning hook (useful baseline)
+    # "pytorch" → full PyTorch / CUDA kernel trace via torch.profiler.
+    #             Exports a Chrome trace JSON to profile/ subdirectory.
+    #             Open at https://ui.perfetto.dev — then "Open trace file".
+    #             Use --limit_train_batches 400 to keep trace size manageable.
+    profiler = None
+    if args.profiler == "simple":
+        from pytorch_lightning.profilers import SimpleProfiler
+        profiler = SimpleProfiler(dirpath=args.save_dir, filename="simple_profile")
+        print("Profiler                 : SimpleProfiler  "
+              f"(output → {args.save_dir}/simple_profile.txt)")
+    elif args.profiler == "pytorch":
+        from pytorch_lightning.profilers import PyTorchProfiler
+        _profile_dir = os.path.join(args.save_dir, "profile")
+        os.makedirs(_profile_dir, exist_ok=True)
+        profiler = PyTorchProfiler(
+            dirpath=_profile_dir,
+            filename="pytorch_trace",
+            export_to_chrome=True,
+            # Profile after a short warm-up so compile/JIT doesn't dominate
+            schedule=torch.profiler.schedule(wait=5, warmup=5, active=20, repeat=1),
+            record_shapes=True,
+            profile_memory=True,
+            with_stack=False,           # stack traces add overhead; enable if needed
+        )
+        print(f"Profiler                 : PyTorchProfiler  "
+              f"(Chrome trace → {_profile_dir}/pytorch_trace*.json)\n"
+              f"                           Open at https://ui.perfetto.dev")
+
     # ── Trainer ─────────────────────────────────────────────────────────────
     _trainer_kwargs = {}
     if args.val_check_interval > 0:
         _trainer_kwargs["val_check_interval"] = args.val_check_interval
+    if args.limit_train_batches > 0:
+        _trainer_kwargs["limit_train_batches"] = args.limit_train_batches
+        print(f"limit_train_batches      : {args.limit_train_batches}  "
+              f"(mini run — full epoch would be ~{len(train_loader)} batches)")
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
@@ -530,6 +589,7 @@ def main() -> None:
         log_every_n_steps=args.log_every_n_steps,
         enable_progress_bar=True,
         deterministic=False,            # True slows training; seed already set
+        profiler=profiler,
         **_trainer_kwargs,
     )
 
