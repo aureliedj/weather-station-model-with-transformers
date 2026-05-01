@@ -105,10 +105,10 @@ def parse_args() -> argparse.Namespace:
     # default=None → auto-read from checkpoint; explicit CLI value always wins
     p.add_argument("--window",      type=int, default=None,
                    help="Input window in 10-min steps (default: read from checkpoint, "
-                        "fallback 288 = 48 h)")
+                        "fallback 72 = 12 h)")
     p.add_argument("--max_delta",   type=int, default=None,
                    help="Max lead-time in 10-min steps (default: read from checkpoint, "
-                        "fallback 18 = 3 h)")
+                        "fallback 36 = 6 h)")
     p.add_argument("--batch_size",  type=int, default=32)
     p.add_argument("--num_workers", type=int, default=4)
 
