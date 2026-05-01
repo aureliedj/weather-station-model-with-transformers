@@ -96,7 +96,7 @@ python main.py \
     --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    5 \
-    --weight_decay     0.05 \
+    --weight_decay     1e-6 \
     --grad_clip        1.0 \
     --val_check_interval 4000 \
     --save_every       2 \

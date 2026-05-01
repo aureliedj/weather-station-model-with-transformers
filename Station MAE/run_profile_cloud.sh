@@ -39,8 +39,8 @@ LOCAL_CACHE="/tmp/station_mae_cache"
 EXCLUDE="--exclude_stations 110"
 
 # Same encoder settings as full run to get representative timings
-SPATIAL="--no_spatial_attn"
-TEMPORAL_WINDOW=""
+SPATIAL="" #"--no_spatial_attn"
+TEMPORAL_WINDOW="" #"--temporal_window 6"
 
 python main.py \
     --data_root        "$DATA_ROOT" \
