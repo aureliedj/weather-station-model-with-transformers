@@ -102,7 +102,7 @@ python main.py \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --val_check_interval 2000 \
+    --val_check_interval 500 \
     --save_every       2 \
     --patience         50 \
     --min_lr           1e-6 \
