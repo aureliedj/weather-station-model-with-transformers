@@ -93,7 +93,7 @@ python main.py \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.15 \
-    --train_stride     6 \
+    --train_stride     4 \
     --drop_path_rate   0.10 \
     --batch_size       32 \
     --num_workers      5 \
@@ -102,7 +102,7 @@ python main.py \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --val_check_interval 4000 \
+    --val_check_interval 2000 \
     --save_every       2 \
     --patience         50 \
     --min_lr           1e-6 \
