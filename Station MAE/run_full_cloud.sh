@@ -91,7 +91,7 @@ python main.py \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.1 \
-    --batch_size       16 \
+    --batch_size       32 \
     --num_workers      5 \
     --epochs           100 \
     --lr               1e-4 \
@@ -100,7 +100,7 @@ python main.py \
     --grad_clip        1.0 \
     --val_check_interval 4000 \
     --save_every       2 \
-    --patience         30 \
+    --patience         50 \
     --min_lr           1e-6 \
     --amp \
     --bf16 \
