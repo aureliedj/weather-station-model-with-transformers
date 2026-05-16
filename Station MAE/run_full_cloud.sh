@@ -76,6 +76,8 @@ SPATIAL="" #"--no_spatial_attn"
 # W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
 # TEMPORAL_WINDOW="--temporal_window 6"
 TEMPORAL_WINDOW=""
+
+#--masked_only_loss \        # pure gap-filling objective
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
@@ -90,10 +92,9 @@ python main.py \
     --enc_layers       6 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
-    --train_stride 6 \          # hourly sampling instead of every 10 min
-    --drop_path_rate 0.10 \     # stochastic depth, increases with layer depth
-    #--masked_only_loss \        # pure gap-filling objective
-    --dropout 0.15 \
+    --dropout          0.15 \
+    --train_stride     6 \
+    --drop_path_rate   0.10 \
     --batch_size       32 \
     --num_workers      5 \
     --epochs           100 \
