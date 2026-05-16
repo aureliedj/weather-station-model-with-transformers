@@ -548,6 +548,7 @@ class StationMAEDataset(Dataset):
         shared_memory:        bool = False,
         fast_cache_dir:       "str | None" = None,
         exclude_stations:     "list | None" = None,
+        train_stride:         int  = 1,
     ):
         super().__init__()
 
@@ -558,11 +559,13 @@ class StationMAEDataset(Dataset):
         if num_delta_per_sample > 1:
             assert max_delta_steps is not None, \
                 "max_delta_steps must be set when num_delta_per_sample > 1"
+        assert train_stride >= 1, "train_stride must be >= 1"
 
         self.window_size          = window_size
         self.delta_steps          = delta_steps
         self.split                = split
         self.num_delta_per_sample = num_delta_per_sample
+        self.train_stride         = train_stride
         # Effective upper bound on lead-time — governs valid index calculation
         # and random sampling in __getitem__
         self.max_delta_steps = max_delta_steps if max_delta_steps is not None \
@@ -600,6 +603,12 @@ class StationMAEDataset(Dataset):
                 self.spatial       = cached["spatial"]
                 self.spatial_stats = cached["spatial_stats"]
                 self.indices       = cached["meta"]["indices"]
+
+                # Apply train_stride: thin the training indices to reduce window
+                # overlap and improve effective data diversity.  Val/test keep
+                # stride=1 (every valid window) for consistent evaluation.
+                if split == "train" and train_stride > 1:
+                    self.indices = self.indices[::train_stride]
 
                 # Keep numpy mmap arrays alive (torch.from_numpy holds a weak ref
                 # to the numpy array; storing explicitly prevents GC).
@@ -763,6 +772,15 @@ class StationMAEDataset(Dataset):
             target_year = timestamps[i + window_size - 1 + max_delta].year
             if start_year == target_year:
                 self.indices.append(i)
+
+        # Apply train_stride: thin the index list so consecutive samples are
+        # at least train_stride * 10 minutes apart.  With W=72 (12 h window)
+        # and stride=1, consecutive samples share 71/72 ≈ 99% of their input.
+        # stride=6 → 60-min spacing → 66/72 ≈ 92% overlap → ~6× more diversity.
+        # stride=12 → 2-h spacing  → 60/72 ≈ 83% overlap → ~12× more diversity.
+        # Stride is applied to training only; val/test always use stride=1.
+        if split == "train" and train_stride > 1:
+            self.indices = self.indices[::train_stride]
 
         # ------------------------------------------------------------------
         # 7. Save fast cache for future runs (if fast_cache_dir is set)

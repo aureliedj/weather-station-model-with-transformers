@@ -98,6 +98,15 @@ class StationMAE(nn.Module):
         cross_attention_decoder: Use CrossAttentionBlock (query tokens cross-attend to
                                  encoder context) instead of concatenated self-attention.
                                  Decoder sequence drops from W·N_vis+N·K to just N·K.
+        drop_path_rate:          Maximum stochastic-depth drop probability (linearly
+                                 scheduled from 0 at layer 0 to drop_path_rate at the
+                                 deepest layer, in both encoder and decoder).
+                                 Recommended range: 0.05–0.20.  Default 0.0 = disabled.
+        masked_only_loss:        If True, the training loss is computed only over
+                                 encoder-masked stations.  Visible stations are used
+                                 as context only and receive no gradient.
+                                 Appropriate for inpainting (max_delta=0) where visible
+                                 stations have a shortcut via their own input window.
     """
 
     def __init__(
@@ -118,12 +127,15 @@ class StationMAE(nn.Module):
         encoder_spatial_attn:    bool  = True,
         temporal_window:         int   = 0,
         cross_attention_decoder: bool  = False,
+        drop_path_rate:          float = 0.0,
+        masked_only_loss:        bool  = False,
     ):
         super().__init__()
 
-        self.mask_ratio      = mask_ratio
-        self.num_vars        = num_vars
-        self.num_target_vars = num_target_vars
+        self.mask_ratio       = mask_ratio
+        self.num_vars         = num_vars
+        self.num_target_vars  = num_target_vars
+        self.masked_only_loss = masked_only_loss
 
         self.encoder = StationMAEEncoder(
             d_model=d_model,
@@ -138,6 +150,7 @@ class StationMAE(nn.Module):
             factorised=factorised_encoder,
             spatial_attn=encoder_spatial_attn,
             temporal_window=temporal_window,
+            drop_path_rate=drop_path_rate,
         )
 
         self.decoder = StationMAEDecoder(
@@ -151,6 +164,7 @@ class StationMAE(nn.Module):
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
             cross_attention=cross_attention_decoder,
+            drop_path_rate=drop_path_rate,
         )
 
     # ------------------------------------------------------------------
@@ -181,8 +195,9 @@ class StationMAE(nn.Module):
 
         y_target      = y[:, :, :self.num_target_vars]
         y_mask_target = y_mask[:, :, :self.num_target_vars]
-        # Loss over ALL N stations (visible + masked) wherever sensors present
-        loss = self._supervised_loss(preds, y_target, y_mask_target)
+        # Optionally restrict loss to masked stations (inpainting regime)
+        _midx = masked_idx if self.masked_only_loss else None
+        loss  = self._supervised_loss(preds, y_target, y_mask_target, _midx)
 
         return loss, preds, masked_idx
 
@@ -238,13 +253,13 @@ class StationMAE(nn.Module):
         # preds_all: (B, K, N, num_target_vars)
 
         # ── Loss: mean over K ────────────────────────────────────────────
+        _midx    = masked_idx if self.masked_only_loss else None
         loss_acc = torch.zeros(1, device=x.device, dtype=encoded.dtype).squeeze()
         for k in range(K):
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
-            # Loss over ALL N stations (visible + masked) wherever sensors present
             loss_acc = loss_acc + self._supervised_loss(
-                preds_all[:, k], y_target_k, y_mask_target_k
+                preds_all[:, k], y_target_k, y_mask_target_k, _midx
             )
 
         return loss_acc / K, preds_all, masked_idx
@@ -283,27 +298,42 @@ class StationMAE(nn.Module):
 
     @staticmethod
     def _supervised_loss(
-        preds:   torch.Tensor,   # (B, N, V)
-        y:       torch.Tensor,   # (B, N, V)
-        y_mask:  torch.Tensor,   # (B, N, V)  1.0 = sensor present at target step
+        preds:      torch.Tensor,           # (B, N, V)
+        y:          torch.Tensor,           # (B, N, V)
+        y_mask:     torch.Tensor,           # (B, N, V)  1.0 = sensor present at target step
+        masked_idx: "torch.Tensor | None" = None,  # (B, N_masked) — restrict to these stations
     ) -> torch.Tensor:
         """
-        MSE loss over **all N stations** wherever sensors are present at the
-        target timestep (y_mask == 1).
+        MSE loss over stations wherever sensors are present at the target timestep.
 
-        The encoder still masks a fraction of stations (they never see the
-        input window).  However, the decoder produces predictions for every
-        station, and the loss now supervises ALL of them — not just the masked
-        subset.  This gives richer gradient signal: visible stations are
-        regularised to predict accurately, and masked stations are forced to
-        reconstruct from spatial context alone.
+        ``masked_idx`` controls which stations contribute to the gradient:
 
-        The only exclusion is where the sensor was absent at the target step
-        (y_mask == 0) — those entries have no ground truth.
+        masked_idx=None (default — all-station loss):
+            All N stations are supervised wherever sensors are present.
+            Richer gradient signal: visible stations are regularised to predict
+            accurately; masked stations must reconstruct from spatial context alone.
 
-        Returns a scalar (mean squared error over present sensor readings).
+        masked_idx=(B, N_masked) (masked-only loss):
+            Only the N_masked encoder-masked stations are supervised.  Visible
+            stations are used purely as context and receive no gradient from the
+            loss.  Appropriate for pure inpainting (max_delta=0): the model must
+            reconstruct masked stations from scratch — visible stations already
+            have access to their own full input window, so supervising them
+            would create a shortcut that inflates the training score without
+            improving genuine gap-filling.
+
+        Returns a scalar (mean squared error over included, sensor-present readings).
         """
-        sensor_ok = y_mask.bool()                        # (B, N, V)
+        if masked_idx is not None:
+            # Gather only the masked-station slices: (B, N_masked, V)
+            B, N_m = masked_idx.shape
+            V = y.shape[-1]
+            idx    = masked_idx.unsqueeze(-1).expand(B, N_m, V)
+            preds  = preds.gather(1, idx)
+            y      = y.gather(1, idx)
+            y_mask = y_mask.gather(1, idx)
+
+        sensor_ok = y_mask.bool()                        # (B, N[_masked], V)
         sq_err    = (preds - y).pow(2)
         denom     = sensor_ok.float().sum().clamp(min=1.0)
         return (sq_err * sensor_ok.float()).sum() / denom

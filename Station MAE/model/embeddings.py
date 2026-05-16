@@ -234,6 +234,7 @@ class PositionalEmbedding(nn.Module):
         fourier_dim: int   = POSITION_FOURIER_DIM,
         lambda_min:  float = 0.1,    # ≈ 8.5 km (local station-spacing scale)
         lambda_max:  float = 10.0,   # ≈ 850 km (supra-national scale)
+        dropout:     float = 0.0,
     ):
         super().__init__()
         assert fourier_dim % 2 == 0, "fourier_dim must be even"
@@ -252,6 +253,7 @@ class PositionalEmbedding(nn.Module):
             nn.Linear(2 * fourier_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
 
@@ -300,12 +302,14 @@ class StationEmbedding(nn.Module):
         input_dim:  Number of station characteristics (default STATION_CHAR_DIM = 13).
     """
 
-    def __init__(self, d_model: int, input_dim: int = STATION_CHAR_DIM):
+    def __init__(self, d_model: int, input_dim: int = STATION_CHAR_DIM,
+                 dropout: float = 0.0):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(input_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),   # stabilises scale before second linear
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
 
@@ -350,6 +354,7 @@ class TemporalEmbedding(nn.Module):
         fourier_dim: int   = TEMPORAL_FOURIER_DIM,
         lambda_min:  float = 1.0 / 6.0,          # 10 minutes in hours
         lambda_max:  float = 365.25 * 24.0,       # 1 year in hours
+        dropout:     float = 0.0,
     ):
         super().__init__()
         assert fourier_dim % 2 == 0, "fourier_dim must be even"
@@ -367,6 +372,7 @@ class TemporalEmbedding(nn.Module):
             nn.Linear(fourier_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),   # stabilises scale before second linear
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
 
@@ -432,6 +438,7 @@ class DeltaTimeEmbedding(nn.Module):
         lambda_min:   float = 1.0 / 6.0,    # 10 minutes in hours
         lambda_max:   float = 8.0,           # 8 hours — buffer beyond 6 h max horizon
         step_size_h:  float = 1.0 / 6.0,    # each step = 10 minutes = 1/6 h
+        dropout:      float = 0.0,
     ):
         super().__init__()
         assert fourier_dim % 2 == 0, "fourier_dim must be even"
@@ -450,6 +457,7 @@ class DeltaTimeEmbedding(nn.Module):
             nn.Linear(fourier_dim, d_model),
             nn.GELU(),
             nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
             nn.Linear(d_model, d_model),
         )
 

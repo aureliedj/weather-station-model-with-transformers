@@ -90,7 +90,10 @@ python main.py \
     --enc_layers       6 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
-    --dropout          0.1 \
+    --train_stride 6 \          # hourly sampling instead of every 10 min
+    --drop_path_rate 0.10 \     # stochastic depth, increases with layer depth
+    #--masked_only_loss \        # pure gap-filling objective
+    --dropout 0.15 \
     --batch_size       32 \
     --num_workers      5 \
     --epochs           100 \

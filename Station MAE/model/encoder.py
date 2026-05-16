@@ -26,6 +26,7 @@ Masking strategy:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _cp_checkpoint
 from .embeddings import (
     PositionalEmbedding,
@@ -37,6 +38,43 @@ from .embeddings import (
     TEMPORAL_FOURIER_DIM,
     NUM_VARIABLES,
 )
+
+
+# ---------------------------------------------------------------------------
+# Stochastic depth (DropPath)
+# ---------------------------------------------------------------------------
+
+class DropPath(nn.Module):
+    """
+    Stochastic depth regularisation (Huang et al., 2016; used in DeiT, Swin, etc.).
+
+    During training, the *entire* residual path is dropped with probability
+    ``drop_prob`` and the output is replaced by the unchanged residual input.
+    At test time the path is always kept and the output is scaled by
+    ``1 - drop_prob`` implicitly via the per-sample binary mask approach
+    (no separate rescaling required — the mask already divides by keep_prob).
+
+    Drop decisions are independent per sample in the batch, so information
+    can still flow through via other samples during gradient accumulation.
+
+    Args:
+        drop_prob: Probability of dropping the residual path (0 = never drop).
+    """
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.drop_prob == 0.0:
+            return x
+        keep_prob    = 1.0 - self.drop_prob
+        # Shape: (B, 1, 1, …) — broadcasts over all token/feature dimensions
+        shape        = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        # Floor to 0/1; divide by keep_prob to maintain expected value = 1
+        random_tensor = torch.floor(random_tensor + keep_prob) / keep_prob
+        return x * random_tensor
 
 
 # ---------------------------------------------------------------------------
@@ -56,6 +94,9 @@ class TransformerBlock(nn.Module):
         num_heads:   Number of attention heads.
         mlp_ratio:   FFN hidden dim = d_model * mlp_ratio (default 4).
         dropout:     Dropout rate applied in attention and FFN (default 0.1).
+        drop_path:   Stochastic depth drop probability (default 0.0 = disabled).
+                     Each residual branch is dropped independently with this
+                     probability during training, acting as a strong regulariser.
     """
 
     def __init__(
@@ -64,6 +105,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         dropout:   float = 0.1,
+        drop_path: float = 0.0,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(d_model)
@@ -81,6 +123,7 @@ class TransformerBlock(nn.Module):
             nn.Linear(int(d_model * mlp_ratio), d_model),
             nn.Dropout(dropout),
         )
+        self.drop_path = DropPath(drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -94,10 +137,10 @@ class TransformerBlock(nn.Module):
         # (Flash Attention on CUDA), avoiding materialising the full O(seq²) matrix.
         x_norm = self.norm1(x)
         attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
-        x = x + attn_out
+        x = x + self.drop_path(attn_out)
 
         # FFN with residual
-        x = x + self.ffn(self.norm2(x))
+        x = x + self.drop_path(self.ffn(self.norm2(x)))
         return x
 
 
@@ -146,6 +189,9 @@ class FactorisedTransformerBlock(nn.Module):
                          chunking (Swin-style).  Alternate layers should have
                          shift=True so tokens across chunk boundaries can
                          communicate after two layers.
+        drop_path:       Stochastic depth drop probability (default 0.0 = disabled).
+                         Applied independently to each of the three residual
+                         branches (temporal attn, spatial attn, FFN).
     """
 
     def __init__(
@@ -157,6 +203,7 @@ class FactorisedTransformerBlock(nn.Module):
         spatial_attn:     bool  = True,
         temporal_window:  int   = 0,
         shift:            bool  = False,
+        drop_path:        float = 0.0,
     ):
         super().__init__()
 
@@ -188,6 +235,9 @@ class FactorisedTransformerBlock(nn.Module):
             nn.Linear(int(d_model * mlp_ratio), d_model),
             nn.Dropout(dropout),
         )
+
+        # ── Stochastic depth — one DropPath shared across all residuals ───
+        self.drop_path = DropPath(drop_path)
 
     def _temporal_attn(self, xt: torch.Tensor) -> torch.Tensor:
         """
@@ -246,7 +296,7 @@ class FactorisedTransformerBlock(nn.Module):
         # Each of the B·N sequences has length W (the temporal axis).
         xt    = x.permute(0, 2, 1, 3).reshape(B * N, W, D)    # (B·N, W, D)
         xt_n  = self.norm_t(xt)
-        xt    = xt + self._temporal_attn(xt_n)
+        xt    = xt + self.drop_path(self._temporal_attn(xt_n))
         x     = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)    # (B, W, N, D)
 
         # ── 2. Spatial attention: (B·W, N, D) ────────────────────────────
@@ -257,11 +307,11 @@ class FactorisedTransformerBlock(nn.Module):
             xs     = x.reshape(B * W, N, D)                    # (B·W, N, D)
             xs_n   = self.norm_s(xs)
             as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
-            xs     = xs + as_
+            xs     = xs + self.drop_path(as_)
             x      = xs.reshape(B, W, N, D)                    # (B, W, N, D)
 
         # ── 3. FFN (applied over last dim, works on any leading shape) ────
-        x = x + self.ffn(self.norm_ff(x))
+        x = x + self.drop_path(self.ffn(self.norm_ff(x)))
         return x
 
 
@@ -333,6 +383,7 @@ class StationMAEEncoder(nn.Module):
         factorised:           bool  = False,
         spatial_attn:         bool  = True,
         temporal_window:      int   = 0,
+        drop_path_rate:       float = 0.0,
     ):
         super().__init__()
 
@@ -343,9 +394,12 @@ class StationMAEEncoder(nn.Module):
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
         self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
-        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim)
-        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim)
-        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim)
+        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
+                                                dropout=dropout)
+        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim,
+                                             dropout=dropout)
+        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
+                                              dropout=dropout)
 
         # --- Post-assembly normalisation ---
         # Applied after summing var_proj + spatial_emb + temporal_emb to keep
@@ -361,6 +415,15 @@ class StationMAEEncoder(nn.Module):
         # temporal_window > 0 enables local windowed temporal attention; odd-indexed
         # blocks use a half-window Swin shift so cross-chunk communication emerges
         # after two layers.  Ignored when factorised=False.
+        #
+        # Stochastic depth: drop_path_rate is the maximum drop probability (applied
+        # to the deepest layer).  Rates increase linearly from 0.0 (layer 0) to
+        # drop_path_rate (layer num_layers-1), following the standard recipe from
+        # Huang et al. (2016) and used in DeiT / Swin Transformer.
+        dp_rates = [
+            drop_path_rate * i / max(num_layers - 1, 1)
+            for i in range(num_layers)
+        ]
         if factorised:
             self.blocks = nn.ModuleList([
                 FactorisedTransformerBlock(
@@ -368,13 +431,15 @@ class StationMAEEncoder(nn.Module):
                     spatial_attn=spatial_attn,
                     temporal_window=temporal_window,
                     shift=(i % 2 == 1),   # alternate shift: even=no-shift, odd=shifted
+                    drop_path=dp_rates[i],
                 )
                 for i in range(num_layers)
             ])
         else:
             self.blocks = nn.ModuleList([
-                TransformerBlock(d_model, num_heads, mlp_ratio, dropout)
-                for _ in range(num_layers)
+                TransformerBlock(d_model, num_heads, mlp_ratio, dropout,
+                                 drop_path=dp_rates[i])
+                for i in range(num_layers)
             ])
 
         self.norm = nn.LayerNorm(d_model)

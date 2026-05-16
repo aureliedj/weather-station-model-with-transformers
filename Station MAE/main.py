@@ -46,6 +46,13 @@ Arguments
     --factorised_encoder   Axial (temporal + spatial) attention in encoder
     --cross_attn_decoder   Cross-attention decoder (queries attend to encoder context)
     --grad_checkpoint      Gradient checkpointing (~66% less VRAM, ~33% slower)
+    --drop_path_rate FLT   Max stochastic depth probability (0 = off; try 0.1)
+    --masked_only_loss     Supervise encoder-masked stations only (inpainting mode)
+
+  Regularisation
+    --train_stride   INT   Step between training window starts (1=default, 6=hourly, 12=2-h)
+    --drop_path_rate FLT   Stochastic depth max prob (0=off, try 0.05–0.20)
+    --masked_only_loss     Supervise masked stations only (inpainting: --max_delta 0)
 
   Training
     --num_delta      INT   Lead-times per sample (1 = single-delta; default 1)
@@ -155,6 +162,24 @@ def parse_args() -> argparse.Namespace:
                    help="Cross-attention decoder (query tokens attend to encoder context)")
     p.add_argument("--grad_checkpoint",     action="store_true",
                    help="Gradient checkpointing (~33%% extra compute, ~66%% less VRAM)")
+    p.add_argument("--drop_path_rate",  type=float, default=0.0,
+                   help="Maximum stochastic-depth (DropPath) drop probability "
+                        "(linearly scheduled from 0 at layer 0 to this value at the "
+                        "deepest layer, in both encoder and decoder).  Default 0.0 = "
+                        "disabled.  Recommended range 0.05–0.20 for overfitting runs.")
+    p.add_argument("--masked_only_loss",    action="store_true",
+                   help="Restrict training loss to encoder-masked stations only. "
+                        "Prevents visible stations from being used as supervision "
+                        "targets — appropriate for inpainting (--max_delta 0) where "
+                        "visible stations have a shortcut via their own input window.")
+
+    # Data augmentation / regularisation
+    p.add_argument("--train_stride", type=int, default=1,
+                   help="Step between consecutive training window start indices. "
+                        "stride=1 (default) gives maximum overlap (~99%% with W=72). "
+                        "stride=6 → 60-min spacing between samples → ~6× more "
+                        "independent windows, stronger effective regularisation. "
+                        "stride=12 → 2-h spacing.  Val/test always use stride=1.")
 
     # Training
     p.add_argument("--num_delta",    type=int,   default=1)
@@ -298,6 +323,7 @@ def main() -> None:
         shared_memory=False,
         fast_cache_dir=fast_cache_dir,
         exclude_stations=args.exclude_stations,
+        train_stride=args.train_stride,
     )
 
     print("Building val dataset …")
@@ -367,8 +393,20 @@ def main() -> None:
         encoder_spatial_attn=not args.no_spatial_attn,
         temporal_window=args.temporal_window,
         cross_attention_decoder=args.cross_attn_decoder,
+        drop_path_rate=args.drop_path_rate,
+        masked_only_loss=args.masked_only_loss,
     )
 
+    if args.train_stride > 1:
+        _n_before = len(train_ds.indices) * args.train_stride  # rough estimate
+        print(f"Train stride             : {args.train_stride}  "
+              f"({len(train_ds):,} samples  → ~{args.train_stride}× less window overlap)")
+    if args.drop_path_rate > 0:
+        print(f"Stochastic depth         : drop_path_rate={args.drop_path_rate}  "
+              f"(linearly 0 → {args.drop_path_rate} across encoder + decoder layers)")
+    if args.masked_only_loss:
+        print("Loss                     : masked stations only  "
+              "(visible stations are context, not supervision targets)")
     if args.grad_checkpoint:
         print("Gradient checkpointing   : ON  (~33% extra compute, ~66% less VRAM)")
     if args.factorised_encoder:
@@ -430,6 +468,9 @@ def main() -> None:
         "mlp_ratio":           args.mlp_ratio,
         "mask_ratio":          args.mask_ratio,
         "dropout":             args.dropout,
+        "drop_path_rate":      args.drop_path_rate,
+        "masked_only_loss":    args.masked_only_loss,
+        "train_stride":        args.train_stride,
         "exclude_stations":    args.exclude_stations or [],
     }
 

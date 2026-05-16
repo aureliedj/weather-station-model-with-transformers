@@ -54,7 +54,7 @@ from .embeddings import (
     NUM_VARIABLES,
     NUM_TARGET_VARIABLES,
 )
-from .encoder import TransformerBlock   # reuse the same Pre-LN block
+from .encoder import TransformerBlock, DropPath   # reuse Pre-LN block and DropPath
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +92,8 @@ class CrossAttentionBlock(nn.Module):
         num_heads: Attention heads (shared across self and cross sub-layers).
         mlp_ratio: FFN hidden-dim ratio (default 4.0).
         dropout:   Dropout rate (default 0.1).
+        drop_path: Stochastic depth drop probability (default 0.0 = disabled).
+                   Applied to the residuals of self-attn, cross-attn, and FFN.
     """
 
     def __init__(
@@ -100,6 +102,7 @@ class CrossAttentionBlock(nn.Module):
         num_heads: int,
         mlp_ratio: float = 4.0,
         dropout:   float = 0.1,
+        drop_path: float = 0.0,
     ):
         super().__init__()
 
@@ -126,6 +129,9 @@ class CrossAttentionBlock(nn.Module):
             nn.Dropout(dropout),
         )
 
+        # ── Stochastic depth ──────────────────────────────────────────────
+        self.drop_path = DropPath(drop_path)
+
     def forward(
         self,
         q:  torch.Tensor,   # (B, L_q,  d_model) — decoder query tokens
@@ -138,7 +144,7 @@ class CrossAttentionBlock(nn.Module):
         # 1. Self-attention among queries
         q_n  = self.norm_sa(q)
         sa, _ = self.self_attn(q_n, q_n, q_n, need_weights=False)
-        q    = q + sa
+        q    = q + self.drop_path(sa)
 
         # 2. Cross-attention: queries read from encoder context
         kv_n  = self.norm_kv(kv)          # normalise once, reuse for K and V
@@ -148,10 +154,10 @@ class CrossAttentionBlock(nn.Module):
             kv_n,                         # V: same
             need_weights=False,
         )
-        q = q + ca
+        q = q + self.drop_path(ca)
 
         # 3. FFN
-        q = q + self.ffn(self.norm_ff(q))
+        q = q + self.drop_path(self.ffn(self.norm_ff(q)))
         return q
 
 
@@ -194,6 +200,7 @@ class StationMAEDecoder(nn.Module):
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
         use_checkpoint:       bool  = False,
         cross_attention:      bool  = False,
+        drop_path_rate:       float = 0.0,
     ):
         super().__init__()
 
@@ -215,16 +222,20 @@ class StationMAEDecoder(nn.Module):
         # Token = mask_token + p1 + p2 + t + delta
         # ------------------------------------------------------------------
         # p1 — WHERE (position): Fourier encoding of easting/northing
-        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim)
+        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
+                                                dropout=dropout)
 
         # p2 — WHERE (characteristics): MLP over topographic features
-        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim)
+        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim,
+                                             dropout=dropout)
 
         # t  — WHEN: Aurora Fourier temporal encoding for the TARGET timestep
-        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim)
+        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
+                                              dropout=dropout)
 
         # Δt — LEAD: Fourier encoding over continuous lead-time hours
-        self.delta_emb    = DeltaTimeEmbedding(d_model=d_model, fourier_dim=delta_fourier_dim)
+        self.delta_emb    = DeltaTimeEmbedding(d_model=d_model, fourier_dim=delta_fourier_dim,
+                                               dropout=dropout)
 
         # --- Post-assembly normalisation for station query tokens ---
         # Applied after summing mask_token + spatial + temporal + delta,
@@ -235,12 +246,26 @@ class StationMAEDecoder(nn.Module):
         # Decoder attention stack
         # cross_attention=True  → CrossAttentionBlock  (queries cross-attend encoder)
         # cross_attention=False → TransformerBlock     (concatenated self-attention)
+        #
+        # Stochastic depth rates increase linearly from 0 → drop_path_rate
+        # across decoder layers, matching the encoder convention.
         # ------------------------------------------------------------------
-        _block_cls = CrossAttentionBlock if cross_attention else TransformerBlock
-        self.blocks = nn.ModuleList([
-            _block_cls(d_model, num_heads, mlp_ratio, dropout)
-            for _ in range(num_layers)
-        ])
+        dp_rates = [
+            drop_path_rate * i / max(num_layers - 1, 1)
+            for i in range(num_layers)
+        ]
+        if cross_attention:
+            self.blocks = nn.ModuleList([
+                CrossAttentionBlock(d_model, num_heads, mlp_ratio, dropout,
+                                    drop_path=dp_rates[i])
+                for i in range(num_layers)
+            ])
+        else:
+            self.blocks = nn.ModuleList([
+                TransformerBlock(d_model, num_heads, mlp_ratio, dropout,
+                                 drop_path=dp_rates[i])
+                for i in range(num_layers)
+            ])
         self.norm = nn.LayerNorm(d_model)
 
         # ------------------------------------------------------------------
