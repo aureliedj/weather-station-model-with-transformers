@@ -70,7 +70,7 @@ EXCLUDE="--exclude_stations 110"
 # ── Optional encoder flags ────────────────────────────────────────────────────
 # Uncomment to remove spatial attention (~27% faster per encoder block):
 # SPATIAL=""
-SPATIAL="" #"--no_spatial_attn"
+SPATIAL="--no_spatial_attn"
 
 # Uncomment to enable local windowed temporal attention:
 # W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
