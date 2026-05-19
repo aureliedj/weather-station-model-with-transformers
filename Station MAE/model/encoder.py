@@ -316,6 +316,191 @@ class FactorisedTransformerBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Joint spatiotemporal attention block (with temporal RoPE)
+# ---------------------------------------------------------------------------
+
+def _rotate_half(x: torch.Tensor) -> torch.Tensor:
+    """Rotate the last dimension by half for RoPE application."""
+    half = x.shape[-1] // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    return torch.cat([-x2, x1], dim=-1)
+
+
+def _apply_rope(
+    x:   torch.Tensor,   # (B, H, L, head_dim)
+    cos: torch.Tensor,   # (L, head_dim)
+    sin: torch.Tensor,   # (L, head_dim)
+) -> torch.Tensor:
+    """Apply rotary position embedding to Q or K."""
+    # Broadcast over batch (B) and heads (H)
+    cos = cos.unsqueeze(0).unsqueeze(0)   # (1, 1, L, head_dim)
+    sin = sin.unsqueeze(0).unsqueeze(0)   # (1, 1, L, head_dim)
+    return x * cos + _rotate_half(x) * sin
+
+
+class JointSpatioTemporalBlock(nn.Module):
+    """
+    Joint spatiotemporal self-attention block operating on (B, W, N, d_model).
+
+    Unlike the factorised block, which attends *separately* over time then space,
+    this block flattens all W×N tokens into a single sequence of length L = W·N and
+    runs a single multi-head self-attention pass over all of them simultaneously.
+    This means every station–timestep token can directly attend to every other
+    station at every other timestep in a single layer — capturing cross-dimensional
+    dependencies that factorised blocks can only approximate over multiple layers.
+
+    **Memory / compute trade-off**
+    Full attention over L = W·N tokens has O(L²) = O((W·N)²) cost.  For the default
+    config (W=72, N_vis≈75), L ≈ 5400.  Using Flash Attention (via
+    ``F.scaled_dot_product_attention``) reduces *memory* to O(L) — no materialised
+    attention matrix — so typical GPU VRAM is the limiting resource rather than
+    pure FLOPS.  Gradient checkpointing on these blocks is strongly recommended.
+
+    **Temporal RoPE**
+    Position encoding is injected via 1D Rotary Position Embeddings (RoPE,
+    Su et al. 2021) applied only along the *temporal* axis.  Every token at
+    timestep w receives the same rotational encoding regardless of which station it
+    belongs to.  RoPE rotates Q and K vectors so that attention scores naturally
+    encode relative temporal distance — without adding an explicit additive position
+    tensor and without requiring an attention mask.  This makes the block compatible
+    with ``F.scaled_dot_product_attention`` (Flash Attention path).
+
+    Spatial relationships are handled implicitly through the station embeddings
+    (PositionalEmbedding + StationEmbedding) that are summed into the token before
+    entering the encoder, so no separate spatial position encoding is added here.
+
+    Args:
+        d_model:      Model / token dimension.
+        num_heads:    Number of attention heads.  head_dim = d_model // num_heads.
+        mlp_ratio:    FFN hidden-dim expansion ratio (default 4.0).
+        dropout:      Dropout in FFN and attention (default 0.1).
+        drop_path:    Stochastic depth drop probability (default 0.0).
+        max_time:     Upper bound on W for pre-computing RoPE frequencies (default 512).
+    """
+
+    def __init__(
+        self,
+        d_model:   int,
+        num_heads: int,
+        mlp_ratio: float = 4.0,
+        dropout:   float = 0.1,
+        drop_path: float = 0.0,
+        max_time:  int   = 512,
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        self.num_heads    = num_heads
+        self.head_dim     = d_model // num_heads
+        self.attn_dropout = dropout
+
+        # ── Pre-norm ────────────────────────────────────────────────────────
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # ── Manual Q / K / V projections ────────────────────────────────────
+        # We bypass nn.MultiheadAttention so we can apply RoPE between the
+        # projection and the attention kernel — MHA's forward doesn't expose
+        # Q/K between those two steps.
+        self.q_proj  = nn.Linear(d_model, d_model)
+        self.k_proj  = nn.Linear(d_model, d_model)
+        self.v_proj  = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # ── RoPE frequencies (buffer — moves to device automatically) ───────
+        # inv_freq[i] = 1 / 10000^(2i / head_dim)
+        # Shape: (head_dim // 2,)
+        inv_freq = 1.0 / (
+            10000.0 ** (
+                torch.arange(0, self.head_dim, 2, dtype=torch.float32) / self.head_dim
+            )
+        )
+        self.register_buffer("inv_freq", inv_freq)
+
+        # ── FFN ──────────────────────────────────────────────────────────────
+        hidden = int(d_model * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
+        )
+
+        # ── Stochastic depth ─────────────────────────────────────────────────
+        self.drop_path = DropPath(drop_path)
+
+    def _rope_for_window(
+        self, W: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Pre-compute cos/sin RoPE tensors for a sequence of length W*N
+        where N tokens share the same temporal index w.
+
+        Since the index order in the flattened sequence is
+            [w=0,n=0], [w=0,n=1], …, [w=0,n=N-1],
+            [w=1,n=0], …
+        the temporal index for position i is i // N.  However because N is
+        not known at __init__ time, we pass W here and let the caller expand.
+
+        Returns
+        -------
+        cos, sin : (W, head_dim) tensors — one entry per timestep.
+        Caller must unsqueeze and expand over N.
+        """
+        t = torch.arange(W, device=device, dtype=torch.float32)  # (W,)
+        freqs = torch.outer(t, self.inv_freq)                      # (W, head_dim//2)
+        emb   = torch.cat([freqs, freqs], dim=-1)                  # (W, head_dim)
+        return emb.cos().to(dtype), emb.sin().to(dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, W, N, d_model)
+        Returns:
+            (B, W, N, d_model)
+        """
+        B, W, N, D = x.shape
+        L = W * N
+
+        # Flatten spatial and temporal into a single sequence
+        h = x.reshape(B, L, D)
+
+        # ── Attention with pre-norm ──────────────────────────────────────────
+        h_n = self.norm1(h)
+
+        # Project to Q, K, V and split into heads
+        # (B, L, D) → (B, L, H, head_dim) → (B, H, L, head_dim)
+        Q = self.q_proj(h_n).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        K = self.k_proj(h_n).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+        V = self.v_proj(h_n).reshape(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Build temporal RoPE: cos/sin shape (W, head_dim), then tile over N
+        cos_w, sin_w = self._rope_for_window(W, x.device, x.dtype)  # (W, head_dim)
+        # Each timestep w covers N consecutive positions → repeat_interleave
+        cos_l = cos_w.repeat_interleave(N, dim=0)  # (L, head_dim)
+        sin_l = sin_w.repeat_interleave(N, dim=0)  # (L, head_dim)
+
+        Q = _apply_rope(Q, cos_l, sin_l)
+        K = _apply_rope(K, cos_l, sin_l)
+
+        # Flash Attention via F.scaled_dot_product_attention
+        # No explicit attention mask needed — RoPE encodes relative temporal distance.
+        # Dropout is applied inside the kernel during training.
+        dp = self.attn_dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(Q, K, V, dropout_p=dp)
+        # (B, H, L, head_dim) → (B, L, H*head_dim) = (B, L, D)
+        attn_out = attn_out.transpose(1, 2).reshape(B, L, D)
+        attn_out = self.out_proj(attn_out)
+
+        h = h + self.drop_path(attn_out)
+
+        # ── FFN with pre-norm ────────────────────────────────────────────────
+        h = h + self.drop_path(self.ffn(self.norm2(h)))
+
+        return h.reshape(B, W, N, D)
+
+
+# ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
 
@@ -351,6 +536,7 @@ class StationMAEEncoder(nn.Module):
                               cheaper at W=288, N=100.  Tokens remain in (B,W,N,d) shape
                               through the blocks; flattened to (B,W·N_vis,d) at output to
                               preserve the decoder interface.
+                              Ignored when joint=True.
         spatial_attn:         Only used when factorised=True.  If False, the spatial
                               sub-layer is removed from every FactorisedTransformerBlock —
                               each station is encoded independently from its own temporal
@@ -365,6 +551,13 @@ class StationMAEEncoder(nn.Module):
                               chunk boundaries after two layers.
                               Example: W=72, temporal_window=6 → 12 one-hour chunks
                               at 10-min resolution, 12× cheaper temporal attention.
+        joint:                If True, use JointSpatioTemporalBlock — full attention over
+                              all W×N tokens simultaneously, with temporal RoPE injected
+                              into Q and K.  Captures cross-dimensional interactions in a
+                              single layer at the cost of O((W·N)²) FLOPs; Flash Attention
+                              keeps VRAM at O(W·N) so the memory is manageable.
+                              Takes precedence over factorised when both are True.
+                              Strongly recommended with --grad_checkpoint on limited VRAM.
     """
 
     def __init__(
@@ -384,13 +577,15 @@ class StationMAEEncoder(nn.Module):
         spatial_attn:         bool  = True,
         temporal_window:      int   = 0,
         drop_path_rate:       float = 0.0,
+        joint:                bool  = False,
     ):
         super().__init__()
 
         self.d_model         = d_model
         self.mask_ratio      = mask_ratio
         self.use_checkpoint  = use_checkpoint
-        self.factorised      = factorised
+        self.factorised      = factorised and not joint
+        self.joint           = joint
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
         self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
@@ -424,7 +619,17 @@ class StationMAEEncoder(nn.Module):
             drop_path_rate * i / max(num_layers - 1, 1)
             for i in range(num_layers)
         ]
-        if factorised:
+        if joint:
+            # Joint spatiotemporal attention with temporal RoPE.
+            # Full W×N self-attention per block; Flash Attention keeps VRAM linear.
+            self.blocks = nn.ModuleList([
+                JointSpatioTemporalBlock(
+                    d_model, num_heads, mlp_ratio, dropout,
+                    drop_path=dp_rates[i],
+                )
+                for i in range(num_layers)
+            ])
+        elif factorised:
             self.blocks = nn.ModuleList([
                 FactorisedTransformerBlock(
                     d_model, num_heads, mlp_ratio, dropout,
@@ -563,11 +768,13 @@ class StationMAEEncoder(nn.Module):
         B_sz, W_sz, N_vis, D = visible_tokens.shape
 
         # 3. Transformer blocks
+        # ── Joint path:      keep (B, W, N_vis, d) through JointSpatioTemporalBlocks
+        #    (full W×N attention with temporal RoPE), then flatten to (B, W*N_vis, d).
         # ── Factorised path: keep (B, W, N_vis, d) through FactorisedTransformerBlocks
         #    then flatten to (B, W*N_vis, d) for the decoder interface.
         # ── Flat path:       flatten first to (B, W*N_vis, d) then run TransformerBlocks.
-        # Both paths use gradient checkpointing when use_checkpoint=True.
-        if self.factorised:
+        # All paths use gradient checkpointing when use_checkpoint=True.
+        if self.joint or self.factorised:
             h = visible_tokens                                     # (B, W, N_vis, d_model)
             for block in self.blocks:
                 if self.use_checkpoint and torch.is_grad_enabled():

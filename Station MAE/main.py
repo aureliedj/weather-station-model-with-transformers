@@ -172,6 +172,13 @@ def parse_args() -> argparse.Namespace:
                         "Prevents visible stations from being used as supervision "
                         "targets — appropriate for inpainting (--max_delta 0) where "
                         "visible stations have a shortcut via their own input window.")
+    p.add_argument("--joint_encoder",       action="store_true",
+                   help="Use JointSpatioTemporalBlock in the encoder: full self-attention "
+                        "over all W×N tokens simultaneously with temporal RoPE on Q/K. "
+                        "Captures cross-dimensional (space × time) interactions in every "
+                        "layer. Flash Attention keeps VRAM linear; use with "
+                        "--grad_checkpoint on ≤24 GB GPUs. Takes precedence over "
+                        "--factorised_encoder.")
 
     # Data augmentation / regularisation
     p.add_argument("--train_stride", type=int, default=1,
@@ -395,6 +402,7 @@ def main() -> None:
         cross_attention_decoder=args.cross_attn_decoder,
         drop_path_rate=args.drop_path_rate,
         masked_only_loss=args.masked_only_loss,
+        joint_encoder=args.joint_encoder,
     )
 
     if args.train_stride > 1:
@@ -409,7 +417,10 @@ def main() -> None:
               "(visible stations are context, not supervision targets)")
     if args.grad_checkpoint:
         print("Gradient checkpointing   : ON  (~33% extra compute, ~66% less VRAM)")
-    if args.factorised_encoder:
+    if args.joint_encoder:
+        print("Joint encoder            : ON  (full W×N attention + temporal RoPE; "
+              "Flash Attention — use with --grad_checkpoint on ≤24 GB)")
+    elif args.factorised_encoder:
         _spatial_str = "temporal-only (--no_spatial_attn)" if args.no_spatial_attn \
                        else "temporal + spatial"
         _tw_str = f"  |  temporal_window={args.temporal_window}" \
@@ -470,6 +481,7 @@ def main() -> None:
         "dropout":             args.dropout,
         "drop_path_rate":      args.drop_path_rate,
         "masked_only_loss":    args.masked_only_loss,
+        "joint_encoder":       args.joint_encoder,
         "train_stride":        args.train_stride,
         "exclude_stations":    args.exclude_stations or [],
     }

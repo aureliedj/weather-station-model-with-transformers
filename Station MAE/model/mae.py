@@ -107,6 +107,12 @@ class StationMAE(nn.Module):
                                  as context only and receive no gradient.
                                  Appropriate for inpainting (max_delta=0) where visible
                                  stations have a shortcut via their own input window.
+        joint_encoder:           If True, use JointSpatioTemporalBlock in the encoder —
+                                 full attention over all W×N tokens simultaneously, with
+                                 temporal RoPE on Q and K.  Flash Attention keeps VRAM
+                                 linear in sequence length.  Takes precedence over
+                                 factorised_encoder when both are set.
+                                 Recommended with use_checkpoint=True on ≤ 24 GB GPUs.
     """
 
     def __init__(
@@ -129,6 +135,7 @@ class StationMAE(nn.Module):
         cross_attention_decoder: bool  = False,
         drop_path_rate:          float = 0.0,
         masked_only_loss:        bool  = False,
+        joint_encoder:           bool  = False,
     ):
         super().__init__()
 
@@ -151,6 +158,7 @@ class StationMAE(nn.Module):
             spatial_attn=encoder_spatial_attn,
             temporal_window=temporal_window,
             drop_path_rate=drop_path_rate,
+            joint=joint_encoder,
         )
 
         self.decoder = StationMAEDecoder(

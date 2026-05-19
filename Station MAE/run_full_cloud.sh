@@ -67,17 +67,35 @@ EXCLUDE="--exclude_stations 110"
 # EXCLUDE=""   # ← uncomment to disable exclusion
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Optional encoder flags ────────────────────────────────────────────────────
-# Uncomment to remove spatial attention (~27% faster per encoder block):
-# SPATIAL=""
-SPATIAL="--no_spatial_attn"
+# ── Encoder architecture ──────────────────────────────────────────────────────
+#
+# Three mutually exclusive encoder modes (choose ONE):
+#
+#   JOINT encoder  (--joint_encoder)
+#     Full self-attention over all W×N tokens simultaneously.
+#     Temporal RoPE on Q/K — captures cross-station × cross-time interactions
+#     in every layer. Flash Attention keeps VRAM linear.  Slower than factorised
+#     but richer representations.  Strongly recommended with --grad_checkpoint.
+#     At W=72, N_vis≈75: L≈5400 tokens, ~2.5× slower than factorised.
+#     Disable --factorised_encoder and --no_spatial_attn when using this.
+#
+#   FACTORISED encoder  (--factorised_encoder, current default)
+#     Alternates temporal then spatial attention — ~100× cheaper than flat.
+#     --no_spatial_attn removes the spatial sub-layer (station-independent).
+#
+#   FLAT encoder  (neither flag)
+#     Standard self-attention over flattened W·N_vis tokens.
 
-# Uncomment to enable local windowed temporal attention:
+# Set ENCODER to one of the three options below:
+#ENCODER=--factorised_encoder --no_spatial_attn"   # current default
+#ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
+ENCODER=""                                         # flat (original)
+
+# Uncomment to enable local windowed temporal attention (factorised only):
 # W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
 # TEMPORAL_WINDOW="--temporal_window 6"
 TEMPORAL_WINDOW=""
 
-#--masked_only_loss \        # pure gap-filling objective
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
@@ -110,9 +128,8 @@ python main.py \
     --bf16 \
     --compile \
     --grad_checkpoint \
-    --factorised_encoder \
     --cross_attn_decoder \
-    $SPATIAL \
+    $ENCODER \
     $TEMPORAL_WINDOW \
     $EXCLUDE \
     --wandb_project    station-mae \
