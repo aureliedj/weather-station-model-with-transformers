@@ -18,7 +18,6 @@ python test.py \
     --batch_size       32 \
     --window           72 \
     --max_delta        36 \
-    --num_delta        6 \
     --mlp_ratio        2.0 \
     --num_workers      5 \
     --d_model          128 \
