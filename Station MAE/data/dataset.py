@@ -289,8 +289,10 @@ _CACHE_FILENAME = "peakweather_obs_cache.pt"
 # Fast local cache  (numpy memmap — direct worker access, no IPC overhead)
 # ---------------------------------------------------------------------------
 
-_FAST_CACHE_VERSION = "v1"
+_FAST_CACHE_VERSION = "v2"
 # Bump this when the on-disk format changes to force a rebuild.
+# v2: stores "all_valid_indices" (pre-mode pool) instead of post-stride
+#     "indices", so the windowing strategy can be changed without rebuilding.
 
 
 def _fast_split_paths(fast_dir: str, split: str, train_years: list) -> dict:
@@ -351,12 +353,12 @@ def fast_cache_save(
         torch.save(spatial, paths["spatial"])
 
     torch.save({
-        "version":         _FAST_CACHE_VERSION,
-        "obs_stats":       obs_stats,
-        "spatial_stats":   spatial_stats,
-        "indices":         indices,
-        "window_size":     window_size,
-        "max_delta_steps": max_delta_steps,
+        "version":           _FAST_CACHE_VERSION,
+        "obs_stats":         obs_stats,
+        "spatial_stats":     spatial_stats,
+        "all_valid_indices": indices,   # pre-mode pool; mode is applied on load
+        "window_size":       window_size,
+        "max_delta_steps":   max_delta_steps,
     }, paths["meta"])
 
     print(f"[FastCache] Saved '{split}' in {time.time() - t0:.1f}s", flush=True)
@@ -496,6 +498,31 @@ class StationMAEDataset(Dataset):
     The training loop calls ``model.forward_multi_delta()``, which runs the
     encoder once and the decoder K times — amortising O(L²) attention cost.
 
+    Windowing strategies  (index_mode)
+    ------------------------------------
+    All three strategies first build a *pool* of contiguity-valid start indices
+    — positions where the full span ``[i, i + W + max_delta - 1]`` contains no
+    temporal gaps (checked vectorially via nanosecond timestamp differences).
+    This replaces the old year-boundary heuristic which incorrectly rejected
+    valid cross-year windows and missed mid-series instrument outages.
+
+    ``"sliding"``  (Strategy C — default, GraphDOP / most baselines):
+        Every contiguity-valid start, optionally thinned by ``train_stride`` on
+        the training split.  DataLoader ``shuffle=True`` gives random-without-
+        replacement ordering each epoch.  Maximal data coverage.
+
+    ``"blocks"``   (Strategy B — PatchTST / iTransformer):
+        Greedy non-overlapping selection: a window is accepted only when its
+        start is at least W steps ahead of the previous accepted start.  No two
+        windows share any input timestep.  Cleanest gradient signal, smallest
+        epoch size.
+
+    ``"random"``   (Strategy A — Aurora / W-MAE / VideoMAE):
+        Full pool stored; ``__getitem__`` ignores the DataLoader index and
+        samples uniformly at random from the pool on every call.  Gives
+        per-item independent sampling (with replacement) — different windows
+        every epoch with no systematic coverage bias.
+
     Data loading optimisations
     --------------------------
     * ``share_memory_()`` is called on obs, mask, and hours tensors so that
@@ -532,6 +559,12 @@ class StationMAEDataset(Dataset):
                               a tmpfs (RAM-backed), so page faults are served at memory
                               speed.  First call builds and saves the .npy files; all
                               subsequent calls (and all workers) load instantly.
+        index_mode:           Windowing strategy for the training split (see class
+                              docstring).  One of "sliding" (default), "blocks", or
+                              "random".  Val/test always use "sliding" with stride=1.
+        train_stride:         Uniform thinning step applied to the "sliding" train
+                              index list (1 = every start, 6 = hourly, 12 = 2-h).
+                              Ignored for "blocks" and "random" modes.
     """
 
     def __init__(
@@ -549,6 +582,7 @@ class StationMAEDataset(Dataset):
         fast_cache_dir:       "str | None" = None,
         exclude_stations:     "list | None" = None,
         train_stride:         int  = 1,
+        index_mode:           str  = "sliding",
     ):
         super().__init__()
 
@@ -560,12 +594,16 @@ class StationMAEDataset(Dataset):
             assert max_delta_steps is not None, \
                 "max_delta_steps must be set when num_delta_per_sample > 1"
         assert train_stride >= 1, "train_stride must be >= 1"
+        assert index_mode in ("sliding", "blocks", "random"), (
+            f"index_mode must be 'sliding', 'blocks', or 'random', got '{index_mode}'"
+        )
 
         self.window_size          = window_size
         self.delta_steps          = delta_steps
         self.split                = split
         self.num_delta_per_sample = num_delta_per_sample
         self.train_stride         = train_stride
+        self.index_mode           = index_mode
         # Effective upper bound on lead-time — governs valid index calculation
         # and random sampling in __getitem__
         self.max_delta_steps = max_delta_steps if max_delta_steps is not None \
@@ -602,13 +640,13 @@ class StationMAEDataset(Dataset):
                 self.obs_stats     = cached["obs_stats"]
                 self.spatial       = cached["spatial"]
                 self.spatial_stats = cached["spatial_stats"]
-                self.indices       = cached["meta"]["indices"]
 
-                # Apply train_stride: thin the training indices to reduce window
-                # overlap and improve effective data diversity.  Val/test keep
-                # stride=1 (every valid window) for consistent evaluation.
-                if split == "train" and train_stride > 1:
-                    self.indices = self.indices[::train_stride]
+                # Apply windowing strategy to the pre-mode pool stored in cache.
+                # Mode can be changed freely without rebuilding the cache.
+                self.indices = StationMAEDataset._apply_index_mode(
+                    cached["meta"]["all_valid_indices"],
+                    window_size, train_stride, index_mode, split,
+                )
 
                 # Keep numpy mmap arrays alive (torch.from_numpy holds a weak ref
                 # to the numpy array; storing explicitly prevents GC).
@@ -751,39 +789,66 @@ class StationMAEDataset(Dataset):
         self.timestamps = timestamps
 
         # ------------------------------------------------------------------
-        # 6. Valid window start indices
+        # 6. Valid window start indices — vectorised contiguity check
         #
-        #    A window at index i is valid iff:
-        #      - i + W - 1 + max_delta_steps < T_split   (fits in the split)
-        #      - timestamps[i].year ==
-        #        timestamps[i + W - 1 + max_delta_steps].year
-        #        (no year-boundary crossing, even for the longest lead-time)
+        # A window starting at i is valid iff the entire span
+        #   [i, i + W - 1 + max_delta]
+        # contains no temporal gaps (no missing 10-min steps).
         #
-        #    Enforcing this for max_delta guarantees validity for all deltas
-        #    in [1, max_delta_steps] without checking each one individually.
+        # This replaces the previous year-boundary heuristic which:
+        #   (a) rejected valid windows that cross 31 Dec → 1 Jan within the
+        #       same training split (e.g. 2020-12-31 → 2021-01-01), wasting
+        #       several hundred valid starts per year boundary; and
+        #   (b) did not catch mid-year instrument outages, which produce
+        #       windows with inflated zero-fill proportions in x_mask.
+        #
+        # Implementation:
+        #   1. Compute nanosecond differences between consecutive timestamps
+        #      (vectorised via pd.DatetimeIndex.asi8 → np.diff).
+        #   2. Build a prefix-sum array of "bad gap" counts so each window's
+        #      validity can be tested in O(1).
+        #   3. Apply the chosen windowing strategy (_apply_index_mode).
+        #
+        # Note: timestamps are treated as UTC-equivalent for the diff
+        # comparison.  If the source data uses local time (CET/CEST), windows
+        # that span a DST transition will show a 50-min or 70-min gap for
+        # exactly one step and be correctly rejected.
         # ------------------------------------------------------------------
         T         = len(timestamps)
         max_delta = self.max_delta_steps
-        max_start = T - window_size - max_delta
 
-        self.indices: list[int] = []
-        for i in range(max(0, max_start + 1)):
-            start_year  = timestamps[i].year
-            target_year = timestamps[i + window_size - 1 + max_delta].year
-            if start_year == target_year:
-                self.indices.append(i)
+        # ── Vectorised gap mask ────────────────────────────────────────────
+        _step_ns  = int(pd.Timedelta("10min").value)          # expected gap (ns)
+        _ts_ns    = pd.DatetimeIndex(timestamps).asi8         # (T,) int64 ns
+        _diffs    = np.diff(_ts_ns)                           # (T-1,) ns between steps
+        _bad      = (_diffs != _step_ns).astype(np.int32)    # 1 where gap is wrong
 
-        # Apply train_stride: thin the index list so consecutive samples are
-        # at least train_stride * 10 minutes apart.  With W=72 (12 h window)
-        # and stride=1, consecutive samples share 71/72 ≈ 99% of their input.
-        # stride=6 → 60-min spacing → 66/72 ≈ 92% overlap → ~6× more diversity.
-        # stride=12 → 2-h spacing  → 60/72 ≈ 83% overlap → ~12× more diversity.
-        # Stride is applied to training only; val/test always use stride=1.
-        if split == "train" and train_stride > 1:
-            self.indices = self.indices[::train_stride]
+        # bad_count[i] = number of bad gaps strictly before position i
+        # bad_count[i+k] - bad_count[i] == 0  ↔  span [i, i+k-1] is gap-free
+        _bad_count = np.zeros(T + 1, dtype=np.int32)
+        _bad_count[1:] = np.cumsum(_bad)
+
+        # A window needs the span [i, i + (W-1) + max_delta] to be gap-free,
+        # i.e. no bad gaps among positions i, i+1, …, i + (W-1) + max_delta - 1.
+        _need     = window_size - 1 + max_delta     # number of steps past start
+        _max_i    = max(0, T - window_size - max_delta)
+
+        all_valid: list[int] = [
+            i for i in range(_max_i)
+            if _bad_count[i + _need] == _bad_count[i]
+        ]
+
+        # Apply chosen windowing strategy (see _apply_index_mode docstring).
+        self.indices = StationMAEDataset._apply_index_mode(
+            all_valid, window_size, train_stride, index_mode, split,
+        )
 
         # ------------------------------------------------------------------
         # 7. Save fast cache for future runs (if fast_cache_dir is set)
+        #
+        # We persist the pre-mode all_valid pool, not the post-mode self.indices,
+        # so that the windowing strategy can be changed without rebuilding.
+        # The mode is applied in _apply_index_mode each time the cache is loaded.
         # ------------------------------------------------------------------
         if fast_cache_dir is not None:
             fast_cache_save(
@@ -796,7 +861,7 @@ class StationMAEDataset(Dataset):
                 spatial       = spatial,
                 spatial_stats = spatial_stats,
                 obs_stats     = self.obs_stats,
-                indices       = self.indices,
+                indices       = all_valid,       # ← pre-mode pool, not post-mode
                 window_size   = window_size,
                 max_delta_steps = self.max_delta_steps,
             )
@@ -848,6 +913,80 @@ class StationMAEDataset(Dataset):
 
         return [i for i in range(len(stns)) if i not in drop]
 
+    @staticmethod
+    def _apply_index_mode(
+        all_valid:    list,
+        window_size:  int,
+        train_stride: int,
+        index_mode:   str,
+        split:        str,
+    ) -> list:
+        """
+        Apply the chosen windowing strategy to the contiguity-valid index pool.
+
+        All three strategies receive the same pool of gap-checked start indices
+        and differ only in how they select from it.  Val/test splits always
+        use "sliding" with stride=1 regardless of the requested index_mode.
+
+        Strategy A  ("random"):
+            Returns the full pool unchanged.  ``__getitem__`` samples uniformly
+            at random on every call (ignoring the DataLoader's index), giving
+            independent per-item sampling with replacement.  Every epoch draws
+            a fresh random subset of size ``len(dataset)`` from the full pool —
+            no two epochs see the same sequence of windows.
+            Refs: Aurora, W-MAE, VideoMAE.
+
+        Strategy B  ("blocks"):
+            Greedy non-overlapping selection.  Scans ``all_valid`` in order;
+            accepts index ``i`` only when ``i >= last_accepted + window_size``.
+            Guarantees zero input-timestep overlap between any two windows.
+            Produces the smallest training set but the most independent samples.
+            Refs: PatchTST, iTransformer, TimesNet.
+
+        Strategy C  ("sliding", default):
+            Full pool, optionally thinned by ``train_stride`` on training only.
+            DataLoader ``shuffle=True`` gives random-without-replacement epoch
+            ordering.  Maximum data coverage; recommended default.
+            Refs: GraphDOP (ECMWF), most sliding-window baselines.
+
+        Args:
+            all_valid:    Contiguity-checked valid start indices.
+            window_size:  W — input window length in timesteps.
+            train_stride: Thinning step for "sliding" training indices (≥ 1).
+            index_mode:   "sliding", "blocks", or "random".
+            split:        "train", "val", or "test".  Val/test always → sliding/1.
+        """
+        # Val and test always use the full sliding pool for consistent evaluation
+        if split != "train":
+            return list(all_valid)
+
+        if index_mode == "random":
+            # Strategy A — return full pool; __getitem__ samples randomly
+            return list(all_valid)
+
+        elif index_mode == "blocks":
+            # Strategy B — greedy non-overlapping: accept i only if gap ≥ W
+            result: list = []
+            next_ok: int = 0
+            for i in all_valid:
+                if i >= next_ok:
+                    result.append(i)
+                    next_ok = i + window_size
+            return result
+
+        elif index_mode == "sliding":
+            # Strategy C — full sliding window, optional uniform stride
+            if train_stride > 1:
+                return list(all_valid)[::train_stride]
+            return list(all_valid)
+
+        else:
+            raise ValueError(
+                f"index_mode='{index_mode}' is not recognised. "
+                f"Choose 'sliding' (Strategy C, default), "
+                f"'blocks' (Strategy B), or 'random' (Strategy A)."
+            )
+
     def _apply_station_exclusion(
         self,
         keep: list,
@@ -880,7 +1019,13 @@ class StationMAEDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> dict:
-        i = self.indices[idx]
+        # Strategy A ("random"): ignore DataLoader idx, sample uniformly from pool.
+        # This gives per-item independent sampling with replacement — the idx
+        # argument is used only to size the epoch (via __len__), not to select data.
+        if self.index_mode == "random":
+            i = self.indices[int(torch.randint(len(self.indices), (1,)).item())]
+        else:
+            i = self.indices[idx]
         W = self.window_size
         K = self.num_delta_per_sample
 

@@ -120,8 +120,8 @@ def parse_args() -> argparse.Namespace:
                         "Workers mmap .npy files directly from the OS page cache, "
                         "eliminating IPC overhead for source data. "
                         "Set to '' to disable and use the standard in-memory path.")
-    p.add_argument("--window",       type=int, default=288)
-    p.add_argument("--num_workers",  type=int, default=4)
+    p.add_argument("--window",       type=int, default=72)
+    p.add_argument("--num_workers",  type=int, default=0)
     p.add_argument("--batch_size",   type=int, default=16)
 
     # Subset / quick-check
@@ -181,16 +181,29 @@ def parse_args() -> argparse.Namespace:
                         "--factorised_encoder.")
 
     # Data augmentation / regularisation
+    p.add_argument("--index_mode", type=str, default="sliding",
+                   choices=["sliding", "blocks", "random"],
+                   help="Training window selection strategy (val/test always use sliding/1).\n"
+                        "  sliding (default, Strategy C — GraphDOP / most baselines):\n"
+                        "    Every contiguity-valid start, thinned by --train_stride.\n"
+                        "    DataLoader shuffle gives random-without-replacement epochs.\n"
+                        "  blocks  (Strategy B — PatchTST / iTransformer):\n"
+                        "    Greedy non-overlapping windows; no two windows share any\n"
+                        "    input timestep.  Smallest dataset, cleanest gradients.\n"
+                        "  random  (Strategy A — Aurora / W-MAE / VideoMAE):\n"
+                        "    Full pool stored; __getitem__ samples uniformly at random\n"
+                        "    regardless of DataLoader idx — true per-item replacement\n"
+                        "    sampling, different windows every epoch.")
     p.add_argument("--train_stride", type=int, default=1,
-                   help="Step between consecutive training window start indices. "
-                        "stride=1 (default) gives maximum overlap (~99%% with W=72). "
-                        "stride=6 → 60-min spacing between samples → ~6× more "
-                        "independent windows, stronger effective regularisation. "
-                        "stride=12 → 2-h spacing.  Val/test always use stride=1.")
+                   help="Thinning step for --index_mode sliding on the train split. "
+                        "stride=1 (default): every contiguity-valid start. "
+                        "stride=6 → 60-min spacing (W=72: 92%% overlap, ~6× fewer samples). "
+                        "stride=12 → 2-h spacing. Ignored for 'blocks' and 'random' modes. "
+                        "Val/test always use stride=1.")
 
     # Training
-    p.add_argument("--num_delta",    type=int,   default=1)
-    p.add_argument("--epochs",       type=int,   default=100)
+    p.add_argument("--num_delta",    type=int,   default=6)
+    p.add_argument("--epochs",       type=int,   default=50)
     p.add_argument("--lr",           type=float, default=1e-4)
     p.add_argument("--weight_decay", type=float, default=0.05)
     p.add_argument("--warmup_epochs",type=int,   default=5)
@@ -214,7 +227,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",         type=int,   default=42)
 
     # Early stopping
-    p.add_argument("--patience",     type=int,   default=10)
+    p.add_argument("--patience",     type=int,   default=50)
     p.add_argument("--min_delta",    type=float, default=1e-4)
 
     # Checkpointing
@@ -275,6 +288,7 @@ def set_seed(seed: int) -> None:
 
 def main() -> None:
     args = parse_args()
+    args.data_root = "/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset"
 
     # ── Seed ────────────────────────────────────────────────────────────────
     set_seed(args.seed)
@@ -331,6 +345,7 @@ def main() -> None:
         fast_cache_dir=fast_cache_dir,
         exclude_stations=args.exclude_stations,
         train_stride=args.train_stride,
+        index_mode=args.index_mode,
     )
 
     print("Building val dataset …")
@@ -405,6 +420,15 @@ def main() -> None:
         joint_encoder=args.joint_encoder,
     )
 
+    _mode_labels = {
+        "sliding": "C — full sliding window, thinned by train_stride (GraphDOP / default)",
+        "blocks":  "B — greedy non-overlapping windows (PatchTST / iTransformer)",
+        "random":  "A — per-item random sampling with replacement (Aurora / W-MAE)",
+    }
+    print(f"Window strategy          : {args.index_mode}  "
+          f"({_mode_labels[args.index_mode]})")
+    print(f"  → {len(train_ds.indices):,} training windows  "
+          f"(pool={len(train_ds.indices):,} for random; effective for others)")
     if args.train_stride > 1:
         _n_before = len(train_ds.indices) * args.train_stride  # rough estimate
         print(f"Train stride             : {args.train_stride}  "
@@ -482,6 +506,7 @@ def main() -> None:
         "drop_path_rate":      args.drop_path_rate,
         "masked_only_loss":    args.masked_only_loss,
         "joint_encoder":       args.joint_encoder,
+        "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,
         "exclude_stations":    args.exclude_stations or [],
     }

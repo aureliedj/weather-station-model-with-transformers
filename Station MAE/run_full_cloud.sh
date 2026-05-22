@@ -87,14 +87,40 @@ EXCLUDE="--exclude_stations 110"
 #     Standard self-attention over flattened W·N_vis tokens.
 
 # Set ENCODER to one of the three options below:
-#ENCODER=--factorised_encoder --no_spatial_attn"   # current default
-#ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
-ENCODER=""                                         # flat (original)
+ENCODER="--factorised_encoder --no_spatial_attn"   # default: temporal-only factorised
+# ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
+# ENCODER=""                                         # flat self-attention over W·N tokens
 
 # Uncomment to enable local windowed temporal attention (factorised only):
 # W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
 # TEMPORAL_WINDOW="--temporal_window 6"
 TEMPORAL_WINDOW=""
+
+# ── Window sampling strategy ──────────────────────────────────────────────────
+#
+# Controls which windows become training samples (val/test always use
+# "sliding" with stride=1 for consistent evaluation).
+#
+#   sliding  (Strategy C — default, GraphDOP / most baselines)
+#     Every contiguity-valid start, thinned by --train_stride.
+#     DataLoader shuffle gives random-without-replacement epochs.
+#     With W=72 and stride=4: windows every 40 min, ~94% overlap.
+#     Maximum data coverage; use when overfitting is not a concern.
+#
+#   blocks   (Strategy B — PatchTST / iTransformer)
+#     Greedy non-overlapping: no two windows share any input timestep.
+#     W=72 → ~1 window per 12 h → ~3,500 train samples (vs ~260K sliding).
+#     Cleanest gradient signal; useful for fast ablation runs.
+#
+#   random   (Strategy A — Aurora / W-MAE / VideoMAE)
+#     Full pool stored; each __getitem__ samples independently at random
+#     (with replacement).  Different windows every epoch, no systematic
+#     coverage bias.  --train_stride is ignored in this mode.
+#     Best default when combined with a large pool and many epochs.
+
+INDEX_MODE="--index_mode sliding --train_stride 4"
+# INDEX_MODE="--index_mode blocks"
+# INDEX_MODE="--index_mode random"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -111,7 +137,6 @@ python main.py \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --dropout          0.15 \
-    --train_stride     4 \
     --drop_path_rate   0.10 \
     --batch_size       32 \
     --num_workers      5 \
@@ -131,6 +156,7 @@ python main.py \
     --cross_attn_decoder \
     $ENCODER \
     $TEMPORAL_WINDOW \
+    $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   baseline-cloud \
