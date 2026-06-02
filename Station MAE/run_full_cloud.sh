@@ -92,10 +92,24 @@ EXCLUDE="--exclude_stations 110"
 # ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
 ENCODER=""                                         # flat self-attention over W·N tokens
 
-# Uncomment to enable local windowed temporal attention (factorised only):
-# W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
-# TEMPORAL_WINDOW="--temporal_window 6"
-TEMPORAL_WINDOW=""
+# ── Temporal window (flat or factorised encoder) ─────────────────────────────
+#
+# Splits W timesteps into non-overlapping chunks of size tw.
+# Odd layers use a Swin-style half-window shift for cross-chunk communication.
+#
+# Flat encoder (current default):
+#   Full cross-station attention within each tw×N_vis chunk.
+#   W=72, tw=6, N_vis≈65 → 390 tokens/chunk  (144× cheaper than full flat)
+#   Recommended d_model: 512  mlp_ratio: 4.0
+#   TEMPORAL_WINDOW="--temporal_window 6"
+#
+# Factorised encoder:
+#   Windowed temporal-only attention within each station's tw-step window.
+#   W=72, tw=6 → 12 one-hour chunks, 12× cheaper temporal sub-layer.
+#   TEMPORAL_WINDOW="--temporal_window 6"
+#
+TEMPORAL_WINDOW="--temporal_window 6"
+# TEMPORAL_WINDOW=""   # ← disable windowing (full attention)
 
 # ── Window sampling strategy ──────────────────────────────────────────────────
 #
@@ -149,7 +163,7 @@ python main.py \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --val_check_interval 100 \
+    --limit_val_batches  200 \
     --save_every       2 \
     --patience         50 \
     --min_lr           1e-6 \

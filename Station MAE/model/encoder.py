@@ -501,6 +501,140 @@ class JointSpatioTemporalBlock(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Windowed flat attention block
+# ---------------------------------------------------------------------------
+
+class WindowedFlatTransformerBlock(nn.Module):
+    """
+    Flat self-attention restricted to local temporal windows over (B, W, N, d).
+
+    Instead of attending over all W×N tokens at once (O((W·N)²) pairs), the
+    W timesteps are split into non-overlapping chunks of size ``temporal_window``
+    (tw).  All N station tokens within each chunk attend to each other jointly —
+    preserving the full cross-station context that factorised attention splits
+    into two separate sub-layers.
+
+    Chunk sequence length:  L_chunk = tw × N_vis
+    Attention pairs / chunk: L_chunk² = (tw × N_vis)²
+    Number of chunks:        W / tw
+
+    Example  W=72, tw=6, N_vis=65:
+        L_chunk = 390  (≈ BERT)  → 152K pairs vs 21.9M for full flat  (144× cheaper)
+
+    Cross-chunk communication uses a Swin-style half-window circular shift:
+    even layers use no shift; odd layers shift the temporal axis by tw//2 so
+    that chunk boundaries alternate, letting information propagate across them
+    after two successive layers.
+
+    Args:
+        d_model:          Model dimension.
+        num_heads:        Attention heads.
+        mlp_ratio:        FFN hidden-dim ratio (default 4.0).
+        dropout:          Dropout in FFN and attention (default 0.1).
+        temporal_window:  Chunk size in timesteps (tw).  W must be divisible by tw.
+        shift:            If True apply a tw//2 circular shift before chunking
+                          (Swin-style).  Alternate layers should alternate shift.
+        drop_path:        Stochastic depth drop probability (default 0.0).
+    """
+
+    def __init__(
+        self,
+        d_model:          int,
+        num_heads:         int,
+        mlp_ratio:         float = 4.0,
+        dropout:           float = 0.1,
+        temporal_window:   int   = 6,
+        shift:             bool  = False,
+        drop_path:         float = 0.0,
+    ):
+        super().__init__()
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert temporal_window > 0,      "temporal_window must be > 0"
+
+        self.temporal_window = temporal_window
+        self.shift           = shift
+        self.num_heads       = num_heads
+        self.head_dim        = d_model // num_heads
+        self.attn_dropout    = dropout
+
+        # ── Pre-norm ────────────────────────────────────────────────────────────
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+        # ── Manual Q/K/V projections for Flash Attention compatibility ───────────
+        # (F.scaled_dot_product_attention requires explicit tensors)
+        self.q_proj   = nn.Linear(d_model, d_model)
+        self.k_proj   = nn.Linear(d_model, d_model)
+        self.v_proj   = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        # ── FFN ──────────────────────────────────────────────────────────────────
+        hidden = int(d_model * mlp_ratio)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, hidden),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, d_model),
+            nn.Dropout(dropout),
+        )
+
+        # ── Stochastic depth ─────────────────────────────────────────────────────
+        self.drop_path = DropPath(drop_path)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, W, N, d_model)
+        Returns:
+            (B, W, N, d_model)
+        """
+        B, W, N, D = x.shape
+        tw = self.temporal_window
+        assert W % tw == 0, (
+            f"temporal_window={tw} must divide W={W} exactly. "
+            f"Choose a value that divides your --window size."
+        )
+        num_chunks = W // tw
+        shift_size = tw // 2 if self.shift else 0
+
+        # ── Swin-style half-window circular shift along temporal axis ────────────
+        if shift_size > 0:
+            x = torch.roll(x, shifts=-shift_size, dims=1)
+
+        # ── Chunk: (B, W, N, D) → (B·chunks, tw·N, D) ──────────────────────────
+        # Reshape temporal dimension into (num_chunks, tw), then flatten tw and N.
+        h = x.reshape(B * num_chunks, tw * N, D)
+
+        # ── Flat self-attention within each chunk (Flash Attention) ──────────────
+        h_n = self.norm1(h)
+        H, hd, L = self.num_heads, self.head_dim, tw * N
+        BnC = B * num_chunks
+
+        Q = self.q_proj(h_n).reshape(BnC, L, H, hd).transpose(1, 2)   # (BnC, H, L, hd)
+        K = self.k_proj(h_n).reshape(BnC, L, H, hd).transpose(1, 2)
+        V = self.v_proj(h_n).reshape(BnC, L, H, hd).transpose(1, 2)
+
+        dp = self.attn_dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(Q, K, V, dropout_p=dp)
+        attn_out = attn_out.transpose(1, 2).reshape(BnC, L, D)
+        attn_out = self.out_proj(attn_out)
+
+        h = h + self.drop_path(attn_out)
+
+        # ── FFN ──────────────────────────────────────────────────────────────────
+        h = h + self.drop_path(self.ffn(self.norm2(h)))
+
+        # ── Un-chunk: (B·chunks, tw·N, D) → (B, W, N, D) ───────────────────────
+        x = h.reshape(B, W, N, D)
+
+        # ── Undo temporal shift ──────────────────────────────────────────────────
+        if shift_size > 0:
+            x = torch.roll(x, shifts=shift_size, dims=1)
+
+        return x
+
+
+# ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
 
@@ -586,6 +720,9 @@ class StationMAEEncoder(nn.Module):
         self.use_checkpoint  = use_checkpoint
         self.factorised      = factorised and not joint
         self.joint           = joint
+        # Windowed flat: full cross-station attention within temporal chunks.
+        # Active when temporal_window > 0 and neither joint nor factorised.
+        self.windowed_flat   = (temporal_window > 0) and not joint and not factorised
 
         # --- Learnable sensor mask token (ViT-MAE style) ---
         # When a sensor is absent (x_mask == 0), the raw observation is 0.0
@@ -644,12 +781,27 @@ class StationMAEEncoder(nn.Module):
                     d_model, num_heads, mlp_ratio, dropout,
                     spatial_attn=spatial_attn,
                     temporal_window=temporal_window,
-                    shift=(i % 2 == 1),   # alternate shift: even=no-shift, odd=shifted
+                    shift=(i % 2 == 1),
+                    drop_path=dp_rates[i],
+                )
+                for i in range(num_layers)
+            ])
+        elif temporal_window > 0:
+            # Windowed flat: full cross-station attention within temporal chunks.
+            # Each chunk contains tw × N_vis tokens; attention is O((tw·N)²) per
+            # chunk vs O((W·N)²) for full flat.  Swin shift on odd layers bridges
+            # chunk boundaries after two layers.
+            self.blocks = nn.ModuleList([
+                WindowedFlatTransformerBlock(
+                    d_model, num_heads, mlp_ratio, dropout,
+                    temporal_window=temporal_window,
+                    shift=(i % 2 == 1),
                     drop_path=dp_rates[i],
                 )
                 for i in range(num_layers)
             ])
         else:
+            # Full flat: standard self-attention over all W·N_vis tokens.
             self.blocks = nn.ModuleList([
                 TransformerBlock(d_model, num_heads, mlp_ratio, dropout,
                                  drop_path=dp_rates[i])
@@ -786,13 +938,15 @@ class StationMAEEncoder(nn.Module):
         B_sz, W_sz, N_vis, D = visible_tokens.shape
 
         # 3. Transformer blocks
-        # ── Joint path:      keep (B, W, N_vis, d) through JointSpatioTemporalBlocks
+        # ── Joint path:         keep (B, W, N_vis, d) through JointSpatioTemporalBlocks
         #    (full W×N attention with temporal RoPE), then flatten to (B, W*N_vis, d).
-        # ── Factorised path: keep (B, W, N_vis, d) through FactorisedTransformerBlocks
+        # ── Factorised path:    keep (B, W, N_vis, d) through FactorisedTransformerBlocks
         #    then flatten to (B, W*N_vis, d) for the decoder interface.
-        # ── Flat path:       flatten first to (B, W*N_vis, d) then run TransformerBlocks.
+        # ── Windowed flat path: keep (B, W, N_vis, d) through WindowedFlatTransformerBlocks
+        #    (full attention within tw×N_vis chunks), then flatten.
+        # ── Full flat path:     flatten first to (B, W*N_vis, d) then run TransformerBlocks.
         # All paths use gradient checkpointing when use_checkpoint=True.
-        if self.joint or self.factorised:
+        if self.joint or self.factorised or self.windowed_flat:
             h = visible_tokens                                     # (B, W, N_vis, d_model)
             for block in self.blocks:
                 if self.use_checkpoint and torch.is_grad_enabled():

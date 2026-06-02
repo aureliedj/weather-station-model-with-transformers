@@ -146,12 +146,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--factorised_encoder",  action="store_true",
                    help="Axial attention in encoder (~100× cheaper at W=288)")
     p.add_argument("--temporal_window",     type=int, default=0,
-                   help="Local temporal attention window size in timesteps (0 = full). "
-                        "W must be divisible by this value. Odd encoder layers use a "
-                        "Swin-style half-window shift so tokens can communicate across "
-                        "chunk boundaries after two layers. Only applies with "
-                        "--factorised_encoder. Example: --window 72 --temporal_window 6 "
-                        "gives 12 one-hour chunks, 12x cheaper temporal attention.")
+                   help="Local temporal window size in timesteps (0 = full attention). "
+                        "W must be exactly divisible by this value. Odd encoder layers "
+                        "use a Swin-style half-window shift so tokens communicate across "
+                        "chunk boundaries after two layers.\n"
+                        "  Flat encoder (default): full cross-station attention within "
+                        "each tw×N_vis chunk. W=72, tw=6, N_vis=65 → 390 tokens/chunk, "
+                        "144× cheaper than full flat. Supports d_model=512+.\n"
+                        "  Factorised encoder: windowed temporal-only attention within "
+                        "each station's tw-step chunk. Spatial sub-layer unchanged.\n"
+                        "Example: --window 72 --temporal_window 6")
     p.add_argument("--no_spatial_attn",     action="store_true",
                    help="Disable spatial attention sub-layer in factorised encoder blocks. "
                         "Each station is encoded independently from its own temporal window; "
@@ -283,6 +287,11 @@ def parse_args() -> argparse.Namespace:
                    help="Cap training to N batches per epoch (0 = unlimited, default). "
                         "Useful with --profiler to run a short representative trace "
                         "without waiting for a full epoch.")
+    p.add_argument("--limit_val_batches", type=int, default=0,
+                   help="Cap validation to N batches per check (0 = full val set). "
+                        "Useful when the val set is much larger than the train epoch "
+                        "(e.g. random mode with small epoch size). "
+                        "Example: --limit_val_batches 200 evaluates 6,400 samples.")
 
     return p.parse_args()
 
@@ -698,6 +707,10 @@ def main() -> None:
         _trainer_kwargs["limit_train_batches"] = args.limit_train_batches
         print(f"limit_train_batches      : {args.limit_train_batches}  "
               f"(mini run — full epoch would be ~{len(train_loader)} batches)")
+    if args.limit_val_batches > 0:
+        _trainer_kwargs["limit_val_batches"] = args.limit_val_batches
+        print(f"limit_val_batches        : {args.limit_val_batches}  "
+              f"({args.limit_val_batches * args.batch_size:,} val samples per check)")
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
