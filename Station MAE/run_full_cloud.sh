@@ -87,10 +87,10 @@ EXCLUDE="--exclude_stations 110"
 #     Standard self-attention over flattened W·N_vis tokens.
 
 # Set ENCODER to one of the three options below:
-ENCODER="--factorised_encoder"                     # default: full axial (temporal + spatial)
+# ENCODER="--factorised_encoder"                     # default: full axial (temporal + spatial)
 # ENCODER="--factorised_encoder --no_spatial_attn"  # temporal-only (station-independent encoder)
 # ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
-# ENCODER=""                                         # flat self-attention over W·N tokens
+ ENCODER=""                                         # flat self-attention over W·N tokens
 
 # Uncomment to enable local windowed temporal attention (factorised only):
 # W=144 / tw=6 → 24 one-hour chunks; score computation drops 24×.
@@ -119,9 +119,9 @@ TEMPORAL_WINDOW=""
 #     coverage bias.  --train_stride is ignored in this mode.
 #     Best default when combined with a large pool and many epochs.
 
-INDEX_MODE="--index_mode sliding --train_stride 4"
+# INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
-# INDEX_MODE="--index_mode random"
+INDEX_MODE="--index_mode random"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
