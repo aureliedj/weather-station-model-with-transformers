@@ -108,7 +108,7 @@ ENCODER=""                                         # flat self-attention over W�
 #   W=72, tw=6 → 12 one-hour chunks, 12× cheaper temporal sub-layer.
 #   TEMPORAL_WINDOW="--temporal_window 6"
 #
-TEMPORAL_WINDOW="--temporal_window 6"
+TEMPORAL_WINDOW="--temporal_window 12"
 # TEMPORAL_WINDOW=""   # ← disable windowing (full attention)
 
 # ── Window sampling strategy ──────────────────────────────────────────────────
@@ -150,7 +150,7 @@ python main.py \
     --delta_mode       fixed_grid \
     --delta_grid_stride 3 \
     --mlp_ratio        4.0 \
-    --d_model          512 \
+    --d_model          1024 \
     --enc_layers       6 \
     --dec_layers       4 \
     --mask_ratio       0.5 \
