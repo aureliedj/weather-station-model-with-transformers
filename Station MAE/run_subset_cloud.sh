@@ -1,9 +1,9 @@
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"   # ← update this
-SAVE_DIR="checkpoints/run_subset_cloud"
+
 
 python main.py \
     --data_root "$DATA_ROOT" \
-    --cache_dir "$SAVE_DIR" \
+    --cache_dir "$DATA_ROOT" \
     --window 72 \
     --max_delta 36 \
     --delta_mode fixed_grid \
