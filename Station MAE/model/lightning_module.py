@@ -163,15 +163,21 @@ class StationMAELightning(pl.LightningModule):
         self.log("val/loss", loss, on_epoch=True, prog_bar=True, sync_dist=True)
 
         # ── Per-variable std for unnormalization ────────────────────────
-        # obs_stats_std is a list[float] of length num_vars stored in cfg by main.py.
-        # If absent (old checkpoints), we fall back to 1.0 (metrics stay normalized).
-        _obs_std_list = self.cfg.get("obs_stats_std", None)
-        if _obs_std_list is not None:
-            obs_std = torch.tensor(
-                _obs_std_list[:NUM_TARGET_VARIABLES],
-                dtype=preds_all.dtype,
-                device=preds_all.device,
-            )  # (V,)
+        # obs_stats_std is stored in cfg by main.py.
+        # Old format: list[float] of length V  → (V,) tensor
+        # New format: (N, V) nested list       → mean across stations for monitoring
+        # If absent (old checkpoints), fall back to 1.0 (metrics stay normalised).
+        _obs_std_raw = self.cfg.get("obs_stats_std", None)
+        if _obs_std_raw is not None:
+            _std_t = torch.tensor(_obs_std_raw, dtype=preds_all.dtype,
+                                  device=preds_all.device)
+            if _std_t.dim() == 2:
+                # (N, V) per-station stats — average over stations for a single
+                # representative std per variable (used only for monitoring)
+                obs_std = _std_t.mean(dim=0)[:NUM_TARGET_VARIABLES]   # (V,)
+            else:
+                # Legacy (V,) global stats — use directly
+                obs_std = _std_t[:NUM_TARGET_VARIABLES]                # (V,)
         else:
             obs_std = None
 

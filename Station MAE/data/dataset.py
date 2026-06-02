@@ -218,27 +218,41 @@ def normalise_observations(
     mask: torch.Tensor,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Normalise each variable to zero-mean unit-variance using only present values.
+    Normalise each (station, variable) pair to zero-mean unit-variance using
+    only present values for that specific station and variable.
+
+    Per-station normalisation (vs. global per-variable) removes the systematic
+    altitude-driven offset so that every station's distribution is centred at
+    zero — the model learns the inter-station differences purely from the spatial
+    and topographic embeddings rather than the raw signal level.
 
     Args:
         obs:  (T, N, V) raw observations (0.0 where absent)
-        mask: (T, N, V) presence mask
+        mask: (T, N, V) presence mask (1.0 present, 0.0 absent)
 
     Returns:
-        obs_norm : (T, N, V) normalised
-        stats    : {"mean": (V,), "std": (V,)}
+        obs_norm : (T, N, V) normalised (absent values zeroed)
+        stats    : {"mean": (N, V), "std": (N, V)}
     """
-    means, stds = [], []
-    obs_norm = obs.clone()
-    for v in range(NUM_VARIABLES):
-        vals = obs[:, :, v][mask[:, :, v] == 1.0]
-        m    = vals.mean()
-        s    = vals.std().clamp(min=1e-6)
-        obs_norm[:, :, v] = (obs[:, :, v] - m) / s
-        obs_norm[:, :, v] *= mask[:, :, v]
-        means.append(m)
-        stds.append(s)
-    return obs_norm, {"mean": torch.stack(means), "std": torch.stack(stds)}
+    T, N, V = obs.shape
+
+    # Number of present timesteps per (station, variable)
+    count = mask.sum(dim=0).clamp(min=1.0)                       # (N, V)
+
+    # Per-(station, variable) mean over present values
+    # Absent values are 0 in obs, so obs*mask correctly ignores them
+    means = (obs * mask).sum(dim=0) / count                       # (N, V)
+
+    # Per-(station, variable) std: E[(x - mu)^2] over present values
+    diff_sq = ((obs - means.unsqueeze(0)) ** 2) * mask            # (T, N, V)
+    stds    = (diff_sq.sum(dim=0) / count.clamp(min=2.0)).sqrt()  # (N, V)
+    stds    = stds.clamp(min=1e-6)
+
+    # Normalise and zero-out absent entries
+    obs_norm = (obs - means.unsqueeze(0)) / stds.unsqueeze(0)     # (T, N, V)
+    obs_norm = obs_norm * mask                                     # zero absent
+
+    return obs_norm, {"mean": means, "std": stds}
 
 
 def compute_obs_stats(
@@ -289,10 +303,12 @@ _CACHE_FILENAME = "peakweather_obs_cache.pt"
 # Fast local cache  (numpy memmap — direct worker access, no IPC overhead)
 # ---------------------------------------------------------------------------
 
-_FAST_CACHE_VERSION = "v2"
+_FAST_CACHE_VERSION = "v3"
 # Bump this when the on-disk format changes to force a rebuild.
 # v2: stores "all_valid_indices" (pre-mode pool) instead of post-stride
 #     "indices", so the windowing strategy can be changed without rebuilding.
+# v3: obs_stats["mean"] / ["std"] are now (N, V) per-station-per-variable
+#     tensors instead of (V,) global tensors.
 
 
 def _fast_split_paths(fast_dir: str, split: str, train_years: list) -> dict:
@@ -522,6 +538,9 @@ class StationMAEDataset(Dataset):
         samples uniformly at random from the pool on every call.  Gives
         per-item independent sampling (with replacement) — different windows
         every epoch with no systematic coverage bias.
+        Epoch length is controlled by ``random_epoch_size`` (default:
+        ``len(pool) // window_size`` ≈ number of non-overlapping blocks)
+        to avoid oversampling the pool.
 
     Data loading optimisations
     --------------------------
@@ -539,7 +558,7 @@ class StationMAEDataset(Dataset):
         delta_steps:          Fixed lead-time in 10-min steps (default 18 = 3 h).
                               Used as-is when max_delta_steps is None.
         split:                "train", "val", or "test".
-        obs_stats:            Normalisation stats dict {"mean": (V,), "std": (V,)}.
+        obs_stats:            Normalisation stats dict {"mean": (N, V), "std": (N, V)}.
                               If None, computed from training years of obs_full.
                               Always pass training-split stats to val/test splits
                               to prevent data leakage.
@@ -565,6 +584,20 @@ class StationMAEDataset(Dataset):
         train_stride:         Uniform thinning step applied to the "sliding" train
                               index list (1 = every start, 6 = hourly, 12 = 2-h).
                               Ignored for "blocks" and "random" modes.
+        delta_mode:           How lead-times are selected per sample.
+                              ``"fixed_grid"`` (default): always return K targets at
+                              uniformly-spaced horizons 0, delta_grid_stride,
+                              2·delta_grid_stride, …, max_delta_steps steps.
+                              E.g. max_delta=36, stride=3 → 0, 30 min, 1 h, … 6 h
+                              (K=13).  The encoder runs once; the decoder runs K times.
+                              ``"random"``: each call draws num_delta_per_sample
+                              distinct lead-times uniformly from [1, max_delta_steps].
+        delta_grid_stride:    Spacing between fixed-grid horizons in 10-min steps
+                              (default 3 = 30 min).  Only used when delta_mode="fixed_grid".
+        random_epoch_size:    Number of samples per epoch when index_mode="random".
+                              Default: len(pool) // window_size (≈ non-overlapping blocks).
+                              Tune upward if the model under-trains, downward to cut
+                              epoch time.
     """
 
     def __init__(
@@ -583,6 +616,9 @@ class StationMAEDataset(Dataset):
         exclude_stations:     "list | None" = None,
         train_stride:         int  = 1,
         index_mode:           str  = "sliding",
+        delta_mode:           str  = "fixed_grid",
+        delta_grid_stride:    int  = 3,
+        random_epoch_size:    "int | None" = None,
     ):
         super().__init__()
 
@@ -597,6 +633,10 @@ class StationMAEDataset(Dataset):
         assert index_mode in ("sliding", "blocks", "random"), (
             f"index_mode must be 'sliding', 'blocks', or 'random', got '{index_mode}'"
         )
+        assert delta_mode in ("fixed_grid", "random"), (
+            f"delta_mode must be 'fixed_grid' or 'random', got '{delta_mode}'"
+        )
+        assert delta_grid_stride >= 1, "delta_grid_stride must be >= 1"
 
         self.window_size          = window_size
         self.delta_steps          = delta_steps
@@ -604,10 +644,19 @@ class StationMAEDataset(Dataset):
         self.num_delta_per_sample = num_delta_per_sample
         self.train_stride         = train_stride
         self.index_mode           = index_mode
+        self.delta_mode           = delta_mode
+        self.delta_grid_stride    = delta_grid_stride
         # Effective upper bound on lead-time — governs valid index calculation
         # and random sampling in __getitem__
         self.max_delta_steps = max_delta_steps if max_delta_steps is not None \
                                else delta_steps
+
+        # Fixed-grid lead-times: 0, stride, 2·stride, …, max_delta_steps
+        # E.g. max_delta=36, stride=3 → [0, 3, 6, …, 36]  (K=13 horizons)
+        if delta_mode == "fixed_grid":
+            self.delta_grid = list(range(0, self.max_delta_steps + 1, delta_grid_stride))
+        else:
+            self.delta_grid = []
 
         effective_train_years = train_years if train_years is not None else TRAIN_YEARS
 
@@ -643,9 +692,14 @@ class StationMAEDataset(Dataset):
 
                 # Apply windowing strategy to the pre-mode pool stored in cache.
                 # Mode can be changed freely without rebuilding the cache.
+                _all_valid = cached["meta"]["all_valid_indices"]
                 self.indices = StationMAEDataset._apply_index_mode(
-                    cached["meta"]["all_valid_indices"],
-                    window_size, train_stride, index_mode, split,
+                    _all_valid, window_size, train_stride, index_mode, split,
+                )
+                # Epoch size for random strategy
+                self._random_epoch_size = (
+                    random_epoch_size if random_epoch_size is not None
+                    else max(1, len(_all_valid) // window_size)
                 )
 
                 # Keep numpy mmap arrays alive (torch.from_numpy holds a weak ref
@@ -756,12 +810,15 @@ class StationMAEDataset(Dataset):
 
         # ------------------------------------------------------------------
         # 4. Normalise split observations using training-split statistics
+        #
+        # obs_stats["mean"] / ["std"] are (N, V) per-station-per-variable
+        # tensors.  Broadcasting: (T, N, V) - (1, N, V) / (1, N, V).
+        # Absent values (mask==0) are zeroed after normalisation so the
+        # learnable sensor_mask_token in the encoder can fill them cleanly.
         # ------------------------------------------------------------------
-        obs_norm = obs.clone()
-        for v in range(NUM_VARIABLES):
-            obs_norm[:, :, v] = (
-                (obs[:, :, v] - self.obs_stats["mean"][v]) / self.obs_stats["std"][v]
-            ) * mask[:, :, v]
+        obs_norm = (obs - self.obs_stats["mean"].unsqueeze(0)) \
+                   / self.obs_stats["std"].unsqueeze(0)          # (T, N, V)
+        obs_norm = obs_norm * mask                               # zero absent
 
         # Optionally place tensors in shared memory so DataLoader workers share
         # the pages rather than each forking a private copy.
@@ -841,6 +898,12 @@ class StationMAEDataset(Dataset):
         # Apply chosen windowing strategy (see _apply_index_mode docstring).
         self.indices = StationMAEDataset._apply_index_mode(
             all_valid, window_size, train_stride, index_mode, split,
+        )
+        # Epoch size for random strategy: default = number of non-overlapping blocks
+        # in the pool, which covers the data without oversampling.
+        self._random_epoch_size = (
+            random_epoch_size if random_epoch_size is not None
+            else max(1, len(all_valid) // window_size)
         )
 
         # ------------------------------------------------------------------
@@ -997,12 +1060,20 @@ class StationMAEDataset(Dataset):
 
         Uses advanced indexing which always returns a new contiguous tensor,
         so the result is safe regardless of the backing storage (mmap or RAM).
+
+        Sets ``self._keep_indices`` (LongTensor of kept positions in the
+        original N_full station list) so callers can slice obs_stats for
+        logging / unnormalization in physical units.
         """
         keep_t       = torch.tensor(keep, dtype=torch.long)
+        self._keep_indices = keep_t                              # (N_keep,)
         n_before     = self.obs.shape[1]
         self.obs     = self.obs    [:, keep_t, :].contiguous()
         self.mask    = self.mask   [:, keep_t, :].contiguous()
         self.spatial = self.spatial[keep_t, :]   .contiguous()
+        # obs_stats is intentionally kept at (N_full, V) for fast-cache
+        # compatibility when val/test compare against train_ds.obs_stats.
+        # Callers that need per-kept-station stats should index via _keep_indices.
         dropped      = n_before - len(keep)
         if dropped > 0:
             print(
@@ -1016,6 +1087,10 @@ class StationMAEDataset(Dataset):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
+        # Random strategy: return a fixed epoch size rather than the full pool
+        # to avoid oversampling (the pool has high temporal overlap).
+        if self.index_mode == "random" and self.split == "train":
+            return self._random_epoch_size
         return len(self.indices)
 
     def __getitem__(self, idx: int) -> dict:
@@ -1027,7 +1102,6 @@ class StationMAEDataset(Dataset):
         else:
             i = self.indices[idx]
         W = self.window_size
-        K = self.num_delta_per_sample
 
         # ── Input window — shared across all K targets ─────────────────
         # .clone() gives each slice its own storage rather than a view of the
@@ -1039,10 +1113,33 @@ class StationMAEDataset(Dataset):
         x_hours = self.hours[i : i + W].clone()   # (W,)
 
         # ── Target snapshot(s) ─────────────────────────────────────────
+
+        # ── Fixed-grid mode: always return the full horizon grid ───────
+        # K targets at 0, stride, 2·stride, …, max_delta_steps steps.
+        # E.g. stride=3, max=36 → [0, 3, 6, …, 36], K=13.
+        # delta=0 is the reconstruction target (last input timestep).
+        if self.delta_mode == "fixed_grid":
+            ys, y_masks, y_hrs = [], [], []
+            for dt in self.delta_grid:
+                t_idx = i + W - 1 + dt
+                ys.append(self.obs[t_idx])
+                y_masks.append(self.mask[t_idx])
+                y_hrs.append(self.hours[t_idx])
+            return {
+                "x":           x,
+                "x_mask":      x_mask,
+                "x_hours":     x_hours,
+                "y":           torch.stack(ys),                                # (K, N, V)
+                "y_mask":      torch.stack(y_masks),                           # (K, N, V)
+                "y_hours":     torch.stack(y_hrs),                             # (K,)
+                "spatial":     self.spatial,                                   # (N, 15)
+                "delta_steps": torch.tensor(self.delta_grid, dtype=torch.long),  # (K,)
+            }
+
+        # ── Random delta mode (legacy / ablation) ─────────────────────
+        K = self.num_delta_per_sample
         if K == 1:
             # Single lead-time per sample
-            # Random mode  : max_delta_steps != fixed delta_steps
-            # Fixed mode   : both equal (original behaviour)
             if self.max_delta_steps != self.delta_steps:
                 dt = int(torch.randint(1, self.max_delta_steps + 1, ()).item())
             else:
@@ -1064,10 +1161,8 @@ class StationMAEDataset(Dataset):
             # Multi-delta: K distinct lead-times from [1, max_delta_steps]
             max_dt = self.max_delta_steps
             if K <= max_dt:
-                # Guarantee distinct values via randperm
                 deltas, _ = (torch.randperm(max_dt)[:K] + 1).sort()
             else:
-                # More deltas than range — allow repeats
                 deltas, _ = torch.randint(1, max_dt + 1, (K,)).sort()
 
             ys, y_masks, y_hrs = [], [], []

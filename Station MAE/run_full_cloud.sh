@@ -87,7 +87,8 @@ EXCLUDE="--exclude_stations 110"
 #     Standard self-attention over flattened W·N_vis tokens.
 
 # Set ENCODER to one of the three options below:
-ENCODER="--factorised_encoder --no_spatial_attn"   # default: temporal-only factorised
+ENCODER="--factorised_encoder"                     # default: full axial (temporal + spatial)
+# ENCODER="--factorised_encoder --no_spatial_attn"  # temporal-only (station-independent encoder)
 # ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
 # ENCODER=""                                         # flat self-attention over W·N tokens
 
@@ -130,11 +131,12 @@ python main.py \
     --local_cache_dir  "$LOCAL_CACHE" \
     --window           72 \
     --max_delta        36 \
-    --num_delta        6 \
+    --delta_mode       fixed_grid \
+    --delta_grid_stride 3 \
     --mlp_ratio        2.0 \
     --d_model          128 \
     --enc_layers       6 \
-    --dec_layers       2 \
+    --dec_layers       4 \
     --mask_ratio       0.5 \
     --dropout          0.15 \
     --drop_path_rate   0.10 \

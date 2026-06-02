@@ -33,7 +33,7 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"   # ← update this
-SAVE_DIR="checkpoints/profile_run"
+SAVE_DIR="$(cd "$(dirname "$0")" && pwd)/checkpoints/profile_run"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 EXCLUDE="--exclude_stations 110"

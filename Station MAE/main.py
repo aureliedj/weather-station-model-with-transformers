@@ -201,6 +201,23 @@ def parse_args() -> argparse.Namespace:
                         "stride=12 → 2-h spacing. Ignored for 'blocks' and 'random' modes. "
                         "Val/test always use stride=1.")
 
+    # Delta / lead-time configuration
+    p.add_argument("--delta_mode", type=str, default="fixed_grid",
+                   choices=["fixed_grid", "random"],
+                   help="Lead-time selection mode.\n"
+                        "  fixed_grid (default): every sample returns K targets at\n"
+                        "    0, delta_grid_stride, …, max_delta steps (every 30 min\n"
+                        "    up to 6 h with max_delta=36, stride=3 → K=13).\n"
+                        "    Encoder runs once; decoder runs K times per sample.\n"
+                        "  random: num_delta distinct lead-times drawn uniformly\n"
+                        "    from [1, max_delta] per sample (legacy behaviour).")
+    p.add_argument("--delta_grid_stride", type=int, default=3,
+                   help="Spacing between fixed-grid horizons in 10-min steps "
+                        "(default 3 = 30 min).  Only used with --delta_mode fixed_grid.")
+    p.add_argument("--random_epoch_size", type=int, default=None,
+                   help="Epoch length when --index_mode random is used (default: "
+                        "len(pool) // window_size ≈ number of non-overlapping blocks). "
+                        "Increase to see more samples per epoch; decrease to cut epoch time.")
     # Training
     p.add_argument("--num_delta",    type=int,   default=6)
     p.add_argument("--epochs",       type=int,   default=50)
@@ -346,6 +363,9 @@ def main() -> None:
         exclude_stations=args.exclude_stations,
         train_stride=args.train_stride,
         index_mode=args.index_mode,
+        delta_mode=args.delta_mode,
+        delta_grid_stride=args.delta_grid_stride,
+        random_epoch_size=args.random_epoch_size,
     )
 
     print("Building val dataset …")
@@ -355,20 +375,29 @@ def main() -> None:
         delta_steps=args.max_delta,
         split="val",
         obs_stats=train_ds.obs_stats,       # always normalise with train-split stats
-        num_delta_per_sample=1,             # single-delta for consistent val metrics
+        num_delta_per_sample=1,
         max_delta_steps=args.max_delta,
         cache_dir=cache_dir,
         train_years=train_years,
         shared_memory=False,
         fast_cache_dir=fast_cache_dir,
         exclude_stations=args.exclude_stations,
+        delta_mode=args.delta_mode,
+        delta_grid_stride=args.delta_grid_stride,
     )
 
+    # K = number of lead-times per sample
+    _K = len(train_ds.delta_grid) if args.delta_mode == "fixed_grid" else args.num_delta
     print(f"  train: {len(train_ds):,} samples  "
           f"(years {train_years[0]}–{train_years[-1]})  |  "
           f"val: {len(val_ds):,} samples")
-    print(f"  num_delta (K) = {args.num_delta}  |  max_delta = {args.max_delta} steps "
-          f"({args.max_delta * 10 // 60} h {args.max_delta * 10 % 60} min lead-time)")
+    if args.delta_mode == "fixed_grid":
+        _grid_h = [f"{dt*10//60}h{dt*10%60:02d}" if dt > 0 else "0" for dt in train_ds.delta_grid]
+        print(f"  delta_mode = fixed_grid  |  K={_K}  |  "
+              f"horizons: {', '.join(_grid_h)}")
+    else:
+        print(f"  num_delta (K) = {args.num_delta}  |  max_delta = {args.max_delta} steps "
+              f"({args.max_delta * 10 // 60} h {args.max_delta * 10 % 60} min lead-time)")
 
     _use_cuda     = torch.cuda.is_available()
     _persistent   = (args.num_workers > 0)
@@ -472,10 +501,20 @@ def main() -> None:
             print("torch.compile            : ON  (default mode, MIG-safe) "
                   "— first epoch warm-up ~1-2 min, then ~1.3-1.5× faster")
 
-    # Pass per-variable normalisation statistics into cfg so that
+    # Pass per-station normalisation statistics into cfg so that
     # lightning_module.py can log physically-unnormalized val metrics.
-    # obs_stats["std"] shape: (num_variables,) — index matches TARGET_VARIABLE_NAMES.
+    # obs_stats["mean"] / ["std"] shape: (N_full, V) per-station-per-variable.
+    # After station exclusion, obs_stats stays at N_full for cache compatibility;
+    # we slice to the kept stations here using _keep_indices set by exclusion.
     _obs_stats = train_ds.obs_stats
+    _keep = getattr(train_ds, "_keep_indices", None)
+    if _keep is not None and _obs_stats["std"].dim() == 2:
+        _obs_stats_kept = {
+            "mean": _obs_stats["mean"][_keep],
+            "std":  _obs_stats["std"][_keep],
+        }
+    else:
+        _obs_stats_kept = _obs_stats
     cfg = {
         "lr":                  args.lr,
         "min_lr":              args.min_lr,
@@ -483,9 +522,12 @@ def main() -> None:
         "epochs":              args.epochs,
         "warmup_epochs":       args.warmup_epochs,
         "log_every_n_steps":   args.log_every_n_steps,
-        # Normalisation stats for unnormalized WandB metrics
-        "obs_stats_std":       _obs_stats["std"].tolist(),   # list[float], len=num_vars
-        "obs_stats_mean":      _obs_stats["mean"].tolist(),  # stored for test.py use
+        # Normalisation stats for physically-unnormalized WandB metrics.
+        # Now (N_keep, V) per-station-per-variable; lightning_module averages
+        # over stations for a single monitoring std per variable.
+        "obs_stats_std":       _obs_stats_kept["std"].tolist(),   # (N_keep, V) nested list
+        "obs_stats_mean":      _obs_stats_kept["mean"].tolist(),  # (N_keep, V) nested list
+        "num_stations":        _obs_stats_kept["std"].shape[0],   # N_keep
         # Informational — stored in checkpoint hyper_parameters for test.py
         "factorised_encoder":  args.factorised_encoder,
         "no_spatial_attn":     args.no_spatial_attn,
@@ -508,6 +550,8 @@ def main() -> None:
         "joint_encoder":       args.joint_encoder,
         "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,
+        "delta_mode":          args.delta_mode,
+        "delta_grid_stride":   args.delta_grid_stride,
         "exclude_stations":    args.exclude_stations or [],
     }
 
