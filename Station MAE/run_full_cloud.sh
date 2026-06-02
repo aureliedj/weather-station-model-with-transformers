@@ -150,7 +150,7 @@ python main.py \
     --delta_mode       fixed_grid \
     --delta_grid_stride 3 \
     --mlp_ratio        2.0 \
-    --d_model          128 \
+    --d_model          512 \
     --enc_layers       6 \
     --dec_layers       4 \
     --mask_ratio       0.5 \
