@@ -149,7 +149,7 @@ python main.py \
     --max_delta        36 \
     --delta_mode       fixed_grid \
     --delta_grid_stride 3 \
-    --mlp_ratio        2.0 \
+    --mlp_ratio        4.0 \
     --d_model          512 \
     --enc_layers       6 \
     --dec_layers       4 \
