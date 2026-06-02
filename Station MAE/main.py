@@ -306,7 +306,6 @@ def set_seed(seed: int) -> None:
 def main() -> None:
     args = parse_args()
 
-
     # ── Seed ────────────────────────────────────────────────────────────────
     set_seed(args.seed)
 
