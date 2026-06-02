@@ -156,7 +156,7 @@ python main.py \
     --mask_ratio       0.5 \
     --dropout          0.15 \
     --drop_path_rate   0.10 \
-    --batch_size       16 \
+    --batch_size       4 \
     --num_workers      5 \
     --epochs           100 \
     --lr               1e-4 \
