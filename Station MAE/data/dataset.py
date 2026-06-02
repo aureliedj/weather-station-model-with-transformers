@@ -883,7 +883,8 @@ class StationMAEDataset(Dataset):
         # bad_count[i] = number of bad gaps strictly before position i
         # bad_count[i+k] - bad_count[i] == 0  ↔  span [i, i+k-1] is gap-free
         _bad_count = np.zeros(T + 1, dtype=np.int32)
-        _bad_count[1:] = np.cumsum(_bad)
+        _bad_count[1:T] = np.cumsum(_bad)   # (T-1,) diffs → positions 1..T-1
+        _bad_count[T]   = _bad_count[T - 1] # no gap beyond last timestamp
 
         # A window needs the span [i, i + (W-1) + max_delta] to be gap-free,
         # i.e. no bad gaps among positions i, i+1, …, i + (W-1) + max_delta - 1.
