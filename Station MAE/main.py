@@ -305,7 +305,7 @@ def set_seed(seed: int) -> None:
 
 def main() -> None:
     args = parse_args()
-    args.data_root = "/Users/aureliedejong/Documents/ETH/_DAS Project/PeakWeatherDataset"
+
 
     # ── Seed ────────────────────────────────────────────────────────────────
     set_seed(args.seed)

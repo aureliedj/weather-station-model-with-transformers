@@ -125,6 +125,8 @@ def load_peakweather(root: str) -> PeakWeatherDataset:
         station_type="meteo_station",
         imputation_method=None,
         freq="10min",
+        extended_topo_vars=[],   # disable topography zarr requirement
+        extended_nwp_pars=[],    # disable NWP/ICON zarr requirement
     )
 
 
