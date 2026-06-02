@@ -122,6 +122,8 @@ TEMPORAL_WINDOW=""
 # INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
 INDEX_MODE="--index_mode random"
+# INDEX_MODE="--index_mode sliding --train_stride 4"
+# INDEX_MODE="--index_mode blocks"
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -147,7 +149,7 @@ python main.py \
     --warmup_epochs    5 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --val_check_interval 500 \
+    --val_check_interval 100 \
     --save_every       2 \
     --patience         50 \
     --min_lr           1e-6 \
