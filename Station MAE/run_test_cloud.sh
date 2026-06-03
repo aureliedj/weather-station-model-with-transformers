@@ -21,8 +21,8 @@ SAVE_DIR="test_results/$(basename $(dirname $CHECKPOINT))"
 # sliding (default): all overlapping windows (~105k) — slow, most stable metrics
 # blocks:            non-overlapping windows only (~1,460) — fast, use for quick checks
 #                    and final paper metrics
-INDEX_MODE="sliding"
-# INDEX_MODE="blocks"
+# INDEX_MODE="sliding"
+INDEX_MODE="blocks"
 
 python test.py \
     --data_root     "$DATA_ROOT" \
