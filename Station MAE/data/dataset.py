@@ -246,7 +246,12 @@ def normalise_observations(
     # Per-(station, variable) std: E[(x - mu)^2] over present values
     diff_sq = ((obs - means.unsqueeze(0)) ** 2) * mask            # (T, N, V)
     stds    = (diff_sq.sum(dim=0) / count.clamp(min=2.0)).sqrt()  # (N, V)
-    stds    = stds.clamp(min=1e-6)
+
+    # Floor each station's std at 1% of the cross-station mean std for that variable.
+    # This prevents stations with near-zero std (e.g. sparse coverage) from producing
+    # astronomical normalised values (physical_change / 1e-6 → huge RMSE).
+    global_mean_std = stds[stds > 0].mean() if (stds > 0).any() else torch.tensor(1.0)
+    stds = stds.clamp(min=max(1e-6, float(global_mean_std) * 0.01))
 
     # Normalise and zero-out absent entries
     obs_norm = (obs - means.unsqueeze(0)) / stds.unsqueeze(0)     # (T, N, V)

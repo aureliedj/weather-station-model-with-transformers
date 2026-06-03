@@ -772,7 +772,11 @@ def main() -> None:
             temporal_window=temp_window,
             cross_attention_decoder=cross_attn,
         ).to(device)
-        model.load_state_dict(state_dict)
+        missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"  Missing keys (using default init): {missing}")
+        if unexpected:
+            print(f"  Unexpected keys (ignored): {unexpected}")
         print(f"  Parameters: {model.count_parameters():,}")
 
         from engine.evaluate import (
