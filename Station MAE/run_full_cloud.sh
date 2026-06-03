@@ -135,7 +135,7 @@ TEMPORAL_WINDOW="--temporal_window 12"
 
 # INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
-INDEX_MODE="--index_mode random"
+INDEX_MODE="--index_mode random --random_epoch_size 8000"
 # INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
 
@@ -159,10 +159,10 @@ python main.py \
     --batch_size       4 \
     --num_workers      5 \
     --epochs           100 \
-    --lr               1e-4 \
-    --warmup_epochs    5 \
+    --lr               2e-5 \
+    --warmup_epochs    15 \
     --weight_decay     0.05 \
-    --grad_clip        1.0 \
+    --grad_clip        0.5 \
     --limit_val_batches  200 \
     --save_every       2 \
     --patience         50 \

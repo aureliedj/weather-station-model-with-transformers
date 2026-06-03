@@ -100,28 +100,41 @@ def evaluate(
         x_mask      = batch["x_mask"].to(device)
         spatial     = batch["spatial"].to(device)
         x_hours     = batch["x_hours"].to(device)
-        y           = batch["y"].to(device)
-        y_mask      = batch["y_mask"].to(device)
+        y_raw       = batch["y"].to(device)
+        y_mask_raw  = batch["y_mask"].to(device)
         y_hours     = batch["y_hours"].to(device)
         delta_steps = batch["delta_steps"].to(device)
 
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
             spatial = spatial[0]
 
-        loss, preds, _ = model(
-            x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
-        )
-        total_loss += loss.item()
-        n_batches  += 1
+        # Handle both single-delta (B, N, V) and fixed-grid (B, K, N, V)
+        if y_raw.dim() == 4:
+            K = y_raw.shape[1]
+        else:
+            K = 1
+            y_raw       = y_raw.unsqueeze(1)
+            y_mask_raw  = y_mask_raw.unsqueeze(1)
+            y_hours     = y_hours.unsqueeze(1)
+            delta_steps = delta_steps.unsqueeze(1)
 
-        B, N = preds.shape[:2]
-        y_target      = y[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
-        y_mask_target = y_mask[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
+        for k in range(K):
+            y_k  = y_raw[:, k];       ym_k = y_mask_raw[:, k]
+            yh_k = y_hours[:, k];     ds_k = delta_steps[:, k]
 
-        # Accumulate all N stations (vectorised — no per-sample masking loop)
-        preds_list.append(preds.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
-        targets_list.append(y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
-        masks_list.append(y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
+            loss, preds, _ = model(
+                x, x_mask, spatial, x_hours, y_k, ym_k, yh_k, ds_k
+            )
+            total_loss += loss.item()
+            n_batches  += 1
+
+            B, N = preds.shape[:2]
+            y_target      = y_k[:, :, :NUM_TARGET_VARIABLES]
+            y_mask_target = ym_k[:, :, :NUM_TARGET_VARIABLES]
+
+            preds_list.append(preds.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
+            targets_list.append(y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
+            masks_list.append(y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu())
 
     preds_all   = torch.cat(preds_list,   dim=0)            # (total, 5)
     targets_all = torch.cat(targets_list, dim=0)
@@ -242,32 +255,39 @@ def evaluate_full(
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
             spatial = spatial[0]
 
-        # Multi-delta batches: use the first lead-time slice only
+        # Handle both single-delta (B, N, V) and fixed-grid (B, K, N, V).
+        # For fixed-grid, loop over all K lead-times so per-delta metrics
+        # cover the full horizon grid in one evaluation pass.
         if y_raw.dim() == 4:
-            y_raw       = y_raw[:, 0]
-            y_mask_raw  = y_mask_raw[:, 0]
-            y_hours     = y_hours[:, 0]
-            delta_steps = delta_steps[:, 0]
+            K = y_raw.shape[1]
+        else:
+            K = 1
+            y_raw       = y_raw.unsqueeze(1)
+            y_mask_raw  = y_mask_raw.unsqueeze(1)
+            y_hours     = y_hours.unsqueeze(1)
+            delta_steps = delta_steps.unsqueeze(1)
 
-        loss, preds, _ = model(
-            x, x_mask, spatial, x_hours,
-            y_raw, y_mask_raw, y_hours, delta_steps,
-        )
-        total_loss += loss.item()
-        n_batches  += 1
+        for k in range(K):
+            y_k  = y_raw[:, k];       ym_k = y_mask_raw[:, k]
+            yh_k = y_hours[:, k];     ds_k = delta_steps[:, k]
 
-        B, N = preds.shape[:2]
-        y_target      = y_raw[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
-        y_mask_target = y_mask_raw[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
+            loss_k, preds_k, _ = model(
+                x, x_mask, spatial, x_hours, y_k, ym_k, yh_k, ds_k,
+            )
+            total_loss += loss_k.item()
+            n_batches  += 1
 
-        # Flatten all N stations — one row per (sample, station) pair
-        records.append({
-            "pred":   preds.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
-            "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
-            "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
-            "deltas": delta_steps.tolist(),   # list of B delta values
-            "N":      N,
-        })
+            B, N = preds_k.shape[:2]
+            y_target      = y_k[:, :, :NUM_TARGET_VARIABLES]
+            y_mask_target = ym_k[:, :, :NUM_TARGET_VARIABLES]
+
+            records.append({
+                "pred":   preds_k.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+                "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+                "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+                "deltas": ds_k.tolist(),
+                "N":      N,
+            })
 
     # ── Concatenate all batches ─────────────────────────────────────────
     preds_all   = torch.cat([r["pred"]   for r in records], dim=0)
@@ -316,26 +336,33 @@ def evaluate_full(
 
     # ── Physical-unit metrics (requires obs_stats) ─────────────────────
     if obs_stats is not None:
-        mean_t = obs_stats["mean"].cpu()   # (6,) all variables
-        std_t  = obs_stats["std"].cpu()    # (6,) all variables
+        mean_t = obs_stats["mean"].cpu()   # (V,) or (N, V)
+        std_t  = obs_stats["std"].cpu()    # (V,) or (N, V)
+
+        # Per-station normalization produces (N, V) stats.
+        # Average over stations for a single representative std per variable
+        # used in physical-unit display (RMSE_phys ≈ RMSE_norm × mean_std).
+        if std_t.dim() == 2:
+            std_per_var  = std_t.mean(dim=0)   # (V,)
+            mean_per_var = mean_t.mean(dim=0)  # (V,)
+        else:
+            std_per_var  = std_t
+            mean_per_var = mean_t
 
         # Per-variable in physical units
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
-            std_v = float(std_t[v].item())
+            std_v = float(std_per_var[v].item())
             _scalars(
                 preds_all[:, v], targets_all[:, v], masks_all[:, v],
                 prefix=var_name,
-                std_scale=std_v,   # error in physical units
+                std_scale=std_v,
             )
 
         # Overall physical
         if masks_all.sum() > 0:
-            # Rescale each variable by its std before pooling (mix of units → skip)
-            # Instead report in normalised space for overall — already done above.
-            # Repeat with physical for display convenience (mean over std-scaled errs)
             errs_phys = []
             for v in range(NUM_TARGET_VARIABLES):
-                std_v = float(std_t[v].item())
+                std_v = float(std_per_var[v].item())
                 m = masks_all[:, v]
                 if m.sum() > 0:
                     errs_phys.append(
@@ -351,8 +378,10 @@ def evaluate_full(
         ui = _IDX.get("wind_u")
         vi = _IDX.get("wind_v")
         if ui is not None and vi is not None:
-            mean_u = float(mean_t[ui].item()); std_u = float(std_t[ui].item())
-            mean_v = float(mean_t[vi].item()); std_v_w = float(std_t[vi].item())
+            mean_u  = float(mean_per_var[ui].item())
+            std_u   = float(std_per_var[ui].item())
+            mean_v  = float(mean_per_var[vi].item())
+            std_v_w = float(std_per_var[vi].item())
             m_uv = masks_all[:, ui] & masks_all[:, vi]
             if m_uv.sum() > 0:
                 u_pred = preds_all[m_uv, ui]   * std_u + mean_u
@@ -480,6 +509,7 @@ def evaluate_gap_filling(
     all_preds:   list[torch.Tensor] = []   # (n_masked, 5) fragments
     all_targets: list[torch.Tensor] = []
     all_valid:   list[torch.Tensor] = []   # bool — sensor present at target step
+    all_stds:    list[torch.Tensor] = []   # (n_masked, 5) per-station stds (or None)
 
     for batch in loader:
         x       = batch["x"].to(device)       # (B, W, N, V)
@@ -497,6 +527,13 @@ def evaluate_gap_filling(
         ym_last = x_mask[:, -1, :, :]        # (B, N, V)
         yh_last = x_hours[:, -1]             # (B,)
         delta_z = torch.zeros(B, dtype=torch.long, device=device)
+
+        # Pre-compute per-station stds if obs_stats is (N, V)
+        _std_cpu = None
+        if obs_stats is not None:
+            _s = obs_stats["std"].cpu()
+            if _s.dim() == 2:
+                _std_cpu = _s[:, :NUM_TARGET_VARIABLES]   # (N, 5)
 
         for _ in range(n_repeats):
             # Each forward() call samples a fresh random station mask
@@ -516,6 +553,9 @@ def evaluate_gap_filling(
                 all_valid.append(
                     ym_last[b, m_idx, :NUM_TARGET_VARIABLES].cpu()  # (N_masked, 5)
                 )
+                # Track exact per-station stds for physical unnormalization
+                if _std_cpu is not None:
+                    all_stds.append(_std_cpu[m_idx])                # (N_masked, 5)
 
     if not all_preds:
         return {"gap_n_masked_evals": 0.0}
@@ -569,27 +609,64 @@ def evaluate_gap_filling(
 
     # ── Physical-unit metrics (requires obs_stats) ─────────────────────
     if obs_stats is not None:
-        mean_t = obs_stats["mean"].cpu()   # (NUM_VARIABLES,)
+        mean_t = obs_stats["mean"].cpu()
         std_t  = obs_stats["std"].cpu()
 
+        # If per-station stds were tracked, use exact values for each masked station.
+        # Otherwise fall back to station-mean std.
+        if all_stds:
+            stds_cat = torch.cat(all_stds, dim=0)   # (total_masked, 5) exact per-station
+            use_per_station = True
+        else:
+            use_per_station = False
+            if std_t.dim() == 2:
+                std_per_var  = std_t.mean(dim=0)[:NUM_TARGET_VARIABLES]
+                mean_per_var = mean_t.mean(dim=0)
+            else:
+                std_per_var  = std_t
+                mean_per_var = mean_t
+
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
-            std_v = float(std_t[v].item())
-            _scalars(
-                preds_cat[:, v], targets_cat[:, v], valid_cat[:, v],
-                prefix=f"gap_{var_name}",
-                std_scale=std_v,
-            )
+            if use_per_station:
+                # Element-wise scaling: each station uses its own std
+                scale = stds_cat[:, v]                      # (total_masked,)
+                m = valid_cat[:, v]
+                if m.sum() == 0:
+                    for k in ("rmse", "mae", "bias", "r2"):
+                        metrics[f"gap_{var_name}_{k}"] = float("nan")
+                    continue
+                err  = (preds_cat[m, v] - targets_cat[m, v]) * scale[m]
+                metrics[f"gap_{var_name}_rmse"] = float(err.pow(2).mean().sqrt().item())
+                metrics[f"gap_{var_name}_mae"]  = float(err.abs().mean().item())
+                metrics[f"gap_{var_name}_bias"] = float(err.mean().item())
+                tv = targets_cat[m, v] * scale[m]
+                ss_res = err.pow(2).sum()
+                ss_tot = (tv - tv.mean()).pow(2).sum()
+                metrics[f"gap_{var_name}_r2"] = (
+                    float(1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else float("nan")
+                )
+            else:
+                std_v = float(std_per_var[v].item())
+                _scalars(
+                    preds_cat[:, v], targets_cat[:, v], valid_cat[:, v],
+                    prefix=f"gap_{var_name}",
+                    std_scale=std_v,
+                )
 
         # Overall physical (pool rescaled errors across variables)
         if valid_cat.sum() > 0:
             errs_phys = []
             for v in range(NUM_TARGET_VARIABLES):
-                std_v = float(std_t[v].item())
                 m = valid_cat[:, v]
                 if m.sum() > 0:
-                    errs_phys.append(
-                        (preds_cat[m, v] - targets_cat[m, v]) * std_v
-                    )
+                    if use_per_station:
+                        scale = stds_cat[m, v]
+                        errs_phys.append((preds_cat[m, v] - targets_cat[m, v]) * scale)
+                    else:
+                        std_v = float(std_per_var[v].item())
+                        errs_phys.append(
+                            (preds_cat[m, v] - targets_cat[m, v]) * std_v
+                        )
             if errs_phys:
                 e = torch.cat(errs_phys)
                 metrics["gap_overall_rmse"] = float(e.pow(2).mean().sqrt().item())
@@ -600,8 +677,12 @@ def evaluate_gap_filling(
         ui   = _IDX.get("wind_u")
         vi_i = _IDX.get("wind_v")
         if ui is not None and vi_i is not None:
-            mean_u  = float(mean_t[ui].item());   std_u   = float(std_t[ui].item())
-            mean_v  = float(mean_t[vi_i].item()); std_v_w = float(std_t[vi_i].item())
+            if use_per_station:
+                mean_per_var = mean_t.mean(dim=0) if mean_t.dim() == 2 else mean_t
+            mean_u  = float(mean_per_var[ui].item())
+            std_u   = float((stds_cat[:, ui].mean() if use_per_station else std_per_var[ui]).item())
+            mean_v  = float(mean_per_var[vi_i].item())
+            std_v_w = float((stds_cat[:, vi_i].mean() if use_per_station else std_per_var[vi_i]).item())
             m_uv = valid_cat[:, ui] & valid_cat[:, vi_i]
             if m_uv.sum() > 0:
                 u_pred = preds_cat[m_uv, ui]   * std_u   + mean_u

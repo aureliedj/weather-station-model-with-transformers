@@ -186,7 +186,9 @@ def compute_persistence_metrics(
     """
     from model.embeddings import TARGET_VARIABLE_NAMES, NUM_TARGET_VARIABLES
 
-    std_t = obs_stats["std"].cpu()
+    _std = obs_stats["std"].cpu()
+    # Handle (N, V) per-station stats — use station-mean for persistence display
+    std_t = _std.mean(dim=0) if _std.dim() == 2 else _std   # (V,)
 
     # Batch-level records matching evaluate_full() structure
     records: list[dict] = []
@@ -197,26 +199,29 @@ def compute_persistence_metrics(
         y_mask_raw  = batch["y_mask"]
         delta_steps = batch["delta_steps"]  # (B,) or (B, K)
 
-        if y_raw.dim() == 4:
-            y_raw       = y_raw[:, 0]
-            y_mask_raw  = y_mask_raw[:, 0]
-            delta_steps = delta_steps[:, 0]
-
         B, W, N, V = x.shape
+        persist_pred = x[:, -1, :, :NUM_TARGET_VARIABLES]   # (B, N, 5)
 
-        # Persistence: last observed input step as forecast for every lead-time
-        persist_pred  = x[:, -1, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
-        y_target      = y_raw[:, :, :NUM_TARGET_VARIABLES]       # (B, N, 5)
-        y_mask_target = y_mask_raw[:, :, :NUM_TARGET_VARIABLES]  # (B, N, 5)
+        # Iterate over all K deltas (fixed-grid) or just the single delta
+        if y_raw.dim() == 4:
+            K = y_raw.shape[1]
+        else:
+            K = 1
+            y_raw       = y_raw.unsqueeze(1)
+            y_mask_raw  = y_mask_raw.unsqueeze(1)
+            delta_steps = delta_steps.unsqueeze(1)
 
-        # Flatten all N stations — no masking simulation needed
-        records.append({
-            "pred":   persist_pred.reshape(B * N, NUM_TARGET_VARIABLES),
-            "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES),
-            "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES),
-            "deltas": delta_steps.tolist(),
-            "N":      N,
-        })
+        for k in range(K):
+            y_k  = y_raw[:, k];   ym_k = y_mask_raw[:, k];   ds_k = delta_steps[:, k]
+            y_target      = y_k[:, :, :NUM_TARGET_VARIABLES]
+            y_mask_target = ym_k[:, :, :NUM_TARGET_VARIABLES]
+            records.append({
+                "pred":   persist_pred.reshape(B * N, NUM_TARGET_VARIABLES),
+                "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES),
+                "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES),
+                "deltas": ds_k.tolist(),
+                "N":      N,
+            })
 
     preds_all   = torch.cat([r["pred"]   for r in records], dim=0)
     targets_all = torch.cat([r["target"] for r in records], dim=0)
@@ -515,9 +520,11 @@ def main() -> None:
         return _ckpt_cfg.get(cfg_key, fallback)
 
     # Data settings — resolved before datasets are built
-    window          = _resolve(args.window,    "window",    288)
-    max_delta       = _resolve(args.max_delta, "max_delta", 18)
-    exclude_stations = _ckpt_cfg.get("exclude_stations", None) or None
+    window             = _resolve(args.window,    "window",    288)
+    max_delta          = _resolve(args.max_delta, "max_delta", 18)
+    exclude_stations   = _ckpt_cfg.get("exclude_stations", None) or None
+    delta_mode         = _ckpt_cfg.get("delta_mode",         "fixed_grid")
+    delta_grid_stride  = _ckpt_cfg.get("delta_grid_stride",  3)
 
     # Arch settings — resolved per-checkpoint below, but define defaults here
     _d_model    = _resolve(args.d_model,    "d_model",    128)
@@ -556,6 +563,8 @@ def main() -> None:
         num_delta_per_sample=1, max_delta_steps=max_delta,
         cache_dir=cache_dir,
         exclude_stations=exclude_stations,
+        delta_mode=delta_mode,
+        delta_grid_stride=delta_grid_stride,
     )
     obs_stats = train_ds.obs_stats
     print("  obs_stats ready (train split)")
@@ -564,12 +573,17 @@ def main() -> None:
     test_ds = StationMAEDataset(
         ds, window_size=window, delta_steps=max_delta, split="test",
         obs_stats=obs_stats,
-        num_delta_per_sample=1,          # random delta in [1, max_delta] per sample
+        num_delta_per_sample=1,
         max_delta_steps=max_delta,
         cache_dir=cache_dir,
         exclude_stations=exclude_stations,
+        delta_mode=delta_mode,
+        delta_grid_stride=delta_grid_stride,
     )
-    print(f"  test samples: {len(test_ds):,}")
+    print(f"  test samples: {len(test_ds):,}  "
+          f"(delta_mode={delta_mode}"
+          + (f", grid=[0..{max_delta} step {delta_grid_stride}] K={len(test_ds.delta_grid)}"
+             if delta_mode == "fixed_grid" else "") + ")")
 
     _use_persistent = (args.num_workers > 0)
     test_loader = DataLoader(
@@ -597,9 +611,11 @@ def main() -> None:
             split="test",
             obs_stats=obs_stats,
             num_delta_per_sample=1,
-            max_delta_steps=1,          # clamp: only delta=1 ever sampled
+            max_delta_steps=1,
             cache_dir=cache_dir,
             exclude_stations=exclude_stations,
+            delta_mode="random",        # single fixed delta=1, not a grid
+            delta_grid_stride=1,
         )
         print(f"  lead-1 test samples: {len(lead1_ds):,}")
 
