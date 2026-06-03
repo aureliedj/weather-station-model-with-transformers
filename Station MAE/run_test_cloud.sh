@@ -25,11 +25,12 @@ SAVE_DIR="test_results/$(basename $(dirname $CHECKPOINT))"
 INDEX_MODE="blocks"
 
 python test.py \
-    --data_root     "$DATA_ROOT" \
-    --checkpoint    "$CHECKPOINT" \
-    --batch_size    64 \
-    --num_workers   4 \
-    --index_mode    "$INDEX_MODE" \
-    --save_dir      "$SAVE_DIR" \
-    --wandb_project station-mae \
-    --wandb_run_name "test-$(basename $CHECKPOINT .ckpt)-${INDEX_MODE}"
+    --data_root        "$DATA_ROOT" \
+    --checkpoint       "$CHECKPOINT" \
+    --batch_size       64 \
+    --num_workers      4 \
+    --index_mode       "$INDEX_MODE" \
+    --exclude_stations PFA \
+    --save_dir         "$SAVE_DIR" \
+    --wandb_project    station-mae \
+    --wandb_run_name   "test-$(basename $CHECKPOINT .ckpt)-${INDEX_MODE}"

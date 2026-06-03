@@ -136,6 +136,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device",      type=str, default=None)
 
     # Output
+    p.add_argument("--exclude_stations",  type=str, nargs="+", default=None,
+                   help="Override checkpoint exclude_stations. Use abbreviation e.g. PFA.")
     p.add_argument("--index_mode",        type=str, default="sliding",
                    choices=["sliding", "blocks"],
                    help="Window selection for the test split.\n"
@@ -529,7 +531,8 @@ def main() -> None:
     # Data settings — resolved before datasets are built
     window             = _resolve(args.window,    "window",    288)
     max_delta          = _resolve(args.max_delta, "max_delta", 18)
-    exclude_stations   = _ckpt_cfg.get("exclude_stations", None) or None
+    # CLI --exclude_stations overrides checkpoint value; use abbreviation e.g. PFA
+    exclude_stations   = args.exclude_stations or _ckpt_cfg.get("exclude_stations", None) or None
     delta_mode         = _ckpt_cfg.get("delta_mode",         "fixed_grid")
     delta_grid_stride  = _ckpt_cfg.get("delta_grid_stride",  3)
 
@@ -573,11 +576,18 @@ def main() -> None:
     if _name_col:
         print(f"  sample {_name_col}s: {list(_stns[_name_col].head())}")
     if exclude_stations:
+        _excl_upper = {str(s).upper() for s in exclude_stations}
         print(f"  looking for: {exclude_stations}")
-        _matched = [str(i) for i in _stns.index if str(i) in {str(s) for s in exclude_stations}
-                    or str(int(float(str(i)))) in {str(s) for s in exclude_stations}
-                    if str(i).replace('.','').isdigit()]
-        print(f"  matched indices: {_matched if _matched else 'NONE — check station ID format above'}")
+        _matched = []
+        for _idx in _stns.index:
+            _candidates = {str(_idx).upper()}
+            try:
+                _candidates.add(str(int(float(str(_idx)))).upper())
+            except (ValueError, TypeError):
+                pass
+            if _candidates & _excl_upper:
+                _matched.append(str(_idx))
+        print(f"  matched indices: {_matched if _matched else 'NONE — use abbreviation, e.g. PFA not 110'}")
 
     # Build train_ds only to get obs_stats (do not iterate over it).
     # Exclude the same stations as training so normalisation stats match exactly.
