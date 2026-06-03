@@ -22,7 +22,7 @@ SAVE_DIR="checkpoints/smoke_test"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
-EXCLUDE="--exclude_stations 110"
+EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historical coverage
 
 # ── Encoder architecture (mirror run_full_cloud.sh choice here) ──────────────
 ENCODER="--factorised_encoder"                     # full axial (temporal + spatial)

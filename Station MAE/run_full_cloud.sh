@@ -63,8 +63,9 @@ LOCAL_CACHE="/tmp/station_mae_cache"
 # Drop stations with insufficient historical coverage before training.
 # Matched case-insensitively against the stations_table index / name / abbr.
 # Add more names separated by spaces: EXCLUDE="110 BAS KLO"
-EXCLUDE="--exclude_stations 110"
-# EXCLUDE=""   # ← uncomment to disable exclusion
+EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historical coverage
+# EXCLUDE="--exclude_stations 110"  # alternative: match by numeric ID
+# EXCLUDE=""                         # ← uncomment to disable exclusion
 # ─────────────────────────────────────────────────────────────────────────────
 
 # ── Encoder architecture ──────────────────────────────────────────────────────

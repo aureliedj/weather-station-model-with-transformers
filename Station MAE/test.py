@@ -136,6 +136,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device",      type=str, default=None)
 
     # Output
+    p.add_argument("--index_mode",        type=str, default="sliding",
+                   choices=["sliding", "blocks"],
+                   help="Window selection for the test split.\n"
+                        "  sliding (default): all contiguous windows, stride=1 (~105k samples).\n"
+                        "    Most stable metrics; slow.\n"
+                        "  blocks: non-overlapping windows only (~1,460 samples).\n"
+                        "    Fast evaluation; use for paper metrics and quick checks.")
     p.add_argument("--save_dir",          type=str, default="test_results")
     p.add_argument("--no_plots",          action="store_true")
     p.add_argument("--gap_fill_repeats",  type=int, default=3,
@@ -555,6 +562,23 @@ def main() -> None:
     print("Loading PeakWeather dataset …")
     ds = load_peakweather(root=args.data_root)
 
+    # ── Station table diagnostic ──────────────────────────────────────────────
+    # Printed once so you can verify station IDs and find the correct exclusion key.
+    _stns = ds.stations_table
+    _idx_sample = list(_stns.index[:5])
+    _name_col   = next((c for c in ["name", "abbr", "station_name"] if c in _stns.columns), None)
+    print(f"  stations_table: {len(_stns)} stations  "
+          f"index dtype={_stns.index.dtype}  "
+          f"sample indices={_idx_sample}")
+    if _name_col:
+        print(f"  sample {_name_col}s: {list(_stns[_name_col].head())}")
+    if exclude_stations:
+        print(f"  looking for: {exclude_stations}")
+        _matched = [str(i) for i in _stns.index if str(i) in {str(s) for s in exclude_stations}
+                    or str(int(float(str(i)))) in {str(s) for s in exclude_stations}
+                    if str(i).replace('.','').isdigit()]
+        print(f"  matched indices: {_matched if _matched else 'NONE — check station ID format above'}")
+
     # Build train_ds only to get obs_stats (do not iterate over it).
     # Exclude the same stations as training so normalisation stats match exactly.
     print("Building train dataset for normalisation statistics …")
@@ -579,8 +603,14 @@ def main() -> None:
         exclude_stations=exclude_stations,
         delta_mode=delta_mode,
         delta_grid_stride=delta_grid_stride,
+        index_mode=args.index_mode,
     )
-    print(f"  test samples: {len(test_ds):,}  "
+    _window_mode_str = (
+        f"non-overlapping blocks (~{len(test_ds):,} windows)"
+        if args.index_mode == "blocks"
+        else f"sliding stride=1 ({len(test_ds):,} windows)"
+    )
+    print(f"  test samples: {_window_mode_str}  "
           f"(delta_mode={delta_mode}"
           + (f", grid=[0..{max_delta} step {delta_grid_stride}] K={len(test_ds.delta_grid)}"
              if delta_mode == "fixed_grid" else "") + ")")
@@ -616,6 +646,7 @@ def main() -> None:
             exclude_stations=exclude_stations,
             delta_mode="random",        # single fixed delta=1, not a grid
             delta_grid_stride=1,
+            index_mode=args.index_mode,
         )
         print(f"  lead-1 test samples: {len(lead1_ds):,}")
 

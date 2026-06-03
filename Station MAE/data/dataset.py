@@ -960,10 +960,26 @@ class StationMAEDataset(Dataset):
         drop       = set()
 
         for pos, (idx, row) in enumerate(stns.iterrows()):
+            # Build candidate set: try both raw string and int-normalised form.
+            # Parquet/HDF files often store integer station IDs as floats (e.g.
+            # 110.0), so str(idx) gives '110.0' which never matches '110'.
+            # We also try int(float(idx)) → '110' to handle this case.
             candidates = {str(idx).upper()}
-            for col in ("name", "abbr", "station_name"):
+            # Handle float-formatted integer indices: '110.0' → '110'
+            try:
+                candidates.add(str(int(float(str(idx)))).upper())
+            except (ValueError, TypeError):
+                pass
+            # Check all common station name / abbreviation column names,
+            # including PeakWeather's nat_abbr column.
+            for col in ("name", "abbr", "nat_abbr", "station_name"):
                 if col in row.index and not pd.isna(row[col]):
-                    candidates.add(str(row[col]).upper())
+                    val = str(row[col])
+                    candidates.add(val.upper())
+                    try:
+                        candidates.add(str(int(float(val))).upper())
+                    except (ValueError, TypeError):
+                        pass
             if candidates & excl_upper:
                 drop.add(pos)
 
@@ -1020,8 +1036,18 @@ class StationMAEDataset(Dataset):
             index_mode:   "sliding", "blocks", or "random".
             split:        "train", "val", or "test".  Val/test always → sliding/1.
         """
-        # Val and test always use the full sliding pool for consistent evaluation
+        # Val/test default: full sliding pool (stride=1) for stable metric estimates.
+        # Pass index_mode="blocks" to get non-overlapping windows — useful for
+        # fast evaluation runs and final paper metrics (~1,460 windows vs ~105k).
         if split != "train":
+            if index_mode == "blocks":
+                result: list = []
+                next_ok: int = 0
+                for i in all_valid:
+                    if i >= next_ok:
+                        result.append(i)
+                        next_ok = i + window_size
+                return result
             return list(all_valid)
 
         if index_mode == "random":
