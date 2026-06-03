@@ -136,8 +136,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device",      type=str, default=None)
 
     # Output
-    p.add_argument("--exclude_stations",  type=str, nargs="+", default=None,
+    p.add_argument("--exclude_stations",   type=str, nargs="+", default=None,
                    help="Override checkpoint exclude_stations. Use abbreviation e.g. PFA.")
+    p.add_argument("--test_mask_ratios",  type=float, nargs="+", default=None,
+                   help="One or more encoder mask ratios to sweep at inference time. "
+                        "Default: use the trained mask_ratio from the checkpoint. "
+                        "Example: --test_mask_ratios 0.0 0.5 to compare no-masking vs trained. "
+                        "  0.0 → all stations visible (pure temporal forecasting). "
+                        "  0.5 → 50%% masked (trained setting, gap-filling + forecasting).")
     p.add_argument("--index_mode",        type=str, default="sliding",
                    choices=["sliding", "blocks"],
                    help="Window selection for the test split.\n"
@@ -783,79 +789,142 @@ def main() -> None:
             evaluate_full, print_full_metrics,
             evaluate_gap_filling, print_gap_filling_metrics,
         )
+        import time as _time
 
-        label  = os.path.splitext(os.path.basename(ckpt_path))[0]
-        skill:         dict = {}
-        lead1_metrics: dict = {}
-        gap_metrics:   dict = {}
+        base_label = os.path.splitext(os.path.basename(ckpt_path))[0]
 
-        if _is_inpainting:
-            # ── Inpainting mode: gap-filling is the primary metric ───────
-            # evaluate_full() gives all-station context metrics.
-            # evaluate_gap_filling() is the real score: masked stations only.
-            print("  Running evaluate_full() [all stations, delta=0] …")
-            metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
-            print_full_metrics(metrics, obs_stats=obs_stats)
+        # ── Determine which mask ratios to sweep ─────────────────────────
+        # Default: use the trained mask_ratio from the checkpoint.
+        # CLI --test_mask_ratios overrides, enabling e.g. 0.0 vs 0.5 comparison.
+        _test_mrs = args.test_mask_ratios if args.test_mask_ratios else [c_mask_ratio]
 
-            print(f"\n  Running evaluate_gap_filling() "
-                  f"[PRIMARY · masked stations only · n_repeats={args.gap_fill_repeats}] …")
-            gap_metrics = evaluate_gap_filling(
-                model, test_loader, device,
-                obs_stats=obs_stats,
-                n_repeats=args.gap_fill_repeats,
-            )
-            print("\n── Spatial inpainting · masked stations only (PRIMARY) ──────────────")
-            print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
+        # Summary table across mask ratios (printed at the end of this checkpoint)
+        _mr_summary: list[dict] = []
 
-        else:
-            # ── Forecasting mode: full delta sweep + lead-1 + gap-filling ─
-            print("  Running evaluate_full() [all deltas, all stations] …")
-            metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
+        for _test_mr in _test_mrs:
+            # Override the encoder mask ratio for this evaluation pass
+            model.encoder.mask_ratio = _test_mr
+            model.eval()
 
-            skill = compute_skill_scores(metrics, persist_metrics)
-            print_full_metrics(metrics, obs_stats=obs_stats)
+            _mr_tag   = f"mr{_test_mr:.2f}"
+            label     = f"{base_label}_{_mr_tag}"
+            mr_save   = os.path.join(args.save_dir, label)
+            os.makedirs(mr_save, exist_ok=True)
 
-            print("── Skill scores vs persistence (higher = better, 1.0 = perfect) ──")
-            for var_name in TARGET_VARIABLE_NAMES:
-                s = skill.get(f"skill_{var_name}", float("nan"))
-                bar_len = max(0, int(s * 20)) if not (s != s) else 0
-                bar = "█" * bar_len
-                print(f"  {var_name:<14}  {s:+.3f}  {bar}")
-            s_ov = skill.get("skill_overall", float("nan"))
-            print(f"  {'[overall]':<14}  {s_ov:+.3f}")
+            print(f"\n{'─'*60}")
+            print(f"  mask_ratio={_test_mr:.2f}  "
+                  f"({'trained setting' if _test_mr == c_mask_ratio else 'override'})  "
+                  f"→ save_dir: {mr_save}")
 
-            print(f"\n  Running evaluate_full() [lead-1 / 10-min forecast, all stations] …")
-            lead1_metrics = evaluate_full(model, lead1_loader, device, obs_stats=obs_stats)
-            print("\n── Lead-1 (10-min forecast) · all stations ──────────────────────────")
-            print_full_metrics(lead1_metrics, obs_stats=obs_stats)
+            skill:         dict = {}
+            lead1_metrics: dict = {}
+            gap_metrics:   dict = {}
 
-            print(f"\n  Running evaluate_gap_filling() "
-                  f"[delta=0, masked stations only · n_repeats={args.gap_fill_repeats}] …")
-            gap_metrics = evaluate_gap_filling(
-                model, test_loader, device,
-                obs_stats=obs_stats,
-                n_repeats=args.gap_fill_repeats,
-            )
-            print("\n── Spatial gap-filling · masked stations only ───────────────────────")
-            print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
+            if _is_inpainting:
+                t0 = _time.time()
+                print("  Running evaluate_full() [all stations, delta=0] …")
+                metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
+                print_full_metrics(metrics, obs_stats=obs_stats)
 
-        all_results.append({
-            "label":   label,
-            "path":    ckpt_path,
-            "epoch":   ckpt_epoch,
-            "metrics": metrics,
-            "skill":   skill,
-        })
-        if lead1_metrics:
-            all_lead1_results.append({"label": label, "metrics": lead1_metrics})
-        if gap_metrics:
-            all_gap_results.append({"label": label, "metrics": gap_metrics})
+                if _test_mr > 0:
+                    print(f"\n  Running evaluate_gap_filling() "
+                          f"[masked only · n_repeats={args.gap_fill_repeats}] …")
+                    gap_metrics = evaluate_gap_filling(
+                        model, test_loader, device,
+                        obs_stats=obs_stats,
+                        n_repeats=args.gap_fill_repeats,
+                    )
+                    print("\n── Spatial inpainting · masked stations only (PRIMARY) ──────────")
+                    print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
+                else:
+                    print("  [skip] gap-filling — mask_ratio=0.0, no hidden stations")
+                print(f"  ⏱  {_time.time()-t0:.0f}s")
+
+            else:
+                # ── Full delta sweep ────────────────────────────────────
+                t0 = _time.time()
+                print("  Running evaluate_full() [all deltas, all stations] …")
+                metrics = evaluate_full(model, test_loader, device, obs_stats=obs_stats)
+                skill   = compute_skill_scores(metrics, persist_metrics)
+                print_full_metrics(metrics, obs_stats=obs_stats)
+                print(f"  ⏱  evaluate_full: {_time.time()-t0:.0f}s")
+
+                print("── Skill scores vs persistence ──────────────────────────────────")
+                for var_name in TARGET_VARIABLE_NAMES:
+                    s = skill.get(f"skill_{var_name}", float("nan"))
+                    bar_len = max(0, int(s * 20)) if not (s != s) else 0
+                    print(f"  {var_name:<14}  {s:+.3f}  {'█' * bar_len}")
+                print(f"  {'[overall]':<14}  {skill.get('skill_overall', float('nan')):+.3f}")
+
+                # ── Lead-1 ─────────────────────────────────────────────
+                t0 = _time.time()
+                print(f"\n  Running evaluate_full() [lead-1 / 10-min forecast] …")
+                lead1_metrics = evaluate_full(model, lead1_loader, device, obs_stats=obs_stats)
+                print("\n── Lead-1 (10-min forecast) · all stations ──────────────────────")
+                print_full_metrics(lead1_metrics, obs_stats=obs_stats)
+                print(f"  ⏱  lead-1: {_time.time()-t0:.0f}s")
+
+                # ── Gap-filling (skip when mask_ratio=0) ───────────────
+                if _test_mr > 0:
+                    t0 = _time.time()
+                    print(f"\n  Running evaluate_gap_filling() "
+                          f"[delta=0, masked only · n_repeats={args.gap_fill_repeats}] …")
+                    gap_metrics = evaluate_gap_filling(
+                        model, test_loader, device,
+                        obs_stats=obs_stats,
+                        n_repeats=args.gap_fill_repeats,
+                    )
+                    print("\n── Spatial gap-filling · masked stations only ───────────────────")
+                    print_gap_filling_metrics(gap_metrics, obs_stats=obs_stats)
+                    print(f"  ⏱  gap-filling: {_time.time()-t0:.0f}s")
+                else:
+                    print("\n  [skip] gap-filling — mask_ratio=0.0, all stations visible")
+
+            # Accumulate for summary table and CSV
+            all_results.append({
+                "label":   label,
+                "path":    ckpt_path,
+                "epoch":   ckpt_epoch,
+                "metrics": metrics,
+                "skill":   skill,
+            })
+            if lead1_metrics:
+                all_lead1_results.append({"label": label, "metrics": lead1_metrics})
+            if gap_metrics:
+                all_gap_results.append({"label": label, "metrics": gap_metrics})
+
+            _mr_summary.append({
+                "mask_ratio":       _test_mr,
+                "overall_rmse":     metrics.get("overall_rmse_norm", float("nan")),
+                "temperature_rmse": metrics.get("temperature_norm_rmse", float("nan")),
+                "wind_u_rmse":      metrics.get("wind_u_norm_rmse", float("nan")),
+                "wind_v_rmse":      metrics.get("wind_v_norm_rmse", float("nan")),
+                "skill_overall":    skill.get("skill_overall", float("nan")),
+                "gap_overall":      gap_metrics.get("gap_overall_rmse_norm", float("nan")),
+            })
+
+        # ── Mask-ratio comparison summary ────────────────────────────────
+        if len(_mr_summary) > 1:
+            print(f"\n{'='*60}")
+            print(f"  Mask-ratio sweep summary — {base_label}")
+            print(f"  {'mask_ratio':>10}  {'overall_rmse':>12}  {'skill':>7}  "
+                  f"{'temp_rmse':>10}  {'gap_rmse':>10}")
+            print("  " + "-" * 56)
+            for r in _mr_summary:
+                gap_str = f"{r['gap_overall']:>10.5f}" if r['gap_overall'] == r['gap_overall'] else f"{'—':>10}"
+                print(f"  {r['mask_ratio']:>10.2f}  {r['overall_rmse']:>12.5f}  "
+                      f"{r['skill_overall']:>+7.3f}  {r['temperature_rmse']:>10.5f}  {gap_str}")
+            print()
 
         # ── WandB logging (optional) ─────────────────────────────────────
         if args.wandb_project:
             try:
                 import wandb
-                run_name = args.wandb_run_name or f"test-{label}"
+                # Use last evaluated mask ratio for WandB label
+                _last_mr = _mr_summary[-1]["mask_ratio"] if _mr_summary else c_mask_ratio
+                run_name = args.wandb_run_name or f"test-{base_label}"
+                if len(_test_mrs) > 1:
+                    run_name = f"{run_name}-sweep"
                 _wandb_run = wandb.init(
                     project=args.wandb_project,
                     name=run_name,
@@ -866,7 +935,9 @@ def main() -> None:
                         "mode":               "inpainting" if _is_inpainting else "forecasting",
                         "window":             window,
                         "max_delta":          max_delta,
-                        "mask_ratio":         c_mask_ratio,
+                        "trained_mask_ratio": c_mask_ratio,
+                        "test_mask_ratios":   _test_mrs,
+                        "index_mode":         args.index_mode,
                         "gap_fill_repeats":   args.gap_fill_repeats,
                         "factorised_encoder": factorised,
                         "cross_attn_decoder": cross_attn,

@@ -17,12 +17,21 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 CHECKPOINT="checkpoints/best.ckpt"
 SAVE_DIR="test_results/$(basename $(dirname $CHECKPOINT))"
 
-# ── Evaluation mode ──────────────────────────────────────────────────────────
-# sliding (default): all overlapping windows (~105k) — slow, most stable metrics
-# blocks:            non-overlapping windows only (~1,460) — fast, use for quick checks
-#                    and final paper metrics
-# INDEX_MODE="sliding"
+# ── Window mode ───────────────────────────────────────────────────────────────
+# blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default
+# sliding: all overlapping windows (~105k)  — slow, most stable — for final paper metrics
 INDEX_MODE="blocks"
+# INDEX_MODE="sliding"
+
+# ── Mask ratio sweep ──────────────────────────────────────────────────────────
+# 0.0 → all stations visible to encoder (pure temporal forecasting)
+# 0.5 → trained setting: 50% masked (gap-filling + forecasting)
+# The model is loaded ONCE and evaluated at each ratio in sequence.
+# Results save to separate subdirs: test_results/.../best_mr0.00/, best_mr0.50/
+# A comparison table is printed at the end.
+MASK_RATIOS="0.0 0.5"
+# MASK_RATIOS="0.5"                 # single ratio (faster)
+# MASK_RATIOS="0.0 0.25 0.5 0.75"  # full robustness sweep
 
 python test.py \
     --data_root        "$DATA_ROOT" \
@@ -31,6 +40,8 @@ python test.py \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --exclude_stations PFA \
+    --test_mask_ratios $MASK_RATIOS \
+    --gap_fill_repeats 5 \
     --save_dir         "$SAVE_DIR" \
     --wandb_project    station-mae \
     --wandb_run_name   "test-$(basename $CHECKPOINT .ckpt)-${INDEX_MODE}"
