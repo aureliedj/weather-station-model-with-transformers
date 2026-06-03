@@ -133,9 +133,8 @@ TEMPORAL_WINDOW="--temporal_window 12"
 #     coverage bias.  --train_stride is ignored in this mode.
 #     Best default when combined with a large pool and many epochs.
 
-# INDEX_MODE="--index_mode sliding --train_stride 4"
-# INDEX_MODE="--index_mode blocks"
 INDEX_MODE="--index_mode random --random_epoch_size 8000"
+# ↑ 8000 samples / batch_size=4 = 2000 batches/epoch — stabler gradients than default ~914
 # INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
 
@@ -154,16 +153,16 @@ python main.py \
     --enc_layers       6 \
     --dec_layers       4 \
     --mask_ratio       0.5 \
-    --dropout          0.15 \
-    --drop_path_rate   0.10 \
+    --dropout          0.0 \
+    --drop_path_rate   0.0 \
     --batch_size       4 \
-    --num_workers      5 \
+    --num_workers      3 \
     --epochs           100 \
-    --lr               2e-5 \
+    --lr               1e-5 \
     --warmup_epochs    15 \
     --weight_decay     0.05 \
     --grad_clip        0.5 \
-    --limit_val_batches  200 \
+    --limit_val_batches 200 \
     --save_every       2 \
     --patience         50 \
     --min_lr           1e-6 \
@@ -177,7 +176,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   baseline-cloud \
+    --wandb_run_name   tw12-d1024-v2 \
     --save_dir         "$SAVE_DIR"
 
 # ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
