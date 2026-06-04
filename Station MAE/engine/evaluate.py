@@ -255,37 +255,48 @@ def evaluate_full(
         if spatial.dim() == 3 and spatial.size(0) == x.size(0):
             spatial = spatial[0]
 
-        # Handle both single-delta (B, N, V) and fixed-grid (B, K, N, V).
-        # For fixed-grid, loop over all K lead-times so per-delta metrics
-        # cover the full horizon grid in one evaluation pass.
+        # Use forward_multi_delta when y has K lead-times (B, K, N, V):
+        # encoder runs ONCE, decoder runs once for all K → much faster than
+        # calling forward() K times separately.
+        # Falls back to single-delta forward() for (B, N, V) batches.
         if y_raw.dim() == 4:
-            K = y_raw.shape[1]
+            # Multi-delta path — encoder once, decoder once
+            loss_k, preds_k, _ = model.forward_multi_delta(
+                x, x_mask, spatial, x_hours,
+                y_raw, y_mask_raw, y_hours, delta_steps,
+            )
+            # preds_k: (B, K, N, num_target_vars)
+            total_loss += loss_k.item()
+            n_batches  += 1
+
+            B, K, N = preds_k.shape[:3]
+            for k in range(K):
+                y_target      = y_raw[:, k, :, :NUM_TARGET_VARIABLES]
+                y_mask_target = y_mask_raw[:, k, :, :NUM_TARGET_VARIABLES]
+                records.append({
+                    "pred":   preds_k[:, k].reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+                    "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+                    "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
+                    "deltas": delta_steps[:, k].tolist(),
+                    "N":      N,
+                })
         else:
-            K = 1
-            y_raw       = y_raw.unsqueeze(1)
-            y_mask_raw  = y_mask_raw.unsqueeze(1)
-            y_hours     = y_hours.unsqueeze(1)
-            delta_steps = delta_steps.unsqueeze(1)
-
-        for k in range(K):
-            y_k  = y_raw[:, k];       ym_k = y_mask_raw[:, k]
-            yh_k = y_hours[:, k];     ds_k = delta_steps[:, k]
-
+            # Single-delta path
             loss_k, preds_k, _ = model(
-                x, x_mask, spatial, x_hours, y_k, ym_k, yh_k, ds_k,
+                x, x_mask, spatial, x_hours,
+                y_raw, y_mask_raw, y_hours, delta_steps,
             )
             total_loss += loss_k.item()
             n_batches  += 1
 
             B, N = preds_k.shape[:2]
-            y_target      = y_k[:, :, :NUM_TARGET_VARIABLES]
-            y_mask_target = ym_k[:, :, :NUM_TARGET_VARIABLES]
-
+            y_target      = y_raw[:, :, :NUM_TARGET_VARIABLES]
+            y_mask_target = y_mask_raw[:, :, :NUM_TARGET_VARIABLES]
             records.append({
                 "pred":   preds_k.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
                 "target": y_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
                 "mask":   y_mask_target.reshape(B * N, NUM_TARGET_VARIABLES).cpu(),
-                "deltas": ds_k.tolist(),
+                "deltas": delta_steps.tolist(),
                 "N":      N,
             })
 
@@ -822,4 +833,276 @@ def print_full_metrics(metrics: dict[str, float], obs_stats: "dict | None" = Non
     print(f"\n  avg_loss (train objective MSE) = {metrics.get('avg_loss', float('nan')):.6f}")
     if not has_phys:
         print("  (all metrics in normalised space — pass obs_stats for physical units)")
+
+
+# ---------------------------------------------------------------------------
+# Per-variable × per-delta RMSE matrix
+# ---------------------------------------------------------------------------
+
+def build_delta_variable_matrix(
+    metrics: dict[str, float],
+) -> "dict[str, dict[str, float]]":
+    """
+    Assemble a (variable → lead_time → rmse_norm) nested dict from the flat
+    metrics dict returned by evaluate_full().
+
+    Useful for building a heatmap in the notebook:
+        rows = TARGET_VARIABLE_NAMES
+        cols = lead-times in minutes (0, 30, 60, …, 360)
+    """
+    matrix: dict[str, dict[str, float]] = {v: {} for v in TARGET_VARIABLE_NAMES}
+
+    delta_keys = sorted(
+        k for k in metrics if k.startswith("delta_") and k.endswith("_overall_rmse_norm")
+    )
+    for dk in delta_keys:
+        d    = int(dk.split("_")[1])
+        mins = d * 10
+        for var in TARGET_VARIABLE_NAMES:
+            key = f"delta_{d:02d}_{var}_rmse_norm"
+            matrix[var][f"{mins}min"] = metrics.get(key, float("nan"))
+
+    return matrix
+
+
+# ---------------------------------------------------------------------------
+# Raw prediction collector (for notebook time-series plots)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def collect_predictions(
+    model:      nn.Module,
+    loader:     DataLoader,
+    device:     torch.device,
+    n_windows:  int = 100,
+    save_path:  "str | None" = None,
+) -> dict:
+    """
+    Run inference on up to ``n_windows`` test windows and return raw tensors
+    needed for time-series and spatial plots in the notebook.
+
+    Saves (and returns) a dict with:
+        preds          (M, K, N, V_target)  — model predictions (normalised)
+        targets        (M, K, N, V)         — ground truth (normalised)
+        masks          (M, K, N, V)         — sensor availability
+        delta_steps    (M, K)               — lead-time steps
+        window_hours   (M,)                 — hours-since-epoch of window start
+        target_hours   (M, K)               — hours-since-epoch of each target
+        spatial        (N, 15)              — station static features
+
+    Args:
+        model:      StationMAE moved to ``device``, in eval mode.
+        loader:     Test DataLoader (fixed-grid or single-delta).
+        device:     torch.device.
+        n_windows:  Max windows to collect (default 100, ~40 MB for d_model=1024).
+        save_path:  If set, saves the dict as a .pt file at this path.
+    """
+    model.eval()
+
+    all_preds   = []
+    all_targets = []
+    all_masks   = []
+    all_deltas  = []
+    all_w_hours = []
+    all_t_hours = []
+    spatial_saved = None
+    collected = 0
+
+    for batch in loader:
+        if collected >= n_windows:
+            break
+
+        x           = batch["x"].to(device)
+        x_mask      = batch["x_mask"].to(device)
+        spatial     = batch["spatial"].to(device)
+        x_hours     = batch["x_hours"].to(device)
+        y_raw       = batch["y"].to(device)
+        y_mask_raw  = batch["y_mask"].to(device)
+        y_hours     = batch["y_hours"].to(device)
+        delta_steps = batch["delta_steps"].to(device)
+
+        if spatial.dim() == 3:
+            spatial = spatial[0]
+        if spatial_saved is None:
+            spatial_saved = spatial.cpu()
+
+        # Use multi-delta forward for efficiency
+        if y_raw.dim() == 4:
+            _, preds, _ = model.forward_multi_delta(
+                x, x_mask, spatial, x_hours,
+                y_raw, y_mask_raw, y_hours, delta_steps,
+            )
+            # preds: (B, K, N, V_target)
+        else:
+            _, preds, _ = model(x, x_mask, spatial, x_hours,
+                                y_raw, y_mask_raw, y_hours, delta_steps)
+            preds       = preds.unsqueeze(1)
+            y_raw       = y_raw.unsqueeze(1)
+            y_mask_raw  = y_mask_raw.unsqueeze(1)
+            y_hours     = y_hours.unsqueeze(1)
+            delta_steps = delta_steps.unsqueeze(1)
+
+        B = preds.shape[0]
+        take = min(B, n_windows - collected)
+
+        all_preds.append(preds[:take].cpu())
+        all_targets.append(y_raw[:take].cpu())
+        all_masks.append(y_mask_raw[:take].cpu())
+        all_deltas.append(delta_steps[:take].cpu())
+        all_w_hours.append(x_hours[:take, 0].cpu())   # start of window
+        all_t_hours.append(y_hours[:take].cpu())
+        collected += take
+
+    result = {
+        "preds":        torch.cat(all_preds,   dim=0),   # (M, K, N, V_target)
+        "targets":      torch.cat(all_targets, dim=0),   # (M, K, N, V)
+        "masks":        torch.cat(all_masks,   dim=0),   # (M, K, N, V)
+        "delta_steps":  torch.cat(all_deltas,  dim=0),   # (M, K)
+        "window_hours": torch.cat(all_w_hours, dim=0),   # (M,)
+        "target_hours": torch.cat(all_t_hours, dim=0),   # (M, K)
+        "spatial":      spatial_saved,                    # (N, 15)
+        "var_names":    TARGET_VARIABLE_NAMES,
+        "n_windows":    collected,
+    }
+
+    if save_path:
+        import os
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        torch.save(result, save_path)
+        size_mb = os.path.getsize(save_path) / 1e6
+        print(f"  Saved {collected} windows → {save_path}  ({size_mb:.0f} MB)")
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Seasonal metrics breakdown
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def compute_seasonal_metrics(
+    model:     nn.Module,
+    loader:    DataLoader,
+    device:    torch.device,
+    obs_stats: "dict | None" = None,
+) -> dict[str, dict[str, float]]:
+    """
+    Compute evaluate_full()-style metrics split by meteorological season.
+
+    Seasons (NH convention):
+        DJF — Dec, Jan, Feb  (winter)
+        MAM — Mar, Apr, May  (spring)
+        JJA — Jun, Jul, Aug  (summer)
+        SON — Sep, Oct, Nov  (autumn)
+
+    Returns a dict mapping season name → metrics dict (same keys as evaluate_full).
+    """
+    import datetime
+
+    _EPOCH = datetime.datetime(1970, 1, 1)
+
+    def _season(hours: float) -> str:
+        dt    = _EPOCH + datetime.timedelta(hours=float(hours))
+        month = dt.month
+        if month in (12, 1, 2):  return "DJF"
+        if month in (3,  4, 5):  return "MAM"
+        if month in (6,  7, 8):  return "JJA"
+        return "SON"
+
+    # Collect per-season records: same structure as evaluate_full
+    season_records: dict[str, list] = {"DJF": [], "MAM": [], "JJA": [], "SON": []}
+
+    model.eval()
+
+    for batch in loader:
+        x           = batch["x"].to(device)
+        x_mask      = batch["x_mask"].to(device)
+        spatial     = batch["spatial"].to(device)
+        x_hours     = batch["x_hours"].to(device)
+        y_raw       = batch["y"].to(device)
+        y_mask_raw  = batch["y_mask"].to(device)
+        y_hours     = batch["y_hours"].to(device)
+        delta_steps = batch["delta_steps"].to(device)
+
+        if spatial.dim() == 3:
+            spatial = spatial[0]
+
+        if y_raw.dim() == 4:
+            _, preds, _ = model.forward_multi_delta(
+                x, x_mask, spatial, x_hours,
+                y_raw, y_mask_raw, y_hours, delta_steps,
+            )
+            K = preds.shape[1]
+        else:
+            _, preds, _ = model(x, x_mask, spatial, x_hours,
+                                y_raw, y_mask_raw, y_hours, delta_steps)
+            preds       = preds.unsqueeze(1)
+            y_raw       = y_raw.unsqueeze(1)
+            y_mask_raw  = y_mask_raw.unsqueeze(1)
+            delta_steps = delta_steps.unsqueeze(1)
+            K = 1
+
+        B, _, N, _ = y_raw.shape
+
+        # Classify each sample by the season of its window start
+        for b in range(B):
+            s = _season(x_hours[b, 0].item())
+            for k in range(K):
+                y_target      = y_raw[b, k, :, :NUM_TARGET_VARIABLES].cpu()
+                y_mask_target = y_mask_raw[b, k, :, :NUM_TARGET_VARIABLES].cpu()
+                pred_bk       = preds[b, k].cpu()
+                ds_bk         = int(delta_steps[b, k].item()) if delta_steps.dim() == 2 \
+                                 else int(delta_steps[b].item())
+                season_records[s].append({
+                    "pred":   pred_bk.reshape(N, NUM_TARGET_VARIABLES),
+                    "target": y_target.reshape(N, NUM_TARGET_VARIABLES),
+                    "mask":   y_mask_target.reshape(N, NUM_TARGET_VARIABLES),
+                    "delta":  ds_bk,
+                    "N":      N,
+                })
+
+    # Compute metrics per season
+    seasonal_metrics: dict[str, dict[str, float]] = {}
+
+    for season, recs in season_records.items():
+        if not recs:
+            seasonal_metrics[season] = {}
+            continue
+
+        preds_all   = torch.cat([r["pred"]   for r in recs], dim=0)
+        targets_all = torch.cat([r["target"] for r in recs], dim=0)
+        masks_all   = torch.cat([r["mask"]   for r in recs], dim=0).bool()
+
+        m: dict[str, float] = {"n_samples": float(len(recs))}
+
+        for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
+            mv = masks_all[:, v]
+            if mv.sum() == 0:
+                m[f"{var_name}_rmse_norm"] = float("nan")
+                m[f"{var_name}_mae_norm"]  = float("nan")
+                continue
+            err = preds_all[mv, v] - targets_all[mv, v]
+            m[f"{var_name}_rmse_norm"] = float(err.pow(2).mean().sqrt().item())
+            m[f"{var_name}_mae_norm"]  = float(err.abs().mean().item())
+
+        if masks_all.sum() > 0:
+            err_all = preds_all[masks_all] - targets_all[masks_all]
+            m["overall_rmse_norm"] = float(err_all.pow(2).mean().sqrt().item())
+            m["overall_mae_norm"]  = float(err_all.abs().mean().item())
+
+        # Physical units
+        if obs_stats is not None:
+            _std = obs_stats["std"].cpu()
+            std_per_var = _std.mean(dim=0) if _std.dim() == 2 else _std
+            for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
+                mv  = masks_all[:, v]
+                sv  = float(std_per_var[v].item())
+                if mv.sum() > 0:
+                    err = (preds_all[mv, v] - targets_all[mv, v]) * sv
+                    m[f"{var_name}_rmse"] = float(err.pow(2).mean().sqrt().item())
+                    m[f"{var_name}_mae"]  = float(err.abs().mean().item())
+
+        seasonal_metrics[season] = m
+
+    return seasonal_metrics
     print()

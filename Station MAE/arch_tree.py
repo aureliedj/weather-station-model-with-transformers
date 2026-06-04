@@ -3,10 +3,19 @@
 arch_tree.py — Station-MAE architecture tree with live tensor shapes.
 
 Run from the "Station MAE/" directory (no GPU needed):
-    python arch_tree.py                          # factorised encoder, cross-attn decoder
-    python arch_tree.py --joint                  # joint spatiotemporal encoder
-    python arch_tree.py --flat                   # flat encoder (no factorisation)
+
+  # Current production config (tw12-d1024-v2, run_full_cloud.sh):
+    python arch_tree.py
+
+  # Override specific settings:
     python arch_tree.py --window 72 --stations 20 --d_model 64
+    python arch_tree.py --joint                  # joint spatiotemporal encoder
+    python arch_tree.py --factorised             # factorised axial encoder
+    python arch_tree.py --flat --temporal_window 0  # full flat (no windowing)
+
+Defaults reflect the current run_full_cloud.sh configuration:
+    flat encoder + temporal_window=12, d_model=1024, enc_layers=6, dec_layers=4,
+    cross-attn decoder, window=72, stations=155, mask_ratio=0.5
 """
 import argparse
 import torch
@@ -14,15 +23,17 @@ import torch
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
 p = argparse.ArgumentParser()
-p.add_argument("--joint",      action="store_true", help="Joint spatiotemporal encoder (RoPE)")
-p.add_argument("--flat",       action="store_true", help="Flat (un-factorised) encoder")
-p.add_argument("--concat_dec", action="store_true", help="Concatenated self-attn decoder (default: cross-attn)")
-p.add_argument("--window",     type=int, default=12, help="W: input timesteps (default 12)")
-p.add_argument("--stations",   type=int, default=16, help="N: stations (default 16)")
-p.add_argument("--d_model",    type=int, default=32, help="d_model (default 32)")
-p.add_argument("--enc_layers", type=int, default=3)
-p.add_argument("--dec_layers", type=int, default=2)
-p.add_argument("--mask_ratio", type=float, default=0.5)
+p.add_argument("--joint",            action="store_true", help="Joint spatiotemporal encoder (RoPE)")
+p.add_argument("--factorised",       action="store_true", help="Factorised axial encoder")
+p.add_argument("--flat",             action="store_true", help="Full flat encoder (no windowing)")
+p.add_argument("--concat_dec",       action="store_true", help="Concatenated self-attn decoder (default: cross-attn)")
+p.add_argument("--window",           type=int,   default=72,   help="W: input timesteps (default 72 = 12h)")
+p.add_argument("--stations",         type=int,   default=155,  help="N: stations after PFA exclusion (default 155)")
+p.add_argument("--d_model",          type=int,   default=1024, help="d_model (default 1024)")
+p.add_argument("--enc_layers",       type=int,   default=6)
+p.add_argument("--dec_layers",       type=int,   default=4)
+p.add_argument("--mask_ratio",       type=float, default=0.5)
+p.add_argument("--temporal_window",  type=int,   default=12,   help="Temporal chunk size (default 12 = 2h chunks)")
 args = p.parse_args()
 
 B, W, N, V = 2, args.window, args.stations, 6
@@ -34,21 +45,38 @@ N_masked   = N - N_vis
 
 from model.mae import StationMAE
 
+# Derive encoder mode from flags:
+# --joint      → joint spatiotemporal + RoPE
+# --factorised → factorised axial (temporal + spatial sub-layers)
+# --flat       → full flat (no windowing, overrides temporal_window)
+# default      → flat + temporal_window=12 (windowed flat, current production config)
+_is_flat        = not args.joint and not args.factorised
+_temporal_win   = 0 if args.flat else args.temporal_window
+_num_heads      = max(2, D // 64)   # scale heads with d_model (1 head per 64 dims)
+
 model = StationMAE(
     d_model                 = D,
-    enc_heads               = 2,
+    enc_heads               = _num_heads,
     enc_layers              = args.enc_layers,
-    dec_heads               = 2,
+    dec_heads               = _num_heads,
     dec_layers              = args.dec_layers,
-    mlp_ratio               = 2.0,
+    mlp_ratio               = 4.0,
     dropout                 = 0.0,
     mask_ratio              = args.mask_ratio,
-    factorised_encoder      = not args.joint and not args.flat,
+    factorised_encoder      = args.factorised,
     joint_encoder           = args.joint,
+    temporal_window         = _temporal_win,
     cross_attention_decoder = not args.concat_dec,
 ).eval()
 
-enc_mode = "joint" if args.joint else ("flat" if args.flat else "factorised")
+if args.joint:
+    enc_mode = "joint (RoPE)"
+elif args.factorised:
+    enc_mode = f"factorised" + (f" tw={_temporal_win}" if _temporal_win else "")
+elif _temporal_win:
+    enc_mode = f"flat windowed (tw={_temporal_win})"
+else:
+    enc_mode = "flat (full attention)"
 dec_mode = "concat self-attn" if args.concat_dec else "cross-attn"
 
 # ── Forward hooks ──────────────────────────────────────────────────────────────
@@ -158,6 +186,11 @@ row(1, "stn_emb",   r["stn_emb"][0],  r["stn_emb"][2],   "where-2: topo characte
 row(1, "temp_emb",  r["temp_emb"][0], r["temp_emb"][2],  "when:    hours → Aurora Fourier")
 row(1, "tok_norm",  r["tok_norm"][0], r["tok_norm"][2],  "Σ four embeddings → LayerNorm")
 print()
+if _temporal_win and _is_flat:
+    _chunks   = W // _temporal_win
+    _chunk_L  = _temporal_win * N_vis
+    print(f"  │  Temporal windowing  tw={_temporal_win} → {_chunks} chunks × {_chunk_L} tokens/chunk")
+    print(f"  │    (vs full flat L={W*N_vis:,}  —  {(W*N_vis)**2/(_chunks*_chunk_L**2):.0f}× cheaper attention)")
 print(f"  │  Station masking  (mask_ratio={args.mask_ratio:.0%})")
 print(f"  │    visible  {(B, W, N_vis, D)}   N_vis={N_vis}")
 print(f"  │    masked   {(B, N_masked)}        N_masked={N_masked}  (indices only, not processed)")

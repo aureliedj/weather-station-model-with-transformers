@@ -18,8 +18,9 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"   # ← update if needed
-SAVE_DIR="checkpoints/smoke_test"
+SAVE_DIR="/home/renku/work/weather-station-model-with-transformers/Station MAE/checkpoints/smoke_test"
 LOCAL_CACHE="/tmp/station_mae_cache"
+POLYBOX_DIR="/home/renku/work/polybox-capstone/checkpoints"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
 EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historical coverage
@@ -69,4 +70,5 @@ python main.py \
     $TEMPORAL_WINDOW \
     $INDEX_MODE \
     $EXCLUDE \
-    --save_dir         "$SAVE_DIR"
+    --save_dir         "$SAVE_DIR" \
+    --polybox_dir      "$POLYBOX_DIR"

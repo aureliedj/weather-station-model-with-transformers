@@ -48,7 +48,9 @@ python test.py \
     --index_mode       "$INDEX_MODE" \
     --exclude_stations PFA \
     --test_mask_ratios $MASK_RATIOS \
-    --gap_fill_repeats 5 \
+    --gap_fill_repeats 3 \
+    --save_predictions 200 \
+    --seasonal \
     $GLOBAL_NORM \
     --save_dir         "$SAVE_DIR" \
     --wandb_project    station-mae \

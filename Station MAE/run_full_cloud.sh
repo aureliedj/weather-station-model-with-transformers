@@ -177,7 +177,8 @@ python main.py \
     $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   tw12-d1024-v2 \
-    --save_dir         "$SAVE_DIR"
+    --save_dir         "$SAVE_DIR" \
+    --polybox_dir      /home/renku/work/polybox-capstone/checkpoints
 
 # ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
 #

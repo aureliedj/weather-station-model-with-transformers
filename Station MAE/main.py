@@ -90,6 +90,7 @@ Arguments
 import argparse
 import os
 import random
+import shutil
 import threading
 import time
 
@@ -253,6 +254,12 @@ def parse_args() -> argparse.Namespace:
 
     # Checkpointing
     p.add_argument("--save_dir",        type=str, default="checkpoints")
+    p.add_argument("--polybox_dir",     type=str, default=None,
+                   help="If set, copy best.ckpt and last.ckpt to this directory after "
+                        "each validation. Useful for persisting checkpoints to a remote "
+                        "mount (e.g. Polybox). The WandB run name is appended as a "
+                        "subdirectory so multiple runs stay organised. "
+                        "Example: --polybox_dir /home/renku/work/polybox-capstone/checkpoints")
     p.add_argument("--save_every",      type=int, default=5)
     p.add_argument("--save_every_steps", type=int, default=0,
                    help="Save a periodic checkpoint every N training steps (0 = off, "
@@ -311,6 +318,42 @@ def set_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+class CopyCheckpointToPolybox:
+    """
+    Lightning callback that copies best.ckpt and last.ckpt to a remote
+    directory (e.g. Polybox mount) after every validation run.
+
+    Files are copied to ``{polybox_dir}/{run_name}/`` so multiple training
+    runs stay organised by their WandB run name.  Failures (e.g. mount
+    temporarily unavailable) are caught and logged without crashing training.
+    """
+
+    def __init__(self, src_dir: str, polybox_dir: str, run_name: str):
+        self.src_dir = src_dir
+        self.dst_dir = os.path.join(polybox_dir, run_name)
+        try:
+            os.makedirs(self.dst_dir, exist_ok=True)
+            print(f"[Polybox] Checkpoint mirror: {self.dst_dir}")
+        except Exception as e:
+            print(f"[Polybox] WARNING — could not create {self.dst_dir}: {e}")
+
+    def _copy(self, filename: str) -> None:
+        src = os.path.join(self.src_dir, filename)
+        dst = os.path.join(self.dst_dir, filename)
+        if not os.path.exists(src):
+            return
+        try:
+            shutil.copy2(src, dst)
+            size_mb = os.path.getsize(dst) / 1e6
+            print(f"[Polybox] ✓ {filename}  ({size_mb:.0f} MB) → {self.dst_dir}")
+        except Exception as e:
+            print(f"[Polybox] WARNING — could not copy {filename}: {e}")
+
+    def on_validation_end(self, trainer, pl_module) -> None:   # noqa: N802
+        self._copy("best.ckpt")
+        self._copy("last.ckpt")
+
 
 def main() -> None:
     args = parse_args()
@@ -618,6 +661,17 @@ def main() -> None:
         # Learning rate monitor — logs train/lr to WandB automatically
         LearningRateMonitor(logging_interval="step"),
     ]
+
+    if args.polybox_dir:
+        _run_name = args.wandb_run_name or "unnamed-run"
+        callbacks.append(
+            CopyCheckpointToPolybox(
+                src_dir    = args.save_dir,
+                polybox_dir= args.polybox_dir,
+                run_name   = _run_name,
+            )
+        )
+        print(f"Polybox mirror           : {args.polybox_dir}/{_run_name}/")
 
     if args.patience > 0:
         callbacks.append(

@@ -159,6 +159,15 @@ def parse_args() -> argparse.Namespace:
                         "    Fast evaluation; use for paper metrics and quick checks.")
     p.add_argument("--save_dir",          type=str, default="test_results")
     p.add_argument("--no_plots",          action="store_true")
+    p.add_argument("--save_predictions",  type=int, default=0,
+                   help="Save raw predictions for N test windows to a .pt file "
+                        "(0 = disabled). Enables time-series and spatial plots in "
+                        "the notebook. Each window includes preds, targets, masks, "
+                        "delta_steps, timestamps, and station spatial features. "
+                        "~40 MB per 100 windows at d_model=1024.")
+    p.add_argument("--seasonal",          action="store_true",
+                   help="Compute and save per-season metrics (DJF/MAM/JJA/SON). "
+                        "Useful for analysing model behaviour across weather regimes.")
     p.add_argument("--gap_fill_repeats",  type=int, default=3,
                    help="Number of random masks per window for gap-filling eval (default 3)")
     p.add_argument("--wandb_project",     type=str, default=None,
@@ -569,6 +578,30 @@ def main() -> None:
     print(f"  window={window}  max_delta={max_delta}  mode={_mode_str}  "
           f"d_model={_d_model}  enc_layers={_enc_layers}  dec_layers={_dec_layers}")
 
+    # ── WandB — initialise early so the run appears immediately ──────────
+    _wandb_run = None
+    if args.wandb_project:
+        try:
+            import wandb as _wandb
+            _run_name = args.wandb_run_name or f"test-{os.path.splitext(os.path.basename(args.checkpoint[0]))[0]}"
+            _wandb_run = _wandb.init(
+                project  = args.wandb_project,
+                name     = _run_name,
+                job_type = "evaluation",
+                config   = {
+                    "checkpoints":    args.checkpoint,
+                    "index_mode":     args.index_mode,
+                    "test_mask_ratios": args.test_mask_ratios,
+                    "global_norm":    args.global_norm,
+                    "gap_fill_repeats": args.gap_fill_repeats,
+                    "window":         window,
+                    "max_delta":      max_delta,
+                },
+            )
+            print(f"WandB run                : {_run_name}  (project={args.wandb_project})")
+        except ImportError:
+            print("  [WandB] wandb not installed — skipping")
+
     # ── Data ─────────────────────────────────────────────────────────────
     from data.dataset import load_peakweather, StationMAEDataset
 
@@ -657,28 +690,33 @@ def main() -> None:
 
     from model.embeddings import TARGET_VARIABLE_NAMES
 
-    # ── Lead-1 dataset + persistence baseline (forecasting mode only) ────
+    # ── Lead-30min dataset + persistence baseline (forecasting mode only) ─
+    # Lead times follow the same 30-min fixed grid as training.
+    # delta=3 steps = 30 min is the first non-zero horizon in the grid.
+    # The old lead-1 (delta=1 = 10 min) has been removed — it is not part
+    # of the training grid and produces inconsistent comparisons.
     lead1_loader   = None
     persist_metrics: dict = {}
 
     if not _is_inpainting:
-        print("Building lead-1 test dataset (delta_steps=1, fixed) …")
+        _lead_delta = delta_grid_stride   # 3 steps = 30 min (matches training grid)
+        print(f"Building lead-{_lead_delta*10}min test dataset (delta={_lead_delta} steps) …")
         lead1_ds = StationMAEDataset(
             ds,
             window_size=window,
-            delta_steps=1,
+            delta_steps=_lead_delta,
             split="test",
             obs_stats=obs_stats,
             num_delta_per_sample=1,
-            max_delta_steps=1,
+            max_delta_steps=_lead_delta,
             cache_dir=cache_dir,
             exclude_stations=exclude_stations,
             delta_mode="random",
-            delta_grid_stride=1,
+            delta_grid_stride=_lead_delta,
             index_mode=args.index_mode,
             global_norm=args.global_norm,
         )
-        print(f"  lead-1 test samples: {len(lead1_ds):,}")
+        print(f"  lead-{_lead_delta*10}min test samples: {len(lead1_ds):,}")
 
         lead1_loader = DataLoader(
             lead1_ds,
@@ -699,7 +737,7 @@ def main() -> None:
         print(f"    {'[overall]':<14}  "
               f"{persist_metrics.get('persist_overall_rmse_norm', float('nan')):.5f}")
     else:
-        print("  [Inpainting mode] Skipping lead-1 dataset and persistence baseline.")
+        print("  [Inpainting mode] Skipping lead-30min dataset and persistence baseline.")
 
     # ── Per-checkpoint evaluation ─────────────────────────────────────────
     all_results:       list[dict] = []
@@ -872,11 +910,12 @@ def main() -> None:
 
                 # ── Lead-1 ─────────────────────────────────────────────
                 t0 = _time.time()
-                print(f"\n  Running evaluate_full() [lead-1 / 10-min forecast] …")
+                _lead_min = delta_grid_stride * 10
+                print(f"\n  Running evaluate_full() [lead-{_lead_min}min forecast] …")
                 lead1_metrics = evaluate_full(model, lead1_loader, device, obs_stats=obs_stats)
-                print("\n── Lead-1 (10-min forecast) · all stations ──────────────────────")
+                print(f"\n── Lead-{_lead_min}min forecast · all stations ─────────────────────────")
                 print_full_metrics(lead1_metrics, obs_stats=obs_stats)
-                print(f"  ⏱  lead-1: {_time.time()-t0:.0f}s")
+                print(f"  ⏱  lead-{_lead_min}min: {_time.time()-t0:.0f}s")
 
                 # ── Gap-filling (skip when mask_ratio=0) ───────────────
                 if _test_mr > 0:
@@ -893,6 +932,63 @@ def main() -> None:
                     print(f"  ⏱  gap-filling: {_time.time()-t0:.0f}s")
                 else:
                     print("\n  [skip] gap-filling — mask_ratio=0.0, all stations visible")
+
+            from engine.evaluate import (
+                build_delta_variable_matrix,
+                collect_predictions,
+                compute_seasonal_metrics,
+            )
+
+            # ── Variable × delta RMSE matrix ────────────────────────────
+            _mat = build_delta_variable_matrix(metrics)
+            if _mat:
+                import pandas as pd
+                _mat_df = pd.DataFrame(_mat).T   # rows=variables, cols=lead times
+                _mat_path = os.path.join(mr_save, "delta_variable_rmse_matrix.csv")
+                _mat_df.to_csv(_mat_path)
+                print(f"\n── Variable × lead-time RMSE matrix ──────────────────────────")
+                print(_mat_df.to_string(float_format=lambda x: f"{x:.4f}"))
+                print(f"  Saved: {_mat_path}")
+
+            # ── Save raw predictions for notebook ────────────────────────
+            if args.save_predictions > 0:
+                t0 = _time.time()
+                print(f"\n  Saving {args.save_predictions} raw prediction windows …")
+                _pred_path = os.path.join(mr_save, "predictions.pt")
+                collect_predictions(
+                    model, test_loader, device,
+                    n_windows=args.save_predictions,
+                    save_path=_pred_path,
+                )
+                print(f"  ⏱  predictions: {_time.time()-t0:.0f}s")
+
+            # ── Seasonal metrics ─────────────────────────────────────────
+            if args.seasonal:
+                t0 = _time.time()
+                print("\n  Computing seasonal metrics (DJF / MAM / JJA / SON) …")
+                _seas = compute_seasonal_metrics(model, test_loader, device,
+                                                 obs_stats=obs_stats)
+                print(f"\n── Seasonal RMSE (normalised) ──────────────────────────────────")
+                print(f"  {'Season':<6}  {'N':>6}  " +
+                      "  ".join(f"{v[:4]:>6}" for v in TARGET_VARIABLE_NAMES) +
+                      "  overall")
+                print("  " + "-" * 62)
+                for s in ["DJF", "MAM", "JJA", "SON"]:
+                    sm = _seas.get(s, {})
+                    n  = int(sm.get("n_samples", 0))
+                    vals = "  ".join(
+                        f"{sm.get(f'{v}_rmse_norm', float('nan')):>6.4f}"
+                        for v in TARGET_VARIABLE_NAMES
+                    )
+                    ov = sm.get("overall_rmse_norm", float("nan"))
+                    print(f"  {s:<6}  {n:>6,}  {vals}  {ov:.4f}")
+
+                # Save seasonal CSV
+                import pandas as pd
+                _seas_df = pd.DataFrame(_seas).T
+                _seas_path = os.path.join(mr_save, "seasonal_metrics.csv")
+                _seas_df.to_csv(_seas_path)
+                print(f"  Saved: {_seas_path}  ⏱  {_time.time()-t0:.0f}s")
 
             # Accumulate for summary table and CSV
             all_results.append({
