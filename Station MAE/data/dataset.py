@@ -236,26 +236,43 @@ def normalise_observations(
     """
     T, N, V = obs.shape
 
-    # Number of present timesteps per (station, variable)
-    count = mask.sum(dim=0).clamp(min=1.0)                       # (N, V)
+    # Minimum number of training observations required to use per-station stats.
+    # Stations with fewer observations fall back to cross-station global stats,
+    # preventing near-zero stds (and their reciprocals → astronomical normalised
+    # values) for stations that were inactive during the training period.
+    MIN_OBS = 50
 
-    # Per-(station, variable) mean over present values
-    # Absent values are 0 in obs, so obs*mask correctly ignores them
-    means = (obs * mask).sum(dim=0) / count                       # (N, V)
+    raw_count = mask.sum(dim=0)                                    # (N, V) unclipped
+    count     = raw_count.clamp(min=1.0)
 
-    # Per-(station, variable) std: E[(x - mu)^2] over present values
-    diff_sq = ((obs - means.unsqueeze(0)) ** 2) * mask            # (T, N, V)
-    stds    = (diff_sq.sum(dim=0) / count.clamp(min=2.0)).sqrt()  # (N, V)
+    # ── Per-station mean ───────────────────────────────────────────────────────
+    means = (obs * mask).sum(dim=0) / count                        # (N, V)
 
-    # Floor each station's std at 1% of the cross-station mean std for that variable.
-    # This prevents stations with near-zero std (e.g. sparse coverage) from producing
-    # astronomical normalised values (physical_change / 1e-6 → huge RMSE).
-    global_mean_std = stds[stds > 0].mean() if (stds > 0).any() else torch.tensor(1.0)
-    stds = stds.clamp(min=max(1e-6, float(global_mean_std) * 0.01))
+    # ── Global (cross-station) fallback mean per variable ─────────────────────
+    _g_count = mask.sum(dim=(0, 1)).clamp(min=1)                   # (V,)
+    _g_mean  = (obs * mask).sum(dim=(0, 1)) / _g_count             # (V,)
 
-    # Normalise and zero-out absent entries
-    obs_norm = (obs - means.unsqueeze(0)) / stds.unsqueeze(0)     # (T, N, V)
-    obs_norm = obs_norm * mask                                     # zero absent
+    # ── Per-station std ────────────────────────────────────────────────────────
+    diff_sq = ((obs - means.unsqueeze(0)) ** 2) * mask             # (T, N, V)
+    stds    = (diff_sq.sum(dim=0) / count.clamp(min=2.0)).sqrt()   # (N, V)
+
+    # ── Global fallback std per variable ──────────────────────────────────────
+    _g_diff = ((obs - _g_mean[None, None, :]) ** 2) * mask        # (T, N, V)
+    _g_std  = (_g_diff.sum(dim=(0, 1)) / _g_count.clamp(min=2)).sqrt().clamp(min=1e-6)
+
+    # ── Replace sparse-station stats with global fallback ─────────────────────
+    # Any (station, variable) with fewer than MIN_OBS training observations uses
+    # the cross-station global mean and std instead of the per-station values.
+    # This guarantees normalised values stay in a sane range even for stations
+    # that had no data in the training years.
+    _sparse = raw_count < MIN_OBS                                   # (N, V) bool
+    means   = torch.where(_sparse, _g_mean.unsqueeze(0).expand_as(means), means)
+    stds    = torch.where(_sparse, _g_std.unsqueeze(0).expand_as(stds),   stds)
+    stds    = stds.clamp(min=1e-6)
+
+    # ── Normalise and zero-out absent entries ──────────────────────────────────
+    obs_norm = (obs - means.unsqueeze(0)) / stds.unsqueeze(0)      # (T, N, V)
+    obs_norm = obs_norm * mask                                      # zero absent
 
     return obs_norm, {"mean": means, "std": stds}
 
@@ -308,12 +325,15 @@ _CACHE_FILENAME = "peakweather_obs_cache.pt"
 # Fast local cache  (numpy memmap — direct worker access, no IPC overhead)
 # ---------------------------------------------------------------------------
 
-_FAST_CACHE_VERSION = "v3"
+_FAST_CACHE_VERSION = "v4"
 # Bump this when the on-disk format changes to force a rebuild.
 # v2: stores "all_valid_indices" (pre-mode pool) instead of post-stride
 #     "indices", so the windowing strategy can be changed without rebuilding.
 # v3: obs_stats["mean"] / ["std"] are now (N, V) per-station-per-variable
 #     tensors instead of (V,) global tensors.
+# v4: sparse-station fallback — stations with < 50 training observations use
+#     cross-station global stats to prevent near-zero stds and astronomical
+#     normalised values.
 
 
 def _fast_split_paths(fast_dir: str, split: str, train_years: list) -> dict:
