@@ -65,6 +65,7 @@ python main.py \
     --grad_clip        1.0 \
     --patience         0 \
     --min_lr           1e-6 \
+    --limit_val_batches 20 \
     --cross_attn_decoder \
     $ENCODER \
     $TEMPORAL_WINDOW \
