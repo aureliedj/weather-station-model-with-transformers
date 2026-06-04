@@ -319,15 +319,19 @@ def set_seed(seed: int) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
-class CopyCheckpointToPolybox:
+class CopyCheckpointToPolybox(object):
     """
-    Lightning callback that copies best.ckpt and last.ckpt to a remote
-    directory (e.g. Polybox mount) after every validation run.
+    Lightning-compatible callback that copies best.ckpt and last.ckpt to a
+    remote directory (e.g. Polybox mount) after every validation run.
 
     Files are copied to ``{polybox_dir}/{run_name}/`` so multiple training
     runs stay organised by their WandB run name.  Failures (e.g. mount
     temporarily unavailable) are caught and logged without crashing training.
     """
+
+    def __getattr__(self, name):
+        """Return a no-op for any Lightning hook not explicitly defined."""
+        return lambda *args, **kwargs: None
 
     def __init__(self, src_dir: str, polybox_dir: str, run_name: str):
         self.src_dir = src_dir
