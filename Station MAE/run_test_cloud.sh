@@ -14,8 +14,8 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
-CHECKPOINT="checkpoints/best.ckpt"
-SAVE_DIR="test_results/$(basename $(dirname $CHECKPOINT))"
+CHECKPOINT="/home/renku/work/polybox-capstone/checkpoints/full_run_cloud/best.ckpt"
+SAVE_DIR="test_results"
 
 # ── Window mode ───────────────────────────────────────────────────────────────
 # blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default
@@ -29,6 +29,13 @@ INDEX_MODE="blocks"
 # The model is loaded ONCE and evaluated at each ratio in sequence.
 # Results save to separate subdirs: test_results/.../best_mr0.00/, best_mr0.50/
 # A comparison table is printed at the end.
+# ── Normalisation mode ───────────────────────────────────────────────────────
+# Use --global_norm for checkpoints trained BEFORE per-station normalisation
+# was introduced (i.e. all baseline-cloud and early tw12-d1024 runs).
+# Omit (default) for new checkpoints trained with per-station normalisation.
+GLOBAL_NORM="--global_norm"
+# GLOBAL_NORM=""
+
 MASK_RATIOS="0.0 0.5"
 # MASK_RATIOS="0.5"                 # single ratio (faster)
 # MASK_RATIOS="0.0 0.25 0.5 0.75"  # full robustness sweep
@@ -42,6 +49,7 @@ python test.py \
     --exclude_stations PFA \
     --test_mask_ratios $MASK_RATIOS \
     --gap_fill_repeats 5 \
+    $GLOBAL_NORM \
     --save_dir         "$SAVE_DIR" \
     --wandb_project    station-mae \
     --wandb_run_name   "test-$(basename $CHECKPOINT .ckpt)-${INDEX_MODE}"

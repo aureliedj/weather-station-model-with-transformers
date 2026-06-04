@@ -602,31 +602,18 @@ def main() -> None:
               f"(~{args.val_check_interval * args.batch_size / 1000:.0f}k samples between checks)")
 
     callbacks = [
-        # Best checkpoint by val/loss
+        # Saves two files only:
+        #   best.ckpt  — lowest val/loss seen so far (overwritten in-place)
+        #   last.ckpt  — most recent epoch (overwritten in-place, used for resuming)
+        # save_top_k=1 + save_last=True is all that's needed — no periodic snapshots.
         ModelCheckpoint(
             dirpath=args.save_dir,
             filename="best",
             monitor="val/loss",
             mode="min",
             save_top_k=1,
-            save_last=True,             # also writes last.ckpt after every epoch
+            save_last=True,
             verbose=True,
-        ),
-        # Periodic numbered snapshots — epoch-based or step-based
-        *(
-            [ModelCheckpoint(
-                dirpath=args.save_dir,
-                filename="step_{step:07d}",
-                every_n_train_steps=args.save_every_steps,
-                save_top_k=-1,
-            )]
-            if args.save_every_steps > 0 else
-            [ModelCheckpoint(
-                dirpath=args.save_dir,
-                filename="epoch_{epoch:03d}",
-                every_n_epochs=args.save_every,
-                save_top_k=-1,
-            )]
         ),
         # Learning rate monitor — logs train/lr to WandB automatically
         LearningRateMonitor(logging_interval="step"),

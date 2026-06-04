@@ -56,7 +56,7 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
-SAVE_DIR="checkpoints/full_run_cloud"
+SAVE_DIR="/home/renku/work/polybox-capstone/checkpoints/full_run_cloud"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
@@ -164,7 +164,6 @@ python main.py \
     --weight_decay     0.05 \
     --grad_clip        0.5 \
     --limit_val_batches 200 \
-    --save_every       2 \
     --patience         50 \
     --min_lr           1e-6 \
     --amp \

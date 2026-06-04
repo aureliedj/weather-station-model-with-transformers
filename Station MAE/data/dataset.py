@@ -214,8 +214,9 @@ def build_observations(
 
 
 def normalise_observations(
-    obs:  torch.Tensor,
-    mask: torch.Tensor,
+    obs:         torch.Tensor,
+    mask:        torch.Tensor,
+    per_station: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """
     Normalise each (station, variable) pair to zero-mean unit-variance using
@@ -235,6 +236,19 @@ def normalise_observations(
         stats    : {"mean": (N, V), "std": (N, V)}
     """
     T, N, V = obs.shape
+
+    # ── Global normalization (old behaviour, one mean/std per variable) ────────
+    if not per_station:
+        means_g, stds_g = [], []
+        obs_norm = obs.clone()
+        for v in range(V):
+            vals = obs[:, :, v][mask[:, :, v] == 1.0]
+            m = vals.mean() if len(vals) > 0 else torch.tensor(0.0)
+            s = vals.std().clamp(min=1e-6) if len(vals) > 1 else torch.tensor(1.0)
+            obs_norm[:, :, v] = (obs[:, :, v] - m) / s * mask[:, :, v]
+            means_g.append(m)
+            stds_g.append(s)
+        return obs_norm, {"mean": torch.stack(means_g), "std": torch.stack(stds_g)}
 
     # Minimum number of training observations required to use per-station stats.
     # Stations with fewer observations fall back to cross-station global stats,
@@ -283,6 +297,7 @@ def compute_obs_stats(
     mask_full:   "torch.Tensor | None" = None,
     timestamps:  "list | None"         = None,
     train_years: "list[int] | None"    = None,
+    per_station: bool = True,
 ) -> dict:
     """
     Compute normalisation statistics from the training split.
@@ -310,7 +325,7 @@ def compute_obs_stats(
     train_idx  = [i for i, ts in enumerate(timestamps) if ts.year in years]
     obs_train  = obs_full[train_idx]
     mask_train = mask_full[train_idx]
-    _, stats   = normalise_observations(obs_train, mask_train)
+    _, stats   = normalise_observations(obs_train, mask_train, per_station=per_station)
     return stats
 
 
@@ -644,6 +659,7 @@ class StationMAEDataset(Dataset):
         delta_mode:           str  = "fixed_grid",
         delta_grid_stride:    int  = 3,
         random_epoch_size:    "int | None" = None,
+        global_norm:          bool = False,
     ):
         super().__init__()
 
@@ -807,10 +823,11 @@ class StationMAEDataset(Dataset):
         if obs_stats is None:
             self.obs_stats = compute_obs_stats(
                 ds,
-                obs_full     = obs_full,       # already log1p-transformed above
+                obs_full     = obs_full,
                 mask_full    = mask_full,
                 timestamps   = timestamps_full,
                 train_years  = effective_train_years,
+                per_station  = not global_norm,
             )
         else:
             # Stats passed in — assumed to be from train_ds.obs_stats
@@ -841,8 +858,14 @@ class StationMAEDataset(Dataset):
         # Absent values (mask==0) are zeroed after normalisation so the
         # learnable sensor_mask_token in the encoder can fill them cleanly.
         # ------------------------------------------------------------------
-        obs_norm = (obs - self.obs_stats["mean"].unsqueeze(0)) \
-                   / self.obs_stats["std"].unsqueeze(0)          # (T, N, V)
+        _mean = self.obs_stats["mean"]
+        _std  = self.obs_stats["std"]
+        if _mean.dim() == 1:
+            # Global (V,) stats — broadcast over T and N automatically
+            obs_norm = (obs - _mean) / _std
+        else:
+            # Per-station (N, V) stats — unsqueeze for T dimension
+            obs_norm = (obs - _mean.unsqueeze(0)) / _std.unsqueeze(0)
         obs_norm = obs_norm * mask                               # zero absent
 
         # Optionally place tensors in shared memory so DataLoader workers share

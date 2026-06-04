@@ -138,6 +138,12 @@ def parse_args() -> argparse.Namespace:
     # Output
     p.add_argument("--exclude_stations",   type=str, nargs="+", default=None,
                    help="Override checkpoint exclude_stations. Use abbreviation e.g. PFA.")
+    p.add_argument("--global_norm",       action="store_true",
+                   help="Use global per-variable normalisation (one mean/std per variable). "
+                        "Required when testing checkpoints trained before per-station "
+                        "normalisation was introduced. Without this flag, per-station "
+                        "normalisation is used, which is inconsistent with old checkpoints "
+                        "and produces astronomical RMSE values.")
     p.add_argument("--test_mask_ratios",  type=float, nargs="+", default=None,
                    help="One or more encoder mask ratios to sweep at inference time. "
                         "Default: use the trained mask_ratio from the checkpoint. "
@@ -598,6 +604,11 @@ def main() -> None:
     # Build train_ds only to get obs_stats (do not iterate over it).
     # Exclude the same stations as training so normalisation stats match exactly.
     print("Building train dataset for normalisation statistics …")
+    if args.global_norm:
+        print("  Normalisation: GLOBAL (per-variable) — use for old checkpoints")
+    else:
+        print("  Normalisation: per-station (per-station × per-variable)")
+
     train_ds = StationMAEDataset(
         ds, window_size=window, delta_steps=max_delta, split="train",
         num_delta_per_sample=1, max_delta_steps=max_delta,
@@ -605,6 +616,7 @@ def main() -> None:
         exclude_stations=exclude_stations,
         delta_mode=delta_mode,
         delta_grid_stride=delta_grid_stride,
+        global_norm=args.global_norm,
     )
     obs_stats = train_ds.obs_stats
     print("  obs_stats ready (train split)")
@@ -620,6 +632,7 @@ def main() -> None:
         delta_mode=delta_mode,
         delta_grid_stride=delta_grid_stride,
         index_mode=args.index_mode,
+        global_norm=args.global_norm,
     )
     _window_mode_str = (
         f"non-overlapping blocks (~{len(test_ds):,} windows)"
@@ -660,9 +673,10 @@ def main() -> None:
             max_delta_steps=1,
             cache_dir=cache_dir,
             exclude_stations=exclude_stations,
-            delta_mode="random",        # single fixed delta=1, not a grid
+            delta_mode="random",
             delta_grid_stride=1,
             index_mode=args.index_mode,
+            global_norm=args.global_norm,
         )
         print(f"  lead-1 test samples: {len(lead1_ds):,}")
 
