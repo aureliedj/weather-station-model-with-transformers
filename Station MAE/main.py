@@ -185,6 +185,16 @@ def parse_args() -> argparse.Namespace:
                         "--grad_checkpoint on ≤24 GB GPUs. Takes precedence over "
                         "--factorised_encoder.")
 
+    p.add_argument("--input_context_cross_attn", action="store_true",
+                   help="Add a final cross-attention block in the decoder that attends "
+                        "to the last-timestep input tokens for all N stations. "
+                        "Anchors short-horizon predictions to the most recent observation, "
+                        "moving the persistence crossover from ~45 min to ~15 min.")
+    p.add_argument("--accumulate_grad_batches", type=int, default=1,
+                   help="Gradient accumulation steps (default 1 = no accumulation). "
+                        "Effective batch_size = batch_size × accumulate_grad_batches. "
+                        "Use 4 with batch_size=4 for effective batch=16 without extra VRAM.")
+
     # Data augmentation / regularisation
     p.add_argument("--index_mode", type=str, default="sliding",
                    choices=["sliding", "blocks", "random"],
@@ -502,6 +512,7 @@ def main() -> None:
         drop_path_rate=args.drop_path_rate,
         masked_only_loss=args.masked_only_loss,
         joint_encoder=args.joint_encoder,
+        input_context_cross_attn=args.input_context_cross_attn,
     )
 
     _mode_labels = {
@@ -756,10 +767,14 @@ def main() -> None:
         _trainer_kwargs["limit_val_batches"] = args.limit_val_batches
         print(f"limit_val_batches        : {args.limit_val_batches}  "
               f"({args.limit_val_batches * args.batch_size:,} val samples per check)")
+    if args.accumulate_grad_batches > 1:
+        _trainer_kwargs["accumulate_grad_batches"] = args.accumulate_grad_batches
+        print(f"Gradient accumulation    : {args.accumulate_grad_batches}×  "
+              f"(effective batch={args.batch_size * args.accumulate_grad_batches})")
 
     trainer = pl.Trainer(
         max_epochs=args.epochs,
-        accelerator="auto",             # auto-selects CUDA → MPS → CPU
+        accelerator="auto",
         devices="auto",
         precision=precision,
         gradient_clip_val=args.grad_clip,
@@ -767,7 +782,7 @@ def main() -> None:
         logger=logger,
         log_every_n_steps=args.log_every_n_steps,
         enable_progress_bar=True,
-        deterministic=False,            # True slows training; seed already set
+        deterministic=False,
         profiler=profiler,
         **_trainer_kwargs,
     )

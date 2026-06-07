@@ -109,7 +109,8 @@ ENCODER=""                                         # flat self-attention over W�
 #   W=72, tw=6 → 12 one-hour chunks, 12× cheaper temporal sub-layer.
 #   TEMPORAL_WINDOW="--temporal_window 6"
 #
-TEMPORAL_WINDOW="--temporal_window 12"
+TEMPORAL_WINDOW="--temporal_window 6"
+# TEMPORAL_WINDOW="--temporal_window 12"  # previous setting
 # TEMPORAL_WINDOW=""   # ← disable windowing (full attention)
 
 # ── Window sampling strategy ──────────────────────────────────────────────────
@@ -151,8 +152,8 @@ python main.py \
     --delta_grid_stride 3 \
     --mlp_ratio        4.0 \
     --d_model          1024 \
-    --enc_layers       6 \
-    --dec_layers       4 \
+    --enc_layers       4 \
+    --dec_layers       6 \
     --mask_ratio       0.5 \
     --dropout          0.0 \
     --drop_path_rate   0.0 \
@@ -163,9 +164,11 @@ python main.py \
     --warmup_epochs    15 \
     --weight_decay     0.05 \
     --grad_clip        0.5 \
+    --accumulate_grad_batches 4 \
+    --input_context_cross_attn \
     --limit_val_batches 200 \
     --patience         50 \
-    --min_lr           1e-6 \
+    --min_lr           5e-7 \
     --amp \
     --bf16 \
     --compile \
@@ -176,7 +179,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw12-d1024-v2 \
+    --wandb_run_name   tw6-d1024-v3 \
     --save_dir         "$SAVE_DIR" \
     --polybox_dir      /home/renku/work/polybox-capstone/checkpoints
 

@@ -933,6 +933,10 @@ class StationMAEEncoder(nn.Module):
         # 1. Build full token representations
         tokens = self._build_tokens(x, x_mask, spatial, x_hours)  # (B, W, N, d_model)
 
+        # Extract last-timestep tokens for ALL N stations (before masking).
+        # Returned as input_context for the decoder's cross-attention to recent obs.
+        input_context = tokens[:, -1, :, :]   # (B, N, d_model)
+
         # 2. Mask stations → visible_tokens: (B, W, N_vis, d_model)  [unflattened]
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
         B_sz, W_sz, N_vis, D = visible_tokens.shape
@@ -963,4 +967,4 @@ class StationMAEEncoder(nn.Module):
                     h = block(h)
 
         h = self.norm(h)                                           # (B, W*N_vis, d_model)
-        return h, masked_idx, visible_idx
+        return h, masked_idx, visible_idx, input_context          # 4th: (B, N, d_model)

@@ -33,8 +33,8 @@ INDEX_MODE="blocks"
 # Use --global_norm for checkpoints trained BEFORE per-station normalisation
 # was introduced (i.e. all baseline-cloud and early tw12-d1024 runs).
 # Omit (default) for new checkpoints trained with per-station normalisation.
-GLOBAL_NORM="--global_norm"
-# GLOBAL_NORM=""
+# GLOBAL_NORM="--global_norm"
+GLOBAL_NORM=""
 
 MASK_RATIOS="0.0 0.5"
 # MASK_RATIOS="0.5"                 # single ratio (faster)

@@ -198,9 +198,10 @@ class StationMAEDecoder(nn.Module):
         fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
         delta_fourier_dim:    int   = DELTA_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
-        use_checkpoint:       bool  = False,
-        cross_attention:      bool  = False,
-        drop_path_rate:       float = 0.0,
+        use_checkpoint:          bool  = False,
+        cross_attention:         bool  = False,
+        drop_path_rate:          float = 0.0,
+        input_context_cross_attn: bool = False,
     ):
         super().__init__()
 
@@ -269,6 +270,25 @@ class StationMAEDecoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
         # ------------------------------------------------------------------
+        # Optional: final cross-attention to last-timestep input tokens.
+        #
+        # After the main decoder blocks have integrated encoder context, this
+        # extra CrossAttentionBlock lets query tokens directly read the most
+        # recent (t=W-1) observation of ALL N stations — including the masked
+        # ones whose last known value is still visible here.
+        #
+        # This anchors short-horizon predictions to the last observed state,
+        # which is exactly what persistence uses.  The model can now learn
+        # "copy + small correction" rather than having to reconstruct the
+        # recent state from the compressed encoder output alone.
+        # ------------------------------------------------------------------
+        self.use_input_context = input_context_cross_attn
+        if input_context_cross_attn:
+            self.input_cross_attn = CrossAttentionBlock(
+                d_model, num_heads, mlp_ratio, dropout, drop_path=0.0
+            )
+
+        # ------------------------------------------------------------------
         # Prediction head: d_model → num_target_vars
         # Precipitation is excluded from the output — it is used as input
         # context only (zero-inflated distribution makes MSE a poor fit).
@@ -281,10 +301,11 @@ class StationMAEDecoder(nn.Module):
 
     def forward(
         self,
-        encoded_vis: torch.Tensor,    # (B, W*N_vis, d_model)  — encoder output
-        spatial:     torch.Tensor,    # (N, 15) or (B, N, 15)  — [:2]=pos, [2:]=char
-        y_hours:     torch.Tensor,    # (B,) or (B, K)  hours since epoch for target(s)
-        delta_steps: torch.Tensor,    # (B,) or (B, K)  forecast horizon(s) in 10-min steps
+        encoded_vis:   torch.Tensor,           # (B, W*N_vis, d_model) — encoder output
+        spatial:       torch.Tensor,           # (N, 15) or (B, N, 15)
+        y_hours:       torch.Tensor,           # (B,) or (B, K)
+        delta_steps:   torch.Tensor,           # (B,) or (B, K)
+        input_context: "torch.Tensor | None" = None,  # (B, N, d_model) last-timestep tokens
     ) -> torch.Tensor:
         """
         Predict variables for all N stations at one or K target times.
@@ -355,27 +376,27 @@ class StationMAEDecoder(nn.Module):
             queries = self.query_norm(queries)                      # (B, N, d_model)
 
             if self.use_cross_attention:
-                # ── Cross-attention: queries attend TO encoder context ────
-                # Sequence fed to blocks is just (B, N, d_model) — no concat.
                 h = queries
                 for block in self.blocks:
                     if self.use_checkpoint and torch.is_grad_enabled():
                         h = _cp_checkpoint(block, h, encoded_vis, use_reentrant=False)
                     else:
                         h = block(h, encoded_vis)
-                h = self.norm(h)                                    # (B, N, d_model)
             else:
-                # ── Original: concatenate encoder context + queries ───────
-                full_seq = torch.cat([encoded_vis, queries], dim=1) # (B, L_ctx+N, d_model)
+                full_seq = torch.cat([encoded_vis, queries], dim=1)
                 h = full_seq
                 for block in self.blocks:
                     if self.use_checkpoint and torch.is_grad_enabled():
                         h = _cp_checkpoint(block, h, use_reentrant=False)
                     else:
                         h = block(h)
-                h = self.norm(h)
                 h = h[:, -N:, :]                                    # (B, N, d_model)
 
+            # ── Optional: cross-attend to last-timestep input tokens ────
+            if self.use_input_context and input_context is not None:
+                h = self.input_cross_attn(h, input_context)         # (B, N, d_model)
+
+            h = self.norm(h)
             return self.head(h)                                     # (B, N, num_target_vars)
 
         else:
@@ -392,16 +413,13 @@ class StationMAEDecoder(nn.Module):
             queries_seq = queries_NK.reshape(B, N * K, self.d_model)   # (B, N*K, d_model)
 
             if self.use_cross_attention:
-                # ── Cross-attention: N*K queries attend TO encoder context ─
                 h = queries_seq
                 for block in self.blocks:
                     if self.use_checkpoint and torch.is_grad_enabled():
                         h = _cp_checkpoint(block, h, encoded_vis, use_reentrant=False)
                     else:
                         h = block(h, encoded_vis)
-                h = self.norm(h)                                    # (B, N*K, d_model)
             else:
-                # ── Original: concatenate encoder context + N*K queries ───
                 full_seq = torch.cat([encoded_vis, queries_seq], dim=1)
                 h = full_seq
                 for block in self.blocks:
@@ -409,8 +427,16 @@ class StationMAEDecoder(nn.Module):
                         h = _cp_checkpoint(block, h, use_reentrant=False)
                     else:
                         h = block(h)
-                h = self.norm(h)
                 h = h[:, -N * K:, :]                               # (B, N*K, d_model)
+
+            # ── Optional: cross-attend to last-timestep input tokens ────
+            # For multi-delta, expand input_context to match N*K queries.
+            if self.use_input_context and input_context is not None:
+                ctx_exp = input_context.unsqueeze(2).expand(B, N, K, -1) \
+                                       .reshape(B, N * K, self.d_model)   # (B, N*K, D)
+                h = self.input_cross_attn(h, ctx_exp)
+
+            h = self.norm(h)                                        # (B, N*K, d_model)
 
             preds = self.head(h)                                    # (B, N*K, num_target_vars)
             preds = preds.reshape(B, N, K, self.num_target_vars)

@@ -134,8 +134,9 @@ class StationMAE(nn.Module):
         temporal_window:         int   = 0,
         cross_attention_decoder: bool  = False,
         drop_path_rate:          float = 0.0,
-        masked_only_loss:        bool  = False,
-        joint_encoder:           bool  = False,
+        masked_only_loss:         bool  = False,
+        joint_encoder:            bool  = False,
+        input_context_cross_attn: bool  = False,
     ):
         super().__init__()
 
@@ -143,6 +144,15 @@ class StationMAE(nn.Module):
         self.num_vars         = num_vars
         self.num_target_vars  = num_target_vars
         self.masked_only_loss = masked_only_loss
+
+        # ── Variable-weighted Huber loss ──────────────────────────────────
+        # Weights: [temperature, pressure, humidity, wind_u, wind_v]
+        # Pressure gets 0.2× — persistence dominates, gradients wasted.
+        # Wind gets Huber loss to reduce mean-regression bias (-0.46 m/s).
+        _w = torch.tensor([2.0, 0.2, 1.5, 1.5, 1.5], dtype=torch.float32)
+        self.register_buffer("var_weights", _w)
+        self.huber_delta   = 1.0          # Huber transition point in normalised space
+        self._wind_indices = {3, 4}       # wind_u=3, wind_v=4 in TARGET_VARIABLE_NAMES
 
         self.encoder = StationMAEEncoder(
             d_model=d_model,
@@ -173,6 +183,7 @@ class StationMAE(nn.Module):
             use_checkpoint=use_checkpoint,
             cross_attention=cross_attention_decoder,
             drop_path_rate=drop_path_rate,
+            input_context_cross_attn=input_context_cross_attn,
         )
 
     # ------------------------------------------------------------------
@@ -198,8 +209,8 @@ class StationMAE(nn.Module):
             preds:          (B, N, num_target_vars)
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
-        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
-        preds = self.decoder(encoded, spatial, y_hours, delta_steps)
+        encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
+        preds = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
 
         y_target      = y[:, :, :self.num_target_vars]
         y_mask_target = y_mask[:, :, :self.num_target_vars]
@@ -251,13 +262,11 @@ class StationMAE(nn.Module):
         K = delta_steps.shape[1]
 
         # ── Encoder: runs once ──────────────────────────────────────────
-        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+        encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
         # encoded: (B, W*N_vis, d_model)
 
         # ── Decoder: runs once for all K lead-times ──────────────────────
-        # decoder.forward() detects (B, K) inputs and builds N×K queries,
-        # returning (B, K, N, num_target_vars) in a single transformer pass.
-        preds_all = self.decoder(encoded, spatial, y_hours, delta_steps)
+        preds_all = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
         # preds_all: (B, K, N, num_target_vars)
 
         # ── Loss: mean over K ────────────────────────────────────────────
@@ -297,54 +306,64 @@ class StationMAE(nn.Module):
             preds: (B, N, num_target_vars) predictions for all stations.
         """
         self.eval()
-        encoded, _, _ = self.encoder(x, x_mask, spatial, x_hours)
-        return self.decoder(encoded, spatial, y_hours, delta_steps)
+        encoded, _, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
+        return self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
 
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
 
-    @staticmethod
     def _supervised_loss(
+        self,
         preds:      torch.Tensor,           # (B, N, V)
         y:          torch.Tensor,           # (B, N, V)
-        y_mask:     torch.Tensor,           # (B, N, V)  1.0 = sensor present at target step
-        masked_idx: "torch.Tensor | None" = None,  # (B, N_masked) — restrict to these stations
+        y_mask:     torch.Tensor,           # (B, N, V)
+        masked_idx: "torch.Tensor | None" = None,
     ) -> torch.Tensor:
         """
-        MSE loss over stations wherever sensors are present at the target timestep.
+        Variable-weighted loss: Huber for wind components, MSE for others.
 
-        ``masked_idx`` controls which stations contribute to the gradient:
+        Weights (temperature=2.0, pressure=0.2, humidity=1.5, wind_u=1.5, wind_v=1.5):
+          • Pressure down-weighted — persistence dominates at all horizons, gradient is wasted.
+          • Temperature up-weighted — key variable, most room to improve.
+          • Wind Huber — reduces systematic underprediction bias from MSE mean-regression.
 
-        masked_idx=None (default — all-station loss):
-            All N stations are supervised wherever sensors are present.
-            Richer gradient signal: visible stations are regularised to predict
-            accurately; masked stations must reconstruct from spatial context alone.
-
-        masked_idx=(B, N_masked) (masked-only loss):
-            Only the N_masked encoder-masked stations are supervised.  Visible
-            stations are used purely as context and receive no gradient from the
-            loss.  Appropriate for pure inpainting (max_delta=0): the model must
-            reconstruct masked stations from scratch — visible stations already
-            have access to their own full input window, so supervising them
-            would create a shortcut that inflates the training score without
-            improving genuine gap-filling.
-
-        Returns a scalar (mean squared error over included, sensor-present readings).
+        Returns a scalar normalised by the sum of variable weights.
         """
         if masked_idx is not None:
-            # Gather only the masked-station slices: (B, N_masked, V)
             B, N_m = masked_idx.shape
-            V = y.shape[-1]
+            V  = y.shape[-1]
             idx    = masked_idx.unsqueeze(-1).expand(B, N_m, V)
             preds  = preds.gather(1, idx)
             y      = y.gather(1, idx)
             y_mask = y_mask.gather(1, idx)
 
-        sensor_ok = y_mask.bool()                        # (B, N[_masked], V)
-        sq_err    = (preds - y).pow(2)
-        denom     = sensor_ok.float().sum().clamp(min=1.0)
-        return (sq_err * sensor_ok.float()).sum() / denom
+        sensor_ok = y_mask.bool()                                   # (B, N, V)
+        V = preds.shape[-1]
+        weights = self.var_weights[:V]                              # (V,)
+        total_count = sensor_ok.float().sum().clamp(min=1.0)
+
+        loss_per_var = []
+        for v in range(V):
+            ok  = sensor_ok[..., v]                                 # (B, N)
+            if ok.sum() == 0:
+                loss_per_var.append(torch.zeros(1, device=preds.device, dtype=preds.dtype).squeeze())
+                continue
+            err = preds[..., v] - y[..., v]                        # (B, N)
+            if v in self._wind_indices:
+                # Huber loss: L2 below delta, L1 above — reduces mean-regression bias
+                abs_err = err.abs()
+                elem = torch.where(
+                    abs_err <= self.huber_delta,
+                    0.5 * err.pow(2),
+                    self.huber_delta * (abs_err - 0.5 * self.huber_delta)
+                )
+            else:
+                elem = 0.5 * err.pow(2)                            # half-MSE matches Huber scale
+            loss_per_var.append((elem * ok.float()).sum() / total_count)
+
+        weighted = (weights * torch.stack(loss_per_var)).sum()
+        return weighted / weights.sum()
 
     # ------------------------------------------------------------------
     # Convenience
