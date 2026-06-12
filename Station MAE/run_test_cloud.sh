@@ -14,7 +14,7 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
-CHECKPOINT="/home/renku/work/weather-station-model-with-transformers/Station MAE/checkpoints/best.ckpt"
+CHECKPOINT="/home/renku/work/weather-station-model-with-transformers/Station MAE/checkpoints/last.ckpt"
 SAVE_DIR="test_results"
 
 # ── Window mode ───────────────────────────────────────────────────────────────
