@@ -56,11 +56,16 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
-# Checkpoints saved locally — NOT on the Polybox mount.
-# Direct Polybox writes during training are unreliable (network latency, lock contention).
-# The CopyCheckpointToPolybox callback mirrors best.ckpt/last.ckpt asynchronously to
-# --polybox_dir after each validation without blocking the training loop.
-SAVE_DIR="/home/renku/work/station_mae_ckpts/full_run_cloud"
+
+# Checkpoints saved inside the project directory — guaranteed writable on Renku.
+# Saving to /home/renku/work/ sub-directories outside this project can silently
+# fail due to filesystem permissions on the Renku mount.
+# Saving directly to Polybox during training is unreliable (network latency,
+# lock contention) and has been removed — copy checkpoints to Polybox manually
+# after training with:
+#   cp checkpoints/full_run_cloud/best.ckpt /home/renku/work/polybox-capstone/checkpoints/
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SAVE_DIR="${SCRIPT_DIR}/checkpoints/full_run_cloud"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
@@ -184,8 +189,10 @@ python main.py \
     $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   tw6-d1024-v3 \
-    --save_dir         "$SAVE_DIR" \
-    --polybox_dir      /home/renku/work/polybox-capstone/checkpoints
+    --save_dir         "$SAVE_DIR"
+# NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
+# After training finishes, manually copy checkpoints:
+#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v3-best.ckpt
 
 # ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
 #
