@@ -147,9 +147,13 @@ class StationMAE(nn.Module):
 
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
-        # Pressure gets 0.2× — persistence dominates, gradients wasted.
-        # Wind gets Huber loss to reduce mean-regression bias (-0.46 m/s).
-        _w = torch.tensor([2.0, 0.2, 1.5, 1.5, 1.5], dtype=torch.float32)
+        # Temperature, pressure, humidity all get equal weight 1.0 so the
+        # model sees balanced gradient signal across correlated variables.
+        # Pressure and humidity are physically coupled (high pressure → low
+        # humidity in the Alps), so down-weighting pressure cascades to
+        # degraded humidity learning — equal weights prevent this.
+        # Wind gets 1.5× weight + Huber loss to reduce mean-regression bias.
+        _w = torch.tensor([1.0, 1.0, 1.0, 1.5, 1.5], dtype=torch.float32)
         self.register_buffer("var_weights", _w)
         self.huber_delta   = 1.0          # Huber transition point in normalised space
         self._wind_indices = {3, 4}       # wind_u=3, wind_v=4 in TARGET_VARIABLE_NAMES
@@ -323,10 +327,9 @@ class StationMAE(nn.Module):
         """
         Variable-weighted loss: Huber for wind components, MSE for others.
 
-        Weights (temperature=2.0, pressure=0.2, humidity=1.5, wind_u=1.5, wind_v=1.5):
-          • Pressure down-weighted — persistence dominates at all horizons, gradient is wasted.
-          • Temperature up-weighted — key variable, most room to improve.
-          • Wind Huber — reduces systematic underprediction bias from MSE mean-regression.
+        Weights (temperature=1.0, pressure=1.0, humidity=1.0, wind_u=1.5, wind_v=1.5):
+          • Temperature/pressure/humidity equal weight — physically correlated, balanced gradients.
+          • Wind 1.5× + Huber — reduces systematic underprediction bias from MSE mean-regression.
 
         Returns a scalar normalised by the sum of variable weights.
         """

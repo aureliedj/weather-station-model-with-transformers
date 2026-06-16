@@ -56,7 +56,11 @@
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
-SAVE_DIR="/home/renku/work/polybox-capstone/checkpoints/full_run_cloud"
+# Checkpoints saved locally — NOT on the Polybox mount.
+# Direct Polybox writes during training are unreliable (network latency, lock contention).
+# The CopyCheckpointToPolybox callback mirrors best.ckpt/last.ckpt asynchronously to
+# --polybox_dir after each validation without blocking the training loop.
+SAVE_DIR="/home/renku/work/station_mae_ckpts/full_run_cloud"
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── Station exclusion ────────────────────────────────────────────────────────

@@ -47,6 +47,7 @@ from .embeddings import (
     StationEmbedding,
     TemporalEmbedding,
     DeltaTimeEmbedding,
+    StepIndexEmbedding,
     POSITION_FOURIER_DIM,
     STATION_CHAR_DIM,
     TEMPORAL_FOURIER_DIM,
@@ -238,6 +239,16 @@ class StationMAEDecoder(nn.Module):
         self.delta_emb    = DeltaTimeEmbedding(d_model=d_model, fourier_dim=delta_fourier_dim,
                                                dropout=dropout)
 
+        # s  — STEP: Integer step-index embedding (same Fourier basis as encoder).
+        # The decoder receives delta_steps as integer 10-min step counts
+        # (e.g. 0, 3, 6, 9, … for 30-min spacing).  This embedding maps those
+        # step counts to d_model using the same log-spaced sinusoidal basis as
+        # the encoder's StepIndexEmbedding, so the model can directly align
+        # "input token at step 3" with "decoder query at delta_step 3".
+        # Complements delta_emb (which encodes continuous hours) with an
+        # explicit discrete-step signal consistent with the encoder context.
+        self.step_emb = StepIndexEmbedding(d_model=d_model, dropout=dropout)
+
         # --- Post-assembly normalisation for station query tokens ---
         # Applied after summing mask_token + spatial + temporal + delta,
         # matching the encoder's token_norm for consistent scale at decoder input.
@@ -369,10 +380,12 @@ class StationMAEDecoder(nn.Module):
             # ── Single-delta path ─────────────────────────────────────────
             temp_emb = self.temporal_emb(y_hours)                   # (B, d_model)
             delt_emb = self.delta_emb(delta_steps)                  # (B, d_model)
+            step_emb = self.step_emb(delta_steps)                   # (B, d_model)
 
             queries = spatial_q \
                     + temp_emb.unsqueeze(1) \
-                    + delt_emb.unsqueeze(1)                         # (B, N, d_model)
+                    + delt_emb.unsqueeze(1) \
+                    + step_emb.unsqueeze(1)                         # (B, N, d_model)
             queries = self.query_norm(queries)                      # (B, N, d_model)
 
             if self.use_cross_attention:
@@ -403,12 +416,14 @@ class StationMAEDecoder(nn.Module):
             # ── Multi-delta path ──────────────────────────────────────────
             temp_emb = self.temporal_emb(y_hours)                   # (B, K, d_model)
             delt_emb = self.delta_emb(delta_steps)                  # (B, K, d_model)
+            step_emb = self.step_emb(delta_steps)                   # (B, K, d_model)
 
             spatial_exp = spatial_q.unsqueeze(2).expand(B, N, K, -1)   # (B, N, K, d_model)
             temp_exp    = temp_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
             delt_exp    = delt_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
+            step_exp    = step_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
 
-            queries_NK  = spatial_exp + temp_exp + delt_exp         # (B, N, K, d_model)
+            queries_NK  = spatial_exp + temp_exp + delt_exp + step_exp  # (B, N, K, d_model)
             queries_NK  = self.query_norm(queries_NK)
             queries_seq = queries_NK.reshape(B, N * K, self.d_model)   # (B, N*K, d_model)
 

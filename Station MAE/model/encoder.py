@@ -32,6 +32,7 @@ from .embeddings import (
     PositionalEmbedding,
     StationEmbedding,
     TemporalEmbedding,
+    StepIndexEmbedding,
     VariableProjection,
     POSITION_FOURIER_DIM,
     STATION_CHAR_DIM,
@@ -742,6 +743,15 @@ class StationMAEEncoder(nn.Module):
         self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
                                               dropout=dropout)
 
+        # s — Step-index positional embedding (within-window relative order).
+        # Encodes the INTEGER step index 0..W-1 so the model knows WHERE each
+        # token sits inside the 72-step (12 h) input window, independently of
+        # the absolute time encoded by temporal_emb.  Consistent with the
+        # decoder's step_emb: the same Fourier basis is used so that
+        # "encoder step k" and "decoder output at delta_step k" share the same
+        # sinusoidal features before their respective MLP projections.
+        self.step_emb = StepIndexEmbedding(d_model=d_model, dropout=dropout)
+
         # --- Post-assembly normalisation ---
         # Applied after summing var_proj + spatial_emb + temporal_emb to keep
         # the three independently-initialised components on a common scale
@@ -856,8 +866,18 @@ class StationMAEEncoder(nn.Module):
         temp_emb = self.temporal_emb(x_hours)                       # (B, W, d_model)
         temp_emb = temp_emb.unsqueeze(2)                            # (B, W, 1, d_model)
 
-        # Sum four embeddings — all broadcast cleanly over (B, W, N, d_model)
-        tokens = var_tokens + pos_e + station_e + temp_emb         # (B, W, N, d_model)
+        # --- s: Step-index embedding (within-window relative position) ---
+        # Encodes the INTEGER position 0..W-1 of each token in the input window.
+        # Provides explicit ordering information that the absolute temporal
+        # embedding does not cleanly expose at the 10-min step level.
+        # Consistent with the decoder: step indices use the same Fourier basis
+        # so "encoder step w" and "decoder query at delta_step w" are aligned.
+        step_idx = torch.arange(W, device=x.device)                 # (W,)
+        step_e   = self.step_emb(step_idx)                          # (W, d_model)
+        step_e   = step_e.view(1, W, 1, self.d_model)               # (1, W, 1, d_model)
+
+        # Sum five embeddings — all broadcast cleanly over (B, W, N, d_model)
+        tokens = var_tokens + pos_e + station_e + temp_emb + step_e  # (B, W, N, d_model)
 
         # Normalise after summation: prevents any single component from
         # dominating the scale seen by the first transformer block.

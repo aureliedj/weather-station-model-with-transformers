@@ -133,6 +133,35 @@ class StationMAELightning(pl.LightningModule):
     # Validation
     # ------------------------------------------------------------------
 
+    def on_validation_epoch_start(self) -> None:
+        """
+        Fix the global RNG state before every validation epoch.
+
+        The encoder's _mask_stations() uses torch.rand() to sample which
+        stations to mask.  Without a fixed seed this differs every epoch,
+        making validation metrics subtly noisy (some epochs happen to mask
+        easier/harder stations).  Fixing the seed guarantees identical station
+        masks across epochs so val/loss changes reflect model improvement, not
+        sampling noise.
+
+        Strategy: save the current training RNG state, then set a fixed seed.
+        on_validation_epoch_end restores the original state so the training
+        random stream is completely unaffected.
+        """
+        self._saved_rng_state = torch.get_rng_state()
+        if torch.cuda.is_available():
+            self._saved_cuda_rng_state = torch.cuda.get_rng_state_all()
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(42)
+
+    def on_validation_epoch_end(self) -> None:
+        """Restore the training RNG state saved in on_validation_epoch_start."""
+        if hasattr(self, "_saved_rng_state"):
+            torch.set_rng_state(self._saved_rng_state)
+        if torch.cuda.is_available() and hasattr(self, "_saved_cuda_rng_state"):
+            torch.cuda.set_rng_state_all(self._saved_cuda_rng_state)
+
     def validation_step(self, batch: dict, batch_idx: int) -> None:
         x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps = (
             self._unpack_batch(batch)

@@ -477,6 +477,96 @@ class DeltaTimeEmbedding(nn.Module):
         return self.proj(fourier)                                  # (B, d_model)
 
 
+class StepIndexEmbedding(nn.Module):
+    """
+    Fourier embedding over integer step indices (0, 1, 2, …).
+
+    Provides explicit within-window positional information that is consistent
+    across the encoder and decoder:
+
+      • Encoder  — input token at step w  (w = 0 … W-1) gets embedding[w].
+      • Decoder  — query token for delta_step d (d = 0, 3, 6, …, 36) gets
+                   embedding[d] using the SAME Fourier basis.
+
+    This ensures that "input step 3 = 30 min in" and "output at delta_step 3 =
+    30 min lead" map to the same sinusoidal features before the MLP projection,
+    giving the model a principled shortcut to express 'copy + small correction'
+    for short horizons.
+
+    Motivation: TemporalEmbedding encodes *absolute* hours since 1970, so it
+    naturally captures time-of-day, seasonality, and long-range trends but
+    does not cleanly encode the *relative position within a 12 h window*.
+    StepIndexEmbedding fills that gap with wavelengths tuned to the window
+    scale (1 step ≈ 10 min to max_steps × 10 min), mirroring how ViT / BERT
+    add a learned position embedding on top of content embeddings.
+
+    Wavelengths: log-spaced from λ_min = 1 step (finest; resolves individual
+    steps) to λ_max = max_steps steps (coarsest; covers the full window).
+    Same design as TemporalEmbedding and DeltaTimeEmbedding but in step-count
+    space rather than hours.
+
+    Args:
+        d_model:     Transformer model dimension.
+        fourier_dim: Total Fourier feature dimension (must be even; default 32).
+                     Gives fourier_dim // 2 distinct wavelengths.
+        max_steps:   Upper bound on step index; sets the longest wavelength.
+                     Should be ≥ W + max_delta so both encoder (0..W-1) and
+                     decoder (0..max_delta) step indices fall in-range.
+                     Default 512 is a generous buffer for typical configs.
+        dropout:     Dropout rate on the MLP output (default 0.0).
+    """
+
+    def __init__(
+        self,
+        d_model:     int   = 128,
+        fourier_dim: int   = 32,
+        max_steps:   int   = 512,
+        dropout:     float = 0.0,
+    ):
+        super().__init__()
+        assert fourier_dim % 2 == 0, "fourier_dim must be even"
+        n_wl = fourier_dim // 2
+        # Log-spaced wavelengths in step counts: 1 step (finest) → max_steps (coarsest)
+        lambdas = torch.exp(
+            torch.linspace(math.log(1.0), math.log(float(max_steps)), n_wl)
+        )
+        self.register_buffer("lambdas", lambdas)   # (n_wl,)
+
+        # MLP: fourier_dim → d_model → d_model  (matches other embedding modules)
+        self.proj = nn.Sequential(
+            nn.Linear(fourier_dim, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model),
+        )
+
+    def _fourier(self, steps: torch.Tensor) -> torch.Tensor:
+        """
+        Compute Fourier features for arbitrary-shape step-index input.
+
+        Args:
+            steps: (...) integer or float tensor of step indices.
+        Returns:
+            (..., fourier_dim) float tensor.
+        """
+        x      = steps.float().unsqueeze(-1)                    # (..., 1)
+        angles = 2.0 * math.pi * x / self.lambdas               # (..., n_wl)
+        return torch.cat([torch.cos(angles),
+                          torch.sin(angles)], dim=-1)           # (..., fourier_dim)
+
+    def forward(self, steps: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            steps: (W,)     integer step indices 0..W-1  — encoder usage, or
+                   (B,)     integer delta steps           — decoder single-delta, or
+                   (B, K)   integer delta steps           — decoder multi-delta.
+        Returns:
+            Same leading shape as steps, last dim = d_model.
+        """
+        return self.proj(self._fourier(steps))                  # (..., d_model)
+
+
 class VariableProjection(nn.Module):
     """
     Projects raw meteorological measurements into d_model space.

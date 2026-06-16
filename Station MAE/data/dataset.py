@@ -1089,8 +1089,25 @@ class StationMAEDataset(Dataset):
         # fast evaluation runs and final paper metrics (~1,460 windows vs ~105k).
         if split != "train":
             if index_mode == "blocks":
+                # Apply a split-specific starting offset so val and test blocks
+                # are anchored to different hours of the day.
+                #
+                # With W=72 (12 h), non-overlapping blocks repeat every 12 h.
+                # Without an offset, both val (2022) and test (2023-2024) start
+                # at timestep 0 of their split, which typically aligns to midnight
+                # → blocks land on {00:00, 12:00} every day.
+                #
+                # Offset by W//4 = 18 steps = 3 h for the TEST split:
+                #   val  → blocks at {00:00, 12:00, 00:00, …}
+                #   test → blocks at {03:00, 15:00, 03:00, …}
+                #
+                # This ensures test evaluation samples different diurnal patterns
+                # than validation — relevant for Alpine meteorology where 03:00
+                # (cold drainage flows) and 15:00 (convective peak) are physically
+                # distinct from midnight / noon.
+                offset: int = 0 if split == "val" else window_size // 4
                 result: list = []
-                next_ok: int = 0
+                next_ok: int = offset
                 for i in all_valid:
                     if i >= next_ok:
                         result.append(i)
