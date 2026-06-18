@@ -147,13 +147,12 @@ class StationMAE(nn.Module):
 
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
-        # Temperature, pressure, humidity all get equal weight 1.0 so the
-        # model sees balanced gradient signal across correlated variables.
-        # Pressure and humidity are physically coupled (high pressure → low
-        # humidity in the Alps), so down-weighting pressure cascades to
-        # degraded humidity learning — equal weights prevent this.
+        # Temperature gets 2.0× — primary variable of interest; stronger gradient
+        # signal pushes the model to sharpen its temperature predictions.
+        # Pressure and humidity stay at 1.0 (physically coupled — down-weighting
+        # pressure cascades to degraded humidity learning).
         # Wind gets 1.5× weight + Huber loss to reduce mean-regression bias.
-        _w = torch.tensor([1.0, 1.0, 1.0, 1.5, 1.5], dtype=torch.float32)
+        _w = torch.tensor([2.0, 1.0, 1.0, 1.5, 1.5], dtype=torch.float32)
         self.register_buffer("var_weights", _w)
         self.huber_delta   = 1.0          # Huber transition point in normalised space
         self._wind_indices = {3, 4}       # wind_u=3, wind_v=4 in TARGET_VARIABLE_NAMES

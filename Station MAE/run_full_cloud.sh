@@ -144,7 +144,7 @@ TEMPORAL_WINDOW="--temporal_window 6"
 #     coverage bias.  --train_stride is ignored in this mode.
 #     Best default when combined with a large pool and many epochs.
 
-INDEX_MODE="--index_mode random --random_epoch_size 8000"
+INDEX_MODE="--index_mode random --random_epoch_size 40000"
 # ↑ 8000 samples / batch_size=4 = 2000 batches/epoch — stabler gradients than default ~914
 # INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
