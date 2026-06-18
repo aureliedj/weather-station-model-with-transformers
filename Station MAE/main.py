@@ -261,6 +261,11 @@ def parse_args() -> argparse.Namespace:
     # Early stopping
     p.add_argument("--patience",     type=int,   default=50)
     p.add_argument("--min_delta",    type=float, default=1e-4)
+    p.add_argument("--monitor",      type=str,   default="val/temperature_rmse",
+                   help="Metric monitored by ModelCheckpoint and EarlyStopping. "
+                        "Must be logged by lightning_module.py. "
+                        "Common choices: val/loss, val/temperature_rmse, val/overall_rmse. "
+                        "(default: val/temperature_rmse)")
 
     # Checkpointing
     p.add_argument("--save_dir",        type=str, default="checkpoints")
@@ -661,13 +666,13 @@ def main() -> None:
 
     callbacks = [
         # Saves two files only:
-        #   best.ckpt  — lowest val/loss seen so far (overwritten in-place)
+        #   best.ckpt  — lowest monitored metric seen so far (overwritten in-place)
         #   last.ckpt  — most recent epoch (overwritten in-place, used for resuming)
         # save_top_k=1 + save_last=True is all that's needed — no periodic snapshots.
         ModelCheckpoint(
             dirpath=args.save_dir,
             filename="best",
-            monitor="val/loss",
+            monitor=args.monitor,
             mode="min",
             save_top_k=1,
             save_last=True,
@@ -691,7 +696,7 @@ def main() -> None:
     if args.patience > 0:
         callbacks.append(
             EarlyStopping(
-                monitor="val/loss",
+                monitor=args.monitor,
                 patience=args.patience,
                 min_delta=args.min_delta,
                 mode="min",
@@ -701,7 +706,8 @@ def main() -> None:
         _patience_unit = "steps" if _step_based else "epochs"
         _patience_val  = (args.patience * args.val_check_interval
                           if _step_based else args.patience)
-        print(f"EarlyStopping            : patience={args.patience} checks  "
+        print(f"EarlyStopping            : monitor={args.monitor}  "
+              f"patience={args.patience} checks  "
               f"(= {_patience_val} {_patience_unit})  min_delta={args.min_delta}")
 
     # ── Precision (AMP) ─────────────────────────────────────────────────────

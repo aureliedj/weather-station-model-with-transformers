@@ -177,6 +177,7 @@ python main.py \
     --input_context_cross_attn \
     --limit_val_batches 200 \
     --patience         50 \
+    --monitor          val/temperature_rmse \
     --min_lr           5e-7 \
     --amp \
     --bf16 \
