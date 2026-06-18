@@ -468,6 +468,164 @@ def evaluate_full(
 
 
 # ---------------------------------------------------------------------------
+# Per-station evaluation (for geographic map plots)
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def evaluate_per_station(
+    model:     nn.Module,
+    loader:    DataLoader,
+    device:    torch.device,
+    spatial:   "torch.Tensor",
+    obs_stats: "dict | None" = None,
+) -> "list[dict]":
+    """
+    Compute per-station MAE and RMSE over all test windows.
+
+    Unlike ``evaluate_full()`` which flattens B\xd7N stations together, this
+    function tracks each of the N stations independently so you can later
+    plot MAE/RMSE on a geographic map of Switzerland.
+
+    Args:
+        model:    StationMAE moved to ``device``, in eval mode.
+        loader:   Test DataLoader (fixed-grid or single-delta).
+        device:   torch.device.
+        spatial:  Station static features, shape (N, 15).  Columns 0 and 1
+                  are easting / northing in Swiss LV95 coordinates.
+                  Pass ``test_ds.spatial`` directly.
+        obs_stats: dict with ``"mean"`` and ``"std"`` tensors (shape (N, V)
+                  for per-station normalisation).  Pass ``train_ds.obs_stats``
+                  to get physical-unit metrics.  If None, normalised only.
+
+    Returns:
+        List of N dicts (one per station) with keys:
+            station_idx                 -- 0-based index into the station list
+            easting, northing           -- LV95 coordinates (metres)
+            {var}_mae_norm              -- MAE in normalised space
+            {var}_rmse_norm             -- RMSE in normalised space
+            {var}_n_samples             -- number of valid (sample, delta) pairs
+            {var}_mae, {var}_rmse       -- physical units (if obs_stats provided)
+            overall_mae_norm            -- MAE across all variables (normalised)
+            overall_rmse_norm           -- RMSE across all variables (normalised)
+
+    Typical usage::
+
+        rows = evaluate_per_station(model, test_loader, device,
+                                    test_ds.spatial.cpu(), obs_stats=obs_stats)
+        import pandas as pd
+        df = pd.DataFrame(rows)
+        df.to_csv("per_station_metrics.csv", index=False)
+        # Plot: scatter(x=df.easting, y=df.northing, c=df.temperature_mae, ...)
+    """
+    model.eval()
+
+    N = spatial.shape[0]
+
+    # Vectorised accumulators -- no Python loop over stations or batch items.
+    # We loop only over K lead-times (<=13 in the fixed-grid config).
+    sum_abs_err = torch.zeros(N, NUM_TARGET_VARIABLES)   # (N, V_t) -- sum |err|
+    sum_sq_err  = torch.zeros(N, NUM_TARGET_VARIABLES)   # (N, V_t) -- sum err**2
+    n_valid     = torch.zeros(N, NUM_TARGET_VARIABLES, dtype=torch.long)
+
+    for batch in loader:
+        x           = batch["x"].to(device)
+        x_mask      = batch["x_mask"].to(device)
+        sp          = batch["spatial"].to(device)
+        x_hours     = batch["x_hours"].to(device)
+        y_raw       = batch["y"].to(device)
+        y_mask_raw  = batch["y_mask"].to(device)
+        y_hours     = batch["y_hours"].to(device)
+        delta_steps = batch["delta_steps"].to(device)
+
+        if sp.dim() == 3:
+            sp = sp[0]
+
+        if y_raw.dim() == 4:
+            _, preds, _ = model.forward_multi_delta(
+                x, x_mask, sp, x_hours,
+                y_raw, y_mask_raw, y_hours, delta_steps,
+            )
+            # preds: (B, K, N, V_target)
+            K = preds.shape[1]
+        else:
+            _, preds, _ = model(
+                x, x_mask, sp, x_hours,
+                y_raw, y_mask_raw, y_hours, delta_steps,
+            )
+            preds      = preds.unsqueeze(1)        # (B, 1, N, V_t)
+            y_raw      = y_raw.unsqueeze(1)
+            y_mask_raw = y_mask_raw.unsqueeze(1)
+            K = 1
+
+        for k in range(K):
+            p_k = preds[:, k]                                    # (B, N, V_t)
+            t_k = y_raw[:, k, :, :NUM_TARGET_VARIABLES]         # (B, N, V_t)
+            m_k = y_mask_raw[:, k, :, :NUM_TARGET_VARIABLES]    # (B, N, V_t)
+
+            err = (p_k - t_k).cpu()          # (B, N, V_t)
+            m_k = m_k.cpu().bool()
+
+            # Mask invalid sensor entries (set to 0 so they don't distort sums)
+            err_m = err * m_k.float()
+
+            # Sum over batch dimension B -> (N, V_t)
+            sum_abs_err += err_m.abs().sum(dim=0)
+            sum_sq_err  += err_m.pow(2).sum(dim=0)
+            n_valid     += m_k.long().sum(dim=0)
+
+    # Per-station standard deviations for physical-unit conversion
+    has_phys = obs_stats is not None
+    if has_phys:
+        _std = obs_stats["std"].cpu()
+        if _std.dim() == 2:
+            std_ps = _std[:, :NUM_TARGET_VARIABLES]               # (N, V_t)
+        else:
+            std_ps = _std[:NUM_TARGET_VARIABLES].unsqueeze(0).expand(N, -1)
+
+    rows: list[dict] = []
+    for n in range(N):
+        row: dict = {
+            "station_idx": n,
+            "easting":  float(spatial[n, 0].item()),
+            "northing": float(spatial[n, 1].item()),
+        }
+
+        for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
+            nv = int(n_valid[n, v].item())
+            row[f"{var_name}_n_samples"] = nv
+            if nv == 0:
+                row[f"{var_name}_mae_norm"]  = float("nan")
+                row[f"{var_name}_rmse_norm"] = float("nan")
+                if has_phys:
+                    row[f"{var_name}_mae"]   = float("nan")
+                    row[f"{var_name}_rmse"]  = float("nan")
+                continue
+
+            mae_norm  = float(sum_abs_err[n, v].item() / nv)
+            rmse_norm = float((sum_sq_err[n, v].item() / nv) ** 0.5)
+            row[f"{var_name}_mae_norm"]  = mae_norm
+            row[f"{var_name}_rmse_norm"] = rmse_norm
+
+            if has_phys:
+                std_v = float(std_ps[n, v].item())
+                row[f"{var_name}_mae"]  = mae_norm  * std_v
+                row[f"{var_name}_rmse"] = rmse_norm * std_v
+
+        # Overall across all 5 variables for this station
+        n_ov = int(n_valid[n].sum().item())
+        if n_ov > 0:
+            row["overall_mae_norm"]  = float(sum_abs_err[n].sum().item() / n_ov)
+            row["overall_rmse_norm"] = float((sum_sq_err[n].sum().item() / n_ov) ** 0.5)
+        else:
+            row["overall_mae_norm"]  = float("nan")
+            row["overall_rmse_norm"] = float("nan")
+
+        rows.append(row)
+
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Gap-filling evaluation
 # ---------------------------------------------------------------------------
 

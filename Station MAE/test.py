@@ -937,6 +937,7 @@ def main() -> None:
                 build_delta_variable_matrix,
                 collect_predictions,
                 compute_seasonal_metrics,
+                evaluate_per_station,
             )
 
             # ── Variable × delta RMSE matrix ────────────────────────────
@@ -949,6 +950,19 @@ def main() -> None:
                 print(f"\n── Variable × lead-time RMSE matrix ──────────────────────────")
                 print(_mat_df.to_string(float_format=lambda x: f"{x:.4f}"))
                 print(f"  Saved: {_mat_path}")
+
+            # ── Per-station metrics (for geographic map plots) ──────────
+            t0 = _time.time()
+            print("\n  Computing per-station metrics (for map plots) ...")
+            _per_station = evaluate_per_station(
+                model, test_loader, device,
+                test_ds.spatial.cpu(),
+                obs_stats=obs_stats,
+            )
+            _ps_df = pd.DataFrame(_per_station)
+            _ps_path = os.path.join(mr_save, "per_station_metrics.csv")
+            _ps_df.to_csv(_ps_path, index=False)
+            print(f"  Saved {len(_per_station)} stations \u2192 {_ps_path}  \u23f1  {_time.time()-t0:.0f}s")
 
             # ── Save raw predictions for notebook ────────────────────────
             if args.save_predictions > 0:
