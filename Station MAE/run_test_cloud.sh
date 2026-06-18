@@ -49,7 +49,7 @@ MASK_RATIOS="0.0 0.5"
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       64 \
+    --batch_size       8 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --exclude_stations PFA \
