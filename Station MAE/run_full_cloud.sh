@@ -189,7 +189,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v3 \
+    --wandb_run_name   tw6-d1024-v4 \
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
