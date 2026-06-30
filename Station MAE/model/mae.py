@@ -274,7 +274,7 @@ class StationMAE(nn.Module):
 
         # ── Loss: mean over K ────────────────────────────────────────────
         _midx    = masked_idx if self.masked_only_loss else None
-        loss_acc = torch.zeros(1, device=x.device, dtype=encoded.dtype).squeeze()
+        loss_acc = encoded.new_zeros(())
         for k in range(K):
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
@@ -326,11 +326,16 @@ class StationMAE(nn.Module):
         """
         Variable-weighted loss: Huber for wind components, MSE for others.
 
-        Weights (temperature=1.0, pressure=1.0, humidity=1.0, wind_u=1.5, wind_v=1.5):
-          • Temperature/pressure/humidity equal weight — physically correlated, balanced gradients.
+        Weights (temperature=2.0, pressure=1.0, humidity=1.0, wind_u=1.5, wind_v=1.5):
+          • Temperature 2.0× — primary variable of interest; stronger gradient signal.
+          • Pressure and humidity equal weight — physically correlated, balanced gradients.
           • Wind 1.5× + Huber — reduces systematic underprediction bias from MSE mean-regression.
 
-        Returns a scalar normalised by the sum of variable weights.
+        Each variable's loss is normalised by its own present-sensor count so that
+        variables with fewer valid sensors (e.g. wind at some stations) are not
+        artificially up-weighted relative to variables that are always present.
+
+        Returns a scalar: weighted sum of per-variable losses / sum of weights.
         """
         if masked_idx is not None:
             B, N_m = masked_idx.shape
@@ -343,13 +348,12 @@ class StationMAE(nn.Module):
         sensor_ok = y_mask.bool()                                   # (B, N, V)
         V = preds.shape[-1]
         weights = self.var_weights[:V]                              # (V,)
-        total_count = sensor_ok.float().sum().clamp(min=1.0)
 
         loss_per_var = []
         for v in range(V):
             ok  = sensor_ok[..., v]                                 # (B, N)
             if ok.sum() == 0:
-                loss_per_var.append(torch.zeros(1, device=preds.device, dtype=preds.dtype).squeeze())
+                loss_per_var.append(preds.new_zeros(()))
                 continue
             err = preds[..., v] - y[..., v]                        # (B, N)
             if v in self._wind_indices:
@@ -362,7 +366,8 @@ class StationMAE(nn.Module):
                 )
             else:
                 elem = 0.5 * err.pow(2)                            # half-MSE matches Huber scale
-            loss_per_var.append((elem * ok.float()).sum() / total_count)
+            # Normalise by this variable's own sensor count, not the global total
+            loss_per_var.append((elem * ok.float()).sum() / ok.float().sum().clamp(min=1.0))
 
         weighted = (weights * torch.stack(loss_per_var)).sum()
         return weighted / weights.sum()

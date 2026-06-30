@@ -898,7 +898,7 @@ class StationMAEEncoder(nn.Module):
             tokens: (B, W, N, d_model)
 
         Returns:
-            visible_tokens  : (B, W * N_vis, d_model)  — flattened visible tokens
+            visible_tokens  : (B, W, N_vis, d_model)   — unflattened; forward() flattens after transformer
             masked_indices  : (B, N_masked)             — masked station indices
             visible_indices : (B, N_vis)                — visible station indices
         """
@@ -953,13 +953,38 @@ class StationMAEEncoder(nn.Module):
         # 1. Build full token representations
         tokens = self._build_tokens(x, x_mask, spatial, x_hours)  # (B, W, N, d_model)
 
-        # Extract last-timestep tokens for ALL N stations (before masking).
-        # Returned as input_context for the decoder's cross-attention to recent obs.
-        input_context = tokens[:, -1, :, :]   # (B, N, d_model)
-
         # 2. Mask stations → visible_tokens: (B, W, N_vis, d_model)  [unflattened]
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
         B_sz, W_sz, N_vis, D = visible_tokens.shape
+
+        # ── input_context for decoder cross-attention ──────────────────────
+        # Extract last-timestep embeddings, but ONLY for VISIBLE stations.
+        # Masked stations get zeros — no observation signal leaks to the decoder.
+        #
+        # WHY this matters:
+        #   Previously, input_context was extracted from the FULL token tensor
+        #   (all N stations, before masking).  This meant every "masked" station's
+        #   own current-step embedding was available to the decoder via
+        #   input_context cross-attention, completely bypassing the encoder mask.
+        #   The model learned to exploit this shortcut: it produced the same
+        #   output for mask_ratio=0.0 and mask_ratio=0.5 because it could always
+        #   read every station's value from input_context.
+        #
+        # Fix: build input_context as a zero tensor (B, N, D) and scatter-fill
+        #   only the visible stations' last-step embeddings into their slots.
+        #   Masked stations stay at 0 — the decoder must infer their values from
+        #   the encoded context of visible neighbours.
+        B_sz_, W_sz_, N_tot, D_ = tokens.shape
+        input_context = tokens.new_zeros(B_sz_, N_tot, D_)          # (B, N, d_model)
+        last_step      = tokens[:, -1, :, :]                         # (B, N, d_model)
+        vis_last       = last_step.gather(
+            1, visible_idx.unsqueeze(-1).expand(B_sz_, N_vis, D_)   # (B, N_vis, d_model)
+        )
+        input_context.scatter_(
+            1,
+            visible_idx.unsqueeze(-1).expand(B_sz_, N_vis, D_),
+            vis_last,
+        )                                                             # (B, N, d_model)
 
         # 3. Transformer blocks
         # ── Joint path:         keep (B, W, N_vis, d) through JointSpatioTemporalBlocks

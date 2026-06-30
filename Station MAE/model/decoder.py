@@ -207,7 +207,6 @@ class StationMAEDecoder(nn.Module):
         super().__init__()
 
         self.d_model           = d_model
-        self.num_vars          = num_vars
         self.num_target_vars   = num_target_vars
         self.use_checkpoint    = use_checkpoint
         self.use_cross_attention = cross_attention
@@ -445,11 +444,12 @@ class StationMAEDecoder(nn.Module):
                 h = h[:, -N * K:, :]                               # (B, N*K, d_model)
 
             # ── Optional: cross-attend to last-timestep input tokens ────
-            # For multi-delta, expand input_context to match N*K queries.
+            # Pass input_context (B, N, D) as keys/values so every query token
+            # can attend across ALL visible stations — not just its own station.
+            # (Expanding to N*K would make each query attend only to its own
+            #  station's context, defeating the purpose of cross-station attention.)
             if self.use_input_context and input_context is not None:
-                ctx_exp = input_context.unsqueeze(2).expand(B, N, K, -1) \
-                                       .reshape(B, N * K, self.d_model)   # (B, N*K, D)
-                h = self.input_cross_attn(h, ctx_exp)
+                h = self.input_cross_attn(h, input_context)              # h: (B, N*K, D) ← ctx: (B, N, D)
 
             h = self.norm(h)                                        # (B, N*K, d_model)
 

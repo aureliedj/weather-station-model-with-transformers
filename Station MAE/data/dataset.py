@@ -340,7 +340,7 @@ _CACHE_FILENAME = "peakweather_obs_cache.pt"
 # Fast local cache  (numpy memmap — direct worker access, no IPC overhead)
 # ---------------------------------------------------------------------------
 
-_FAST_CACHE_VERSION = "v4"
+_FAST_CACHE_VERSION = "v5"   # v5: includes log1p transform on precipitation
 # Bump this when the on-disk format changes to force a rebuild.
 # v2: stores "all_valid_indices" (pre-mode pool) instead of post-stride
 #     "indices", so the windowing strategy can be changed without rebuilding.
@@ -932,7 +932,7 @@ class StationMAEDataset(Dataset):
         # bad_count[i+k] - bad_count[i] == 0  ↔  span [i, i+k-1] is gap-free
         _bad_count = np.zeros(T + 1, dtype=np.int32)
         _bad_count[1:T] = np.cumsum(_bad)   # (T-1,) diffs → positions 1..T-1
-        _bad_count[T]   = _bad_count[T - 1] # no gap beyond last timestamp
+        # _bad_count[T] is never queried (max index used is T-1); leave as zero.
 
         # A window needs the span [i, i + (W-1) + max_delta] to be gap-free,
         # i.e. no bad gaps among positions i, i+1, …, i + (W-1) + max_delta - 1.
@@ -1214,8 +1214,10 @@ class StationMAEDataset(Dataset):
             ys, y_masks, y_hrs = [], [], []
             for dt in self.delta_grid:
                 t_idx = i + W - 1 + dt
-                ys.append(self.obs[t_idx])
-                y_masks.append(self.mask[t_idx])
+                # .clone() avoids sending the full backing tensor (mmap / shared
+                # memory) through the DataLoader queue for every single timestep.
+                ys.append(self.obs[t_idx].clone())
+                y_masks.append(self.mask[t_idx].clone())
                 y_hrs.append(self.hours[t_idx])
             return {
                 "x":           x,

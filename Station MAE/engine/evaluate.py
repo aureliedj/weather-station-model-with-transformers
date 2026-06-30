@@ -46,9 +46,8 @@ Units per predicted variable
     wind_speed   → m/s  (derived: √(u² + v²), denormalised)
     wind_dir     → °    (derived: atan2(u, v), circular MAE)
 
-Only masked stations are evaluated to match the training objective and avoid
-the model trivially repeating its own inputs.  Within each masked station,
-only sensors present at the target timestep (y_mask == 1) count.
+Metrics are computed over all N stations wherever sensors are present
+(y_mask == 1).  See per-function docstrings for details.
 """
 
 import math
@@ -849,15 +848,21 @@ def evaluate_gap_filling(
             if use_per_station:
                 mean_per_var = mean_t.mean(dim=0) if mean_t.dim() == 2 else mean_t
             mean_u  = float(mean_per_var[ui].item())
-            std_u   = float((stds_cat[:, ui].mean() if use_per_station else std_per_var[ui]).item())
             mean_v  = float(mean_per_var[vi_i].item())
-            std_v_w = float((stds_cat[:, vi_i].mean() if use_per_station else std_per_var[vi_i]).item())
             m_uv = valid_cat[:, ui] & valid_cat[:, vi_i]
             if m_uv.sum() > 0:
-                u_pred = preds_cat[m_uv, ui]   * std_u   + mean_u
-                u_true = targets_cat[m_uv, ui] * std_u   + mean_u
-                v_pred = preds_cat[m_uv, vi_i] * std_v_w + mean_v
-                v_true = targets_cat[m_uv, vi_i] * std_v_w + mean_v
+                # Use element-wise per-station std when available so that stations
+                # far from the mean std are denormalised correctly.
+                if use_per_station:
+                    std_u_vec   = stds_cat[m_uv, ui]
+                    std_v_w_vec = stds_cat[m_uv, vi_i]
+                else:
+                    std_u_vec   = std_per_var[ui]
+                    std_v_w_vec = std_per_var[vi_i]
+                u_pred = preds_cat[m_uv, ui]   * std_u_vec   + mean_u
+                u_true = targets_cat[m_uv, ui] * std_u_vec   + mean_u
+                v_pred = preds_cat[m_uv, vi_i] * std_v_w_vec + mean_v
+                v_true = targets_cat[m_uv, vi_i] * std_v_w_vec + mean_v
 
                 ws_pred = (u_pred.pow(2) + v_pred.pow(2)).sqrt()
                 ws_true = (u_true.pow(2) + v_true.pow(2)).sqrt()
@@ -1263,4 +1268,3 @@ def compute_seasonal_metrics(
         seasonal_metrics[season] = m
 
     return seasonal_metrics
-    print()

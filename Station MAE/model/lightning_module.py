@@ -29,6 +29,9 @@ each metric is logged with exactly one mode:
     val/{var}_rmse_phys   — per-variable RMSE in physical units (RMSE_norm × obs_std[v])
     val/{var}_mae_phys    — per-variable MAE  in physical units (MAE_norm  × obs_std[v])
                             Physical metrics require cfg["obs_stats_std"] set by main.py.
+    val/step_sensitivity  — mean |pred(delta=36) − pred(delta=3)| on the first val batch.
+                            ≈ 0 → StepIndexEmbedding is being ignored by the decoder;
+                            > 0.05 → decoder output varies meaningfully with lead time.
 """
 
 import math
@@ -167,11 +170,28 @@ class StationMAELightning(pl.LightningModule):
             self._unpack_batch(batch)
         )
 
-        # Validation always uses a single lead-time (first delta if multi)
-        ds = delta_steps[:, 0] if delta_steps.dim() == 2 else delta_steps
-        y_ = y[:, 0]      if y.dim()      == 4 else y
-        ym = y_mask[:, 0] if y_mask.dim() == 4 else y_mask
-        yh = y_hours[:, 0] if y_hours.dim() == 2 else y_hours
+        # ── Choose validation lead-time ──────────────────────────────────
+        # We use k=1 (delta_steps[:, 1] = 3 half-hour steps = 30 min ahead)
+        # rather than k=0 (nowcast / delta=0).
+        #
+        # Why NOT k=0:
+        #   At delta=0 the target equals the last input step.  The encoder sees
+        #   the visible stations' own current values, so their predictions are
+        #   trivially near-perfect (≈ copy of input → RMSE ≈ 0).  This pulls
+        #   val/overall_rmse down to ~0.07, completely masking the true error
+        #   on masked stations and giving a false sense of model quality.
+        #   The derived physical metrics (_phys) then also appear ~10× too good.
+        #
+        # k=1 (30 min ahead) is the minimal "real" forecast horizon:
+        #   • Visible stations: 30-min extrapolation from their own context
+        #   • Masked stations: gap-fill from neighbours + 30-min extrapolation
+        #   This is consistent with what lead1_metrics.csv measures in test.py.
+        _is_multi = (delta_steps.dim() == 2 and delta_steps.shape[1] > 1)
+        _k = 1 if _is_multi else 0          # k=1 for multi-delta batches
+        ds = delta_steps[:, _k] if _is_multi else delta_steps
+        y_ = y[:, _k]       if y.dim()      == 4 else y
+        ym = y_mask[:, _k]  if y_mask.dim() == 4 else y_mask
+        yh = y_hours[:, _k] if y_hours.dim() == 2 else y_hours
 
         loss, preds, _ = self.model(
             x, x_mask, spatial, x_hours, y_, ym, yh, ds
@@ -234,6 +254,33 @@ class StationMAELightning(pl.LightningModule):
             self.log("val/overall_rmse", (pf - tf).pow(2).mean().sqrt(),
                      on_epoch=True, prog_bar=True, sync_dist=True)
             self.log("val/overall_mae",  (pf - tf).abs().mean(),
+                     on_epoch=True, sync_dist=True)
+
+        # ── Step-sensitivity probe (first batch of each val epoch only) ─
+        # Checks whether the StepIndexEmbedding actually influences decoder
+        # output.  Runs a second forward pass at the FAR delta (last K index,
+        # delta=36 = 6 h) and compares to the NEAR delta (k=1, 30 min).
+        #
+        # val/step_sensitivity = mean |pred_far - pred_near|
+        #   ≈ 0.0  → decoder is IGNORING the step index (StepIndexEmbedding
+        #            has no effect — model predicts the same regardless of
+        #            how far ahead it is asked to forecast)
+        #   > 0.05 → decoder is using the step index to modulate output
+        #
+        # Only computed when multi-delta batches are available (K > 2) so
+        # near and far deltas are distinct.
+        if batch_idx == 0 and _is_multi and delta_steps.shape[1] > 2:
+            _k_far = delta_steps.shape[1] - 1   # last K index (delta=36)
+            ds_far = delta_steps[:, _k_far]
+            y_far  = y[:, _k_far]  if y.dim()      == 4 else y
+            ym_far = y_mask[:, _k_far] if y_mask.dim() == 4 else y_mask
+            yh_far = y_hours[:, _k_far] if y_hours.dim() == 2 else y_hours
+            with torch.no_grad():
+                _, preds_far, _ = self.model(
+                    x, x_mask, spatial, x_hours, y_far, ym_far, yh_far, ds_far
+                )
+            step_sensitivity = (preds_far - preds).abs().mean()
+            self.log("val/step_sensitivity", step_sensitivity,
                      on_epoch=True, sync_dist=True)
 
     # ------------------------------------------------------------------
