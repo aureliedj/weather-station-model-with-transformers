@@ -137,13 +137,49 @@ class StationMAE(nn.Module):
         masked_only_loss:         bool  = False,
         joint_encoder:            bool  = False,
         input_context_cross_attn: bool  = False,
+        delta0_weight:            float = 1.0,
+        use_nll_loss:             bool  = False,
     ):
+        """
+        delta0_weight controls the relative loss weight of the k=0 horizon
+        (delta=0, reconstruction of the current timestep) versus all forecast
+        horizons (k≥1).
+
+        Justification: at delta=0, visible stations can almost directly copy
+        their own last input token — their contribution to the loss is near zero
+        and provides almost no gradient signal.  The k=0 target is mainly useful
+        for masked stations (gap-filling), but its presence at equal weight with
+        the 12 forecast horizons dilutes the forecasting gradient by 1/13.
+
+        delta0_weight=1.0  : uniform (current default, all K horizons equal)
+        delta0_weight=0.1  : down-weight k=0 to 1/10 of a forecast horizon
+        delta0_weight=0.0  : exclude k=0 entirely; model is a pure forecaster
+
+        use_nll_loss controls whether the per-variable loss is MSE/Huber or the
+        heteroscedastic Gaussian NLL (equivalent to CRPS for Gaussian predictions):
+
+            NLL = 0.5 × (err² / σ² + log σ²)
+                = 0.5 × (err² × exp(−log_var) + log_var)
+
+        where log_var = log σ² is predicted by a second linear head in the decoder
+        (initialised to 0 so σ² = 1 at training start).  The model learns to widen
+        its predictive uncertainty for hard samples (large residuals, long horizons,
+        spatially isolated masked stations).
+
+        use_nll_loss=False : default — MSE for non-wind, Huber for wind (backward compat)
+        use_nll_loss=True  : Gaussian NLL for all variables; enables calibrated uncertainty
+
+        References: Gneiting & Raftery (2007), Andrychowicz et al. (2023, MetNet-3),
+                    Bodnar et al. (2024, Aurora §3)
+        """
         super().__init__()
 
         self.mask_ratio       = mask_ratio
         self.num_vars         = num_vars
+        self.delta0_weight    = float(delta0_weight)
         self.num_target_vars  = num_target_vars
         self.masked_only_loss = masked_only_loss
+        self.use_nll_loss     = use_nll_loss
 
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
@@ -187,6 +223,7 @@ class StationMAE(nn.Module):
             cross_attention=cross_attention_decoder,
             drop_path_rate=drop_path_rate,
             input_context_cross_attn=input_context_cross_attn,
+            predict_uncertainty=use_nll_loss,
         )
 
     # ------------------------------------------------------------------
@@ -213,13 +250,17 @@ class StationMAE(nn.Module):
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
         encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        preds = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        if self.use_nll_loss:
+            preds, log_var = decoder_out
+        else:
+            preds, log_var = decoder_out, None
 
         y_target      = y[:, :, :self.num_target_vars]
         y_mask_target = y_mask[:, :, :self.num_target_vars]
         # Optionally restrict loss to masked stations (inpainting regime)
         _midx = masked_idx if self.masked_only_loss else None
-        loss  = self._supervised_loss(preds, y_target, y_mask_target, _midx)
+        loss  = self._supervised_loss(preds, y_target, y_mask_target, _midx, log_var=log_var)
 
         return loss, preds, masked_idx
 
@@ -258,7 +299,7 @@ class StationMAE(nn.Module):
             delta_steps: (B, K)          — lead-time (10-min steps) per target
 
         Returns:
-            loss:           scalar — mean MSE over K lead-times
+            loss:           scalar — horizon-weighted MSE over K lead-times
             preds:          (B, K, N, num_target_vars)
             masked_indices: (B, N_masked)
         """
@@ -269,20 +310,39 @@ class StationMAE(nn.Module):
         # encoded: (B, W*N_vis, d_model)
 
         # ── Decoder: runs once for all K lead-times ──────────────────────
-        preds_all = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        if self.use_nll_loss:
+            preds_all, log_var_all = decoder_out
+        else:
+            preds_all, log_var_all = decoder_out, None
         # preds_all: (B, K, N, num_target_vars)
+        # log_var_all: (B, K, N, num_target_vars)  or  None
 
-        # ── Loss: mean over K ────────────────────────────────────────────
+        # ── Horizon-weighted loss ─────────────────────────────────────────
+        # k=0 (delta=0) gets weight self.delta0_weight; all forecast horizons
+        # (k≥1) get weight 1.0.  Weights are normalised to sum=1 so the loss
+        # magnitude stays comparable regardless of the weight choice.
+        #
+        # Motivation (Challu et al. 2023; v5-small training dynamics):
+        #   At delta=0 visible stations can nearly copy their own last input,
+        #   contributing near-zero loss that dilutes the forecasting gradient.
+        #   Down-weighting this horizon shifts gradient mass toward the K-1
+        #   forecast targets without removing the gap-filling signal entirely.
+        h_weights = encoded.new_ones(K)
+        h_weights[0] = self.delta0_weight
+        h_weights = h_weights / h_weights.sum()   # normalise → sums to 1
+
         _midx    = masked_idx if self.masked_only_loss else None
         loss_acc = encoded.new_zeros(())
         for k in range(K):
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
-            loss_acc = loss_acc + self._supervised_loss(
-                preds_all[:, k], y_target_k, y_mask_target_k, _midx
+            lv_k = log_var_all[:, k] if log_var_all is not None else None  # (B, N, num_target_vars) or None
+            loss_acc = loss_acc + h_weights[k] * self._supervised_loss(
+                preds_all[:, k], y_target_k, y_mask_target_k, _midx, log_var=lv_k
             )
 
-        return loss_acc / K, preds_all, masked_idx
+        return loss_acc, preds_all, masked_idx
 
     # ------------------------------------------------------------------
     # Inference (no grad, no loss)
@@ -310,7 +370,11 @@ class StationMAE(nn.Module):
         """
         self.eval()
         encoded, _, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        return self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        # When NLL mode is active, decoder returns (mean, log_var) — return mean only.
+        if self.use_nll_loss:
+            return decoder_out[0]
+        return decoder_out
 
     # ------------------------------------------------------------------
     # Loss
@@ -318,32 +382,46 @@ class StationMAE(nn.Module):
 
     def _supervised_loss(
         self,
-        preds:      torch.Tensor,           # (B, N, V)
-        y:          torch.Tensor,           # (B, N, V)
-        y_mask:     torch.Tensor,           # (B, N, V)
+        preds:      torch.Tensor,                    # (B, N, V)
+        y:          torch.Tensor,                    # (B, N, V)
+        y_mask:     torch.Tensor,                    # (B, N, V)
         masked_idx: "torch.Tensor | None" = None,
+        log_var:    "torch.Tensor | None" = None,    # (B, N, V) — log σ² per var; None → MSE/Huber
     ) -> torch.Tensor:
         """
-        Variable-weighted loss: Huber for wind components, MSE for others.
+        Variable-weighted loss: Gaussian NLL when log_var is provided, otherwise
+        Huber for wind components and half-MSE for all others.
 
-        Weights (temperature=2.0, pressure=1.0, humidity=1.0, wind_u=1.5, wind_v=1.5):
-          • Temperature 2.0× — primary variable of interest; stronger gradient signal.
-          • Pressure and humidity equal weight — physically correlated, balanced gradients.
-          • Wind 1.5× + Huber — reduces systematic underprediction bias from MSE mean-regression.
+        Two modes, selected by whether log_var is passed:
+
+        MSE/Huber mode (log_var=None, default):
+          Weights (temperature=2.0, pressure=1.0, humidity=1.0, wind_u=1.5, wind_v=1.5):
+            • Temperature 2.0× — primary variable; stronger gradient signal.
+            • Pressure and humidity equal weight — physically correlated.
+            • Wind 1.5× + Huber — reduces systematic underprediction bias.
+
+        NLL mode (log_var provided, --nll_loss):
+          Heteroscedastic Gaussian NLL for all variables:
+            NLL_v = 0.5 × (err² × exp(−log_var_v) + log_var_v)
+          log_var is clamped to [−10, 10] to prevent σ² from collapsing or exploding.
+          Variable weights still apply; Huber is replaced by the Gaussian likelihood.
+          This is equivalent to CRPS for Gaussian predictive distributions
+          (Gneiting & Raftery, 2007), rewarding calibrated uncertainty alongside accuracy.
 
         Each variable's loss is normalised by its own present-sensor count so that
-        variables with fewer valid sensors (e.g. wind at some stations) are not
-        artificially up-weighted relative to variables that are always present.
+        variables with fewer valid sensors are not artificially up-weighted.
 
         Returns a scalar: weighted sum of per-variable losses / sum of weights.
         """
         if masked_idx is not None:
             B, N_m = masked_idx.shape
-            V  = y.shape[-1]
-            idx    = masked_idx.unsqueeze(-1).expand(B, N_m, V)
+            V   = y.shape[-1]
+            idx = masked_idx.unsqueeze(-1).expand(B, N_m, V)
             preds  = preds.gather(1, idx)
             y      = y.gather(1, idx)
             y_mask = y_mask.gather(1, idx)
+            if log_var is not None:
+                log_var = log_var.gather(1, idx)
 
         sensor_ok = y_mask.bool()                                   # (B, N, V)
         V = preds.shape[-1]
@@ -356,8 +434,14 @@ class StationMAE(nn.Module):
                 loss_per_var.append(preds.new_zeros(()))
                 continue
             err = preds[..., v] - y[..., v]                        # (B, N)
-            if v in self._wind_indices:
-                # Huber loss: L2 below delta, L1 above — reduces mean-regression bias
+
+            if log_var is not None:
+                # ── NLL mode: heteroscedastic Gaussian (CRPS-equivalent) ──
+                # Clamp to [-10, 10]: σ² = e^{-10} ≈ 4.5e-5 (min), e^{10} ≈ 22026 (max)
+                lv   = log_var[..., v].clamp(-10.0, 10.0)          # (B, N)
+                elem = 0.5 * (err.pow(2) * (-lv).exp() + lv)
+            elif v in self._wind_indices:
+                # ── Huber loss: L2 below delta, L1 above ─────────────────
                 abs_err = err.abs()
                 elem = torch.where(
                     abs_err <= self.huber_delta,
@@ -366,6 +450,7 @@ class StationMAE(nn.Module):
                 )
             else:
                 elem = 0.5 * err.pow(2)                            # half-MSE matches Huber scale
+
             # Normalise by this variable's own sensor count, not the global total
             loss_per_var.append((elem * ok.float()).sum() / ok.float().sum().clamp(min=1.0))
 

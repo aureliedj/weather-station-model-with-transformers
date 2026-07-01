@@ -185,11 +185,35 @@ def parse_args() -> argparse.Namespace:
                         "--grad_checkpoint on ≤24 GB GPUs. Takes precedence over "
                         "--factorised_encoder.")
 
+    p.add_argument("--delta0_weight", type=float, default=1.0,
+                   help="Relative loss weight for the k=0 horizon (delta=0, reconstruction) "
+                        "vs all forecast horizons (k≥1, weight=1.0). Weights are normalised "
+                        "to sum=1 before applying. "
+                        "1.0 = uniform (default, all K horizons equal). "
+                        "0.1 = down-weight reconstruction to 1/10 of a forecast horizon — "
+                        "  shifts gradient mass toward forecasting without discarding gap-fill. "
+                        "0.0 = exclude k=0 entirely; pure forecaster. "
+                        "Motivation: at delta=0, visible stations near-trivially copy their "
+                        "input, contributing near-zero loss that dilutes forecasting gradients. "
+                        "(Challu et al. 2023, N-HiTS; see REVIEW.md §5.4)")
+
     p.add_argument("--input_context_cross_attn", action="store_true",
                    help="Add a final cross-attention block in the decoder that attends "
                         "to the last-timestep input tokens for all N stations. "
                         "Anchors short-horizon predictions to the most recent observation, "
                         "moving the persistence crossover from ~45 min to ~15 min.")
+    p.add_argument("--nll_loss", action="store_true",
+                   help="Replace MSE/Huber with heteroscedastic Gaussian NLL (CRPS). "
+                        "Adds a log-variance head to the decoder: the model predicts both "
+                        "a mean and a per-variable uncertainty σ² at every station. "
+                        "Loss = 0.5 × (err² / σ² + log σ²). "
+                        "Initialised so σ²=1 at training start (= same scale as MSE). "
+                        "The model learns to widen uncertainty for hard samples (long "
+                        "horizons, isolated masked stations). "
+                        "Val RMSE is still computed from the mean prediction — comparable "
+                        "across runs regardless of loss mode. "
+                        "(Priority 2 — REVIEW.md §5.2; Gneiting & Raftery 2007; "
+                        "Andrychowicz et al. 2023 MetNet-3)")
     p.add_argument("--accumulate_grad_batches", type=int, default=1,
                    help="Gradient accumulation steps (default 1 = no accumulation). "
                         "Effective batch_size = batch_size × accumulate_grad_batches. "
@@ -445,7 +469,6 @@ def main() -> None:
         delta_steps=args.max_delta,
         split="val",
         obs_stats=train_ds.obs_stats,       # always normalise with train-split stats
-        num_delta_per_sample=1,
         max_delta_steps=args.max_delta,
         cache_dir=cache_dir,
         train_years=train_years,
@@ -518,6 +541,8 @@ def main() -> None:
         masked_only_loss=args.masked_only_loss,
         joint_encoder=args.joint_encoder,
         input_context_cross_attn=args.input_context_cross_attn,
+        delta0_weight=args.delta0_weight,
+        use_nll_loss=args.nll_loss,
     )
 
     _mode_labels = {
@@ -539,6 +564,10 @@ def main() -> None:
     if args.masked_only_loss:
         print("Loss                     : masked stations only  "
               "(visible stations are context, not supervision targets)")
+    if args.nll_loss:
+        print("Loss mode                : Gaussian NLL / CRPS  "
+              "(heteroscedastic — decoder predicts mean + log σ² per variable; "
+              "NLL = 0.5×(err²/σ² + log σ²))")
     if args.grad_checkpoint:
         print("Gradient checkpointing   : ON  (~33% extra compute, ~66% less VRAM)")
     if args.joint_encoder:
@@ -618,6 +647,8 @@ def main() -> None:
         "dropout":             args.dropout,
         "drop_path_rate":      args.drop_path_rate,
         "masked_only_loss":    args.masked_only_loss,
+        "delta0_weight":       args.delta0_weight,
+        "use_nll_loss":        args.nll_loss,
         "joint_encoder":       args.joint_encoder,
         "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,

@@ -144,9 +144,11 @@ TEMPORAL_WINDOW="--temporal_window 6"
 #     coverage bias.  --train_stride is ignored in this mode.
 #     Best default when combined with a large pool and many epochs.
 
-INDEX_MODE="--index_mode random --random_epoch_size 4000"
-# INDEX_MODE="--index_mode random --random_epoch_size 40000"
-# ↑ 8000 samples / batch_size=4 = 2000 batches/epoch — stabler gradients than default ~914
+# INDEX_MODE="--index_mode random --random_epoch_size 4000"    # fast debug: 250 steps/epoch
+INDEX_MODE="--index_mode random --random_epoch_size 40000"     # LR validation: 2500 steps/epoch, ~45 min/epoch
+# INDEX_MODE="--index_mode random --random_epoch_size 262836"  # full run: 16427 steps/epoch, ~5 h/epoch
+# ↑ full pool: ~63% unique windows/epoch (1 − e^{−1})
+# Switch to full pool AFTER validating lr=1e-4 is stable (check epoch 1-5 of v6)
 # INDEX_MODE="--index_mode sliding --train_stride 4"
 # INDEX_MODE="--index_mode blocks"
 
@@ -162,6 +164,8 @@ python main.py \
     --delta_grid_stride 3 \
     --mlp_ratio        4.0 \
     --d_model          1024 \
+    --enc_heads        16 \
+    --dec_heads        16 \
     --enc_layers       8 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
@@ -170,15 +174,15 @@ python main.py \
     --batch_size       4 \
     --num_workers      3 \
     --epochs           100 \
-    --lr               1e-5 \
-    --warmup_epochs    15 \
+    --lr               1e-4 \
+    --warmup_epochs    5 \
     --weight_decay     0.05 \
-    --grad_clip        0.5 \
+    --grad_clip        1.0 \
     --accumulate_grad_batches 4 \
     --input_context_cross_attn \
-    --limit_val_batches 200 \
-    --patience         15 \
-    --monitor          val/temperature_rmse \
+    --delta0_weight    0.1 \
+    --limit_val_batches 400 \
+    --patience         5 \
     --min_lr           5e-7 \
     --amp \
     --bf16 \
@@ -190,7 +194,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v5-small \
+    --wandb_run_name   tw6-d1024-v6 \
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:

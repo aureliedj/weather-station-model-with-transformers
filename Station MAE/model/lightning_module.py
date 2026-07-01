@@ -112,12 +112,16 @@ class StationMAELightning(pl.LightningModule):
         self.log("train/lr",   lr,   on_step=True, on_epoch=False, prog_bar=False)
 
         # ── train/overall_rmse — epoch-level, mirrors val/overall_rmse ────────
-        # Use first delta for consistent comparison with val (which uses K=1).
+        # Use k=1 (delta=3 = 30 min) to match the val horizon exactly.
+        # k=0 (delta=0, nowcast) would make train RMSE look artificially
+        # better than val RMSE because visible stations at delta=0 trivially
+        # copy their own input — not a meaningful comparison.
         with torch.no_grad():
             if is_multi:
-                p_flat = preds[:, 0].reshape(-1, NUM_TARGET_VARIABLES)
-                t_flat = y[:, 0, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES)
-                m_flat = y_mask[:, 0, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES).bool()
+                _k_train = min(1, preds.shape[1] - 1)   # k=1 if K>1, else k=0
+                p_flat = preds[:, _k_train].reshape(-1, NUM_TARGET_VARIABLES)
+                t_flat = y[:, _k_train, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES)
+                m_flat = y_mask[:, _k_train, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES).bool()
             else:
                 p_flat = preds.reshape(-1, NUM_TARGET_VARIABLES)
                 t_flat = y[:, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES)

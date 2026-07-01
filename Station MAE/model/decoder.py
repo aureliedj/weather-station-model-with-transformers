@@ -203,13 +203,15 @@ class StationMAEDecoder(nn.Module):
         cross_attention:         bool  = False,
         drop_path_rate:          float = 0.0,
         input_context_cross_attn: bool = False,
+        predict_uncertainty:      bool = False,
     ):
         super().__init__()
 
-        self.d_model           = d_model
-        self.num_target_vars   = num_target_vars
-        self.use_checkpoint    = use_checkpoint
+        self.d_model             = d_model
+        self.num_target_vars     = num_target_vars
+        self.use_checkpoint      = use_checkpoint
         self.use_cross_attention = cross_attention
+        self.predict_uncertainty = predict_uncertainty
 
         # ------------------------------------------------------------------
         # Learnable mask token — shared starting point for all station queries.
@@ -304,6 +306,28 @@ class StationMAEDecoder(nn.Module):
         # context only (zero-inflated distribution makes MSE a poor fit).
         # ------------------------------------------------------------------
         self.head = nn.Linear(d_model, num_target_vars)
+
+        # ------------------------------------------------------------------
+        # Optional log-variance head (heteroscedastic NLL / CRPS mode).
+        #
+        # When predict_uncertainty=True, a second linear layer produces
+        # log σ²_v per variable, enabling the Gaussian heteroscedastic NLL:
+        #
+        #     NLL = 0.5 × (err² / σ² + log σ²)
+        #         = 0.5 × (err² × exp(−log_var) + log_var)
+        #
+        # Initialised with zero weights and bias so that at training start
+        # σ² = exp(log_var) = 1, making the NLL identical in scale to MSE.
+        # The model then learns to widen uncertainty for difficult samples
+        # (large residuals, long horizons, masked stations far from neighbours).
+        #
+        # Only instantiated when predict_uncertainty=True — no overhead when
+        # using the default MSE/Huber loss.
+        # ------------------------------------------------------------------
+        if predict_uncertainty:
+            self.log_var_head = nn.Linear(d_model, num_target_vars)
+            nn.init.zeros_(self.log_var_head.weight)
+            nn.init.zeros_(self.log_var_head.bias)
 
     # ------------------------------------------------------------------
     # Forward
@@ -409,7 +433,10 @@ class StationMAEDecoder(nn.Module):
                 h = self.input_cross_attn(h, input_context)         # (B, N, d_model)
 
             h = self.norm(h)
-            return self.head(h)                                     # (B, N, num_target_vars)
+            mean = self.head(h)                                     # (B, N, num_target_vars)
+            if self.predict_uncertainty:
+                return mean, self.log_var_head(h)                   # (mean, log_var)
+            return mean
 
         else:
             # ── Multi-delta path ──────────────────────────────────────────
@@ -451,9 +478,14 @@ class StationMAEDecoder(nn.Module):
             if self.use_input_context and input_context is not None:
                 h = self.input_cross_attn(h, input_context)              # h: (B, N*K, D) ← ctx: (B, N, D)
 
-            h = self.norm(h)                                        # (B, N*K, d_model)
+            h = self.norm(h)                                       # (B, N*K, d_model)
 
-            preds = self.head(h)                                    # (B, N*K, num_target_vars)
-            preds = preds.reshape(B, N, K, self.num_target_vars)
-            preds = preds.permute(0, 2, 1, 3).contiguous()         # (B, K, N, num_target_vars)
-            return preds
+            mean = self.head(h)                                    # (B, N*K, num_target_vars)
+            mean = mean.reshape(B, N, K, self.num_target_vars)
+            mean = mean.permute(0, 2, 1, 3).contiguous()          # (B, K, N, num_target_vars)
+            if self.predict_uncertainty:
+                log_var = self.log_var_head(h)                     # (B, N*K, num_target_vars)
+                log_var = log_var.reshape(B, N, K, self.num_target_vars)
+                log_var = log_var.permute(0, 2, 1, 3).contiguous()  # (B, K, N, num_target_vars)
+                return mean, log_var
+            return mean
