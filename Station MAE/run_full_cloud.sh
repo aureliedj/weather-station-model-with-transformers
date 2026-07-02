@@ -42,9 +42,8 @@
 #     Local windowed temporal attention: splits W timesteps into chunks of N.
 #     Odd layers use a Swin-style half-window shift so tokens communicate
 #     across chunk boundaries after two layers. W must be divisible by N.
-#     At W=144, tw=6 gives 24 one-hour chunks. Score computation drops 24×
+#     At W=72, tw=6 gives 12 one-hour chunks. Score computation drops 12×
 #     (still modest savings vs FFN/QKV, but worthwhile at this window size).
-#     At W=288, tw=6 gives 48 chunks — savings become substantial.
 #
 # Resuming an interrupted run:
 #   ./run_full_cloud.sh   (Lightning restores from last.ckpt automatically)
@@ -110,13 +109,6 @@ ENCODER=""                                         # flat self-attention over W�
 # Flat encoder (current default):
 #   Full cross-station attention within each tw×N_vis chunk.
 #   W=72, tw=6, N_vis≈65 → 390 tokens/chunk  (144× cheaper than full flat)
-#   Recommended d_model: 512  mlp_ratio: 4.0
-#   TEMPORAL_WINDOW="--temporal_window 6"
-#
-# Factorised encoder:
-#   Windowed temporal-only attention within each station's tw-step window.
-#   W=72, tw=6 → 12 one-hour chunks, 12× cheaper temporal sub-layer.
-#   TEMPORAL_WINDOW="--temporal_window 6"
 #
 TEMPORAL_WINDOW="--temporal_window 6"
 # TEMPORAL_WINDOW="--temporal_window 12"  # previous setting
@@ -124,33 +116,38 @@ TEMPORAL_WINDOW="--temporal_window 6"
 
 # ── Window sampling strategy ──────────────────────────────────────────────────
 #
-# Controls which windows become training samples (val/test always use
-# "sliding" with stride=1 for consistent evaluation).
+# Training uses index_mode=random — each __getitem__ draws independently
+# and uniformly from the full pool of ~260k valid windows (with replacement).
+# The station mask is re-drawn per sample, so revisiting the same time window
+# in a later step is NOT redundant — a different 50% of stations are masked,
+# creating a genuinely different training task.
 #
-#   sliding  (Strategy C — default, GraphDOP / most baselines)
-#     Every contiguity-valid start, thinned by --train_stride.
-#     DataLoader shuffle gives random-without-replacement epochs.
-#     With W=72 and stride=4: windows every 40 min, ~94% overlap.
-#     Maximum data coverage; use when overfitting is not a concern.
+# Epoch size rationale
+# --------------------
+# The non-overlapping block count for 5 training years is:
+#   pool (~260,000) / W (72) ≈ 3,611 windows
+# This is the minimum epoch size that gives one "effective pass" over the data.
+# We set random_epoch_size=10000 (≈ 2.8× non-overlapping) as the baseline.
+# Each revisit has a different random station mask, so it is NOT redundant.
 #
-#   blocks   (Strategy B — PatchTST / iTransformer)
-#     Greedy non-overlapping: no two windows share any input timestep.
-#     W=72 → ~1 window per 12 h → ~3,500 train samples (vs ~260K sliding).
-#     Cleanest gradient signal; useful for fast ablation runs.
+# This is a 4× reduction from the previous 40,000-step epochs, which was
+# 11× redundant within each epoch and led to:
+#   • 3h/epoch → very coarse LR scheduling and monitoring granularity
+#   • Only ~33 epochs in a 100h budget
+# With 10,000 steps/epoch (~2500 batches at batch_size=4):
+#   • ~50 min/epoch → fine-grained LR decay and early stopping
+#   • ~120 epochs in a 100h budget
 #
-#   random   (Strategy A — Aurora / W-MAE / VideoMAE)
-#     Full pool stored; each __getitem__ samples independently at random
-#     (with replacement).  Different windows every epoch, no systematic
-#     coverage bias.  --train_stride is ignored in this mode.
-#     Best default when combined with a large pool and many epochs.
-
-# INDEX_MODE="--index_mode random --random_epoch_size 4000"    # fast debug: 250 steps/epoch
-INDEX_MODE="--index_mode random --random_epoch_size 40000"     # LR validation: 2500 steps/epoch, ~45 min/epoch
-# INDEX_MODE="--index_mode random --random_epoch_size 262836"  # full run: 16427 steps/epoch, ~5 h/epoch
-# ↑ full pool: ~63% unique windows/epoch (1 − e^{−1})
-# Switch to full pool AFTER validating lr=1e-4 is stable (check epoch 1-5 of v6)
-# INDEX_MODE="--index_mode sliding --train_stride 4"
-# INDEX_MODE="--index_mode blocks"
+# Validation uses non-overlapping blocks (hardcoded in main.py):
+#   Val year 2022 → ~728 windows → ~23 batches at batch_size=4 → ~6 s/epoch
+#   No --limit_val_batches needed — the full val set is evaluated every epoch.
+#
+INDEX_MODE="--index_mode random --random_epoch_size 10000"
+# INDEX_MODE="--index_mode random --random_epoch_size 5000"  # ~1.4× non-overlapping (fast ablation)
+# INDEX_MODE="--index_mode random --random_epoch_size 3611"  # exact 1× non-overlapping
+# INDEX_MODE="--index_mode random --random_epoch_size 40000" # previous (11× redundant)
+# INDEX_MODE="--index_mode blocks"                           # non-overlapping train (fast ablation)
+# INDEX_MODE="--index_mode sliding --train_stride 4"         # sliding, hourly stride
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -173,16 +170,15 @@ python main.py \
     --drop_path_rate   0.0 \
     --batch_size       4 \
     --num_workers      3 \
-    --epochs           100 \
+    --epochs           300 \
     --lr               1e-4 \
-    --warmup_epochs    5 \
+    --warmup_epochs    15 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
     --accumulate_grad_batches 4 \
     --input_context_cross_attn \
-    --delta0_weight    0.1 \
-    --limit_val_batches 400 \
-    --patience         5 \
+    --nll_loss \
+    --patience         40 \
     --min_lr           5e-7 \
     --amp \
     --bf16 \
@@ -194,29 +190,8 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v6 \
+    --wandb_run_name   tw6-d1024-v8 \
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
-#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v3-best.ckpt
-
-# ─── Sub-epoch validation + checkpointing (--val_check_interval) ─────────────
-#
-# One full epoch on this config takes ~50 min.  To get validation feedback and
-# checkpoint saves every ~30 min instead of every epoch, add these flags:
-#
-#   --val_check_interval 4000   # run val every 4000 training steps (~30 min)
-#   --save_every_steps   4000   # save step_NNNNNNN.ckpt at the same interval
-#   --patience           3      # stop after 3 checks (~90 min) without improvement
-#   --min_lr             1e-6   # LR floor: cosine decays to 1e-6 not 0
-#
-# With batch_size=16 and ~105K train samples → ~6562 steps/epoch.
-# 4000 steps ≈ 0.61 epochs ≈ 30 min.  Adjust if your step-time differs.
-# EarlyStopping patience now counts "validation checks" not epochs, so
-# patience=3 → stop after ~90 min without improvement.
-
-# ─── If still OOM: switch to window=72 (12 h context) ────────────────────────
-# Replace --window 144 with --window 72 and remove --grad_checkpoint.
-# Temporal attention drops 4×, decoder KV halves, frees ~3-4 GB VRAM.
-# The model still forecasts up to 6 h ahead via DeltaTimeEmbedding.
-# Epoch time roughly halves compared to window=144 without grad_checkpoint.
+#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v7-best.ckpt

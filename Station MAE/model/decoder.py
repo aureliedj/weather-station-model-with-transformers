@@ -12,12 +12,21 @@ The decoder answers a single question per forward pass:
 It does so in four steps:
 
   1. Station queries  —  For each of the N stations build a target-time query
-     vector by summing three positional signals:
+     vector by summing five positional signals:
 
-         query[n] = mask_token                      (learnable, shared)
-                  + spatial_emb(spatial[n])         — WHERE  (static topo/location)
-                  + temporal_emb(y_hours)            — WHEN   (Aurora Fourier time)
-                  + delta_emb(delta_steps)           — LEAD   (forecast horizon)
+         query[n,k] = mask_token                           (learnable, shared)
+                    + spatial_emb(spatial[n])              — WHERE  (static topo/location)
+                    + temporal_emb(y_hours[k])             — WHEN   (Aurora Fourier absolute time)
+                    + delta_emb(delta_steps[k])            — LEAD   (forecast horizon in hours)
+                    + step_emb(W-1 + delta_steps[k])       — LEAD   (position in unified step-count
+                                                                      timeline shared with encoder)
+
+     The step_emb places each decoder query in the SAME integer coordinate system
+     as the encoder: encoder input tokens use indices 0..W-1, decoder query tokens
+     use indices W-1+Δ (e.g. 74, 77, …, 107 for Δ=3,6,…,36 and W=72).
+     This is semantically clean — no aliasing between encoder and decoder indices —
+     and lets the model learn "I am 3 steps after the last encoder step" rather
+     than just "my lead time is 0.5 h".
 
   2. Full sequence  —  Concatenate the W·N_vis encoder tokens (context) with
      the N station queries (targets):
@@ -204,6 +213,7 @@ class StationMAEDecoder(nn.Module):
         drop_path_rate:          float = 0.0,
         input_context_cross_attn: bool = False,
         predict_uncertainty:      bool = False,
+        window_size:              int  = 72,
     ):
         super().__init__()
 
@@ -212,6 +222,9 @@ class StationMAEDecoder(nn.Module):
         self.use_checkpoint      = use_checkpoint
         self.use_cross_attention = cross_attention
         self.predict_uncertainty = predict_uncertainty
+        # W: input window length.  Decoder step indices = W-1 + delta_steps,
+        # continuing the encoder's 0..W-1 timeline into future positions.
+        self.window_size         = window_size
 
         # ------------------------------------------------------------------
         # Learnable mask token — shared starting point for all station queries.
@@ -240,15 +253,24 @@ class StationMAEDecoder(nn.Module):
         self.delta_emb    = DeltaTimeEmbedding(d_model=d_model, fourier_dim=delta_fourier_dim,
                                                dropout=dropout)
 
-        # s  — STEP: Integer step-index embedding (same Fourier basis as encoder).
-        # The decoder receives delta_steps as integer 10-min step counts
-        # (e.g. 0, 3, 6, 9, … for 30-min spacing).  This embedding maps those
-        # step counts to d_model using the same log-spaced sinusoidal basis as
-        # the encoder's StepIndexEmbedding, so the model can directly align
-        # "input token at step 3" with "decoder query at delta_step 3".
-        # Complements delta_emb (which encodes continuous hours) with an
-        # explicit discrete-step signal consistent with the encoder context.
-        self.step_emb = StepIndexEmbedding(d_model=d_model, dropout=dropout)
+        # s  — STEP: integer position in the unified encoder+decoder timeline.
+        #
+        # The encoder assigns step indices 0..W-1 to its input tokens.
+        # The decoder's query tokens at lead Δ are placed at index W-1+Δ,
+        # continuing the same integer coordinate system past the window edge:
+        #
+        #   Encoder  :  0 ──── 1 ──── … ──── W-1          (input steps)
+        #   Decoder  :                              W-1+3  W-1+6  …  W-1+36
+        #              (e.g. W=72 → encoder 0..71, decoder 74, 77, …, 107)
+        #
+        # This guarantees decoder indices are strictly outside the encoder range
+        # (no aliasing: "step 6 in the encoder" ≠ "step 6 in the decoder"),
+        # and gives the model a common positional reference that complements
+        # DeltaTimeEmbedding's continuous-hours signal with a discrete step count
+        # calibrated to the window scale.  The Fourier basis (log-spaced
+        # wavelengths 1..max_steps) is identical to the encoder's step_emb so
+        # that encoder and decoder positions are represented in the same space.
+        self.step_emb     = StepIndexEmbedding(d_model=d_model, dropout=dropout)
 
         # --- Post-assembly normalisation for station query tokens ---
         # Applied after summing mask_token + spatial + temporal + delta,
@@ -403,7 +425,10 @@ class StationMAEDecoder(nn.Module):
             # ── Single-delta path ─────────────────────────────────────────
             temp_emb = self.temporal_emb(y_hours)                   # (B, d_model)
             delt_emb = self.delta_emb(delta_steps)                  # (B, d_model)
-            step_emb = self.step_emb(delta_steps)                   # (B, d_model)
+            # Step index in the unified encoder+decoder timeline: W-1 + Δ
+            # e.g. delta_steps=3 → step_idx=74 for W=72
+            step_idx = (self.window_size - 1) + delta_steps         # (B,) long
+            step_emb = self.step_emb(step_idx)                      # (B, d_model)
 
             queries = spatial_q \
                     + temp_emb.unsqueeze(1) \
@@ -442,7 +467,10 @@ class StationMAEDecoder(nn.Module):
             # ── Multi-delta path ──────────────────────────────────────────
             temp_emb = self.temporal_emb(y_hours)                   # (B, K, d_model)
             delt_emb = self.delta_emb(delta_steps)                  # (B, K, d_model)
-            step_emb = self.step_emb(delta_steps)                   # (B, K, d_model)
+            # Step index in the unified encoder+decoder timeline: W-1 + Δ
+            # delta_steps: (B, K) long  →  step_idx: (B, K)
+            step_idx = (self.window_size - 1) + delta_steps         # (B, K) long
+            step_emb = self.step_emb(step_idx)                      # (B, K, d_model)
 
             spatial_exp = spatial_q.unsqueeze(2).expand(B, N, K, -1)   # (B, N, K, d_model)
             temp_exp    = temp_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)

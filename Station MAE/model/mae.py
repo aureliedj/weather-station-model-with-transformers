@@ -139,6 +139,8 @@ class StationMAE(nn.Module):
         input_context_cross_attn: bool  = False,
         delta0_weight:            float = 1.0,
         use_nll_loss:             bool  = False,
+        use_persist_norm:         bool  = False,
+        window_size:              int   = 72,
     ):
         """
         delta0_weight controls the relative loss weight of the k=0 horizon
@@ -171,15 +173,47 @@ class StationMAE(nn.Module):
 
         References: Gneiting & Raftery (2007), Andrychowicz et al. (2023, MetNet-3),
                     Bodnar et al. (2024, Aurora §3)
+
+        use_persist_norm divides each variable's per-sensor loss by that variable's
+        persistence MSE — the expected squared error of the naive "repeat last
+        observed value" baseline, estimated from the validation set before training.
+
+        This converts the loss from raw MSE scale to a skill-score scale:
+            L_v_normalised = L_v / MSE_persist_v
+        where L_v_normalised = 1.0 means the model matches persistence exactly,
+        and L_v_normalised < 1.0 means the model beats it.
+
+        The key effect is automatic gradient rebalancing: variables that are
+        spatially easy to predict (pressure, small MSE_persist) are up-weighted
+        relative to difficult variables (wind, large MSE_persist), so that all
+        variables contribute comparable gradient magnitudes regardless of their
+        inherent predictability.
+
+        Call set_persist_mse() with a (num_target_vars,) tensor before training.
+        The buffer is saved in checkpoints and restored on resume.
+
+        use_persist_norm=False : default — raw MSE scale (backward compat)
+        use_persist_norm=True  : skill-score scale, auto-balances gradient contributions
+
+        References: Rasp & Lerch (2018), Demaeyer et al. (2023, EUPPBench)
         """
         super().__init__()
 
-        self.mask_ratio       = mask_ratio
-        self.num_vars         = num_vars
-        self.delta0_weight    = float(delta0_weight)
-        self.num_target_vars  = num_target_vars
-        self.masked_only_loss = masked_only_loss
-        self.use_nll_loss     = use_nll_loss
+        self.mask_ratio        = mask_ratio
+        self.num_vars          = num_vars
+        self.delta0_weight     = float(delta0_weight)
+        self.num_target_vars   = num_target_vars
+        self.masked_only_loss  = masked_only_loss
+        self.use_nll_loss      = use_nll_loss
+        self.use_persist_norm  = use_persist_norm
+
+        # Persistence MSE normaliser — one scalar per target variable.
+        # Initialised to 1.0 so the loss is unchanged until set_persist_mse()
+        # is called.  Saved/restored automatically via Lightning checkpoints.
+        self.register_buffer(
+            "persist_mse",
+            torch.ones(num_target_vars, dtype=torch.float32),
+        )
 
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
@@ -224,6 +258,7 @@ class StationMAE(nn.Module):
             drop_path_rate=drop_path_rate,
             input_context_cross_attn=input_context_cross_attn,
             predict_uncertainty=use_nll_loss,
+            window_size=window_size,
         )
 
     # ------------------------------------------------------------------
@@ -319,27 +354,40 @@ class StationMAE(nn.Module):
         # log_var_all: (B, K, N, num_target_vars)  or  None
 
         # ── Horizon-weighted loss ─────────────────────────────────────────
-        # k=0 (delta=0) gets weight self.delta0_weight; all forecast horizons
-        # (k≥1) get weight 1.0.  Weights are normalised to sum=1 so the loss
-        # magnitude stays comparable regardless of the weight choice.
-        #
-        # Motivation (Challu et al. 2023; v5-small training dynamics):
-        #   At delta=0 visible stations can nearly copy their own last input,
-        #   contributing near-zero loss that dilutes the forecasting gradient.
-        #   Down-weighting this horizon shifts gradient mass toward the K-1
-        #   forecast targets without removing the gap-filling signal entirely.
+        # Uniform weights across all K horizons (normalised to sum=1).
+        # delta0_weight is applied to k=0 when delta=0 is the first grid entry,
+        # though with masked-only supervision at k=0 the gradient is already
+        # naturally smaller (~50% of stations), so delta0_weight=1.0 is preferred.
         h_weights = encoded.new_ones(K)
-        h_weights[0] = self.delta0_weight
+        if delta_steps[0, 0].item() == 0:
+            h_weights[0] = self.delta0_weight
         h_weights = h_weights / h_weights.sum()   # normalise → sums to 1
 
-        _midx    = masked_idx if self.masked_only_loss else None
+        # ── Per-horizon masking strategy ──────────────────────────────────
+        # delta=0 (inpainting / reconstruction):
+        #   Supervision on MASKED stations only.  Visible stations have a direct
+        #   shortcut through input_context — their predictions are trivially close
+        #   to their own input values, contributing near-zero loss and gradient.
+        #   Limiting to masked stations gives a pure gap-filling signal.
+        #
+        # delta>0 (forecasting):
+        #   Supervision on ALL stations unless masked_only_loss is set globally.
+        #   Both visible and masked stations provide a genuine forecast gradient
+        #   — no shortcut exists at any horizon past the last input step.
         loss_acc = encoded.new_zeros(())
         for k in range(K):
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
-            lv_k = log_var_all[:, k] if log_var_all is not None else None  # (B, N, num_target_vars) or None
+            lv_k = log_var_all[:, k] if log_var_all is not None else None
+
+            # k=0 and delta=0: always restrict to masked stations
+            if k == 0 and delta_steps[0, 0].item() == 0:
+                _midx_k = masked_idx
+            else:
+                _midx_k = masked_idx if self.masked_only_loss else None
+
             loss_acc = loss_acc + h_weights[k] * self._supervised_loss(
-                preds_all[:, k], y_target_k, y_mask_target_k, _midx, log_var=lv_k
+                preds_all[:, k], y_target_k, y_mask_target_k, _midx_k, log_var=lv_k
             )
 
         return loss_acc, preds_all, masked_idx
@@ -425,7 +473,12 @@ class StationMAE(nn.Module):
 
         sensor_ok = y_mask.bool()                                   # (B, N, V)
         V = preds.shape[-1]
-        weights = self.var_weights[:V]                              # (V,)
+        # NLL mode is self-weighting via σ² — uniform weights avoid double-counting.
+        # MSE/Huber mode uses the hand-tuned variable weights.
+        if log_var is not None:
+            weights = preds.new_ones(V)
+        else:
+            weights = self.var_weights[:V]                          # (V,)
 
         loss_per_var = []
         for v in range(V):
@@ -452,7 +505,19 @@ class StationMAE(nn.Module):
                 elem = 0.5 * err.pow(2)                            # half-MSE matches Huber scale
 
             # Normalise by this variable's own sensor count, not the global total
-            loss_per_var.append((elem * ok.float()).sum() / ok.float().sum().clamp(min=1.0))
+            var_loss = (elem * ok.float()).sum() / ok.float().sum().clamp(min=1.0)
+
+            # ── Persistence-normalised loss (Fix 2) ───────────────────────
+            # Divide by the persistence MSE for this variable so that the loss
+            # is expressed as a skill score (1.0 = persistence level).
+            # This equalises gradient contributions across variables regardless
+            # of how spatially predictable each one is — wind (large persist MSE)
+            # is down-weighted, pressure (small persist MSE) is up-weighted.
+            # persist_mse is clamped to ≥ 1e-6 to guard against near-zero values.
+            if self.use_persist_norm:
+                var_loss = var_loss / self.persist_mse[v].clamp(min=1e-6)
+
+            loss_per_var.append(var_loss)
 
         weighted = (weights * torch.stack(loss_per_var)).sum()
         return weighted / weights.sum()
@@ -460,6 +525,26 @@ class StationMAE(nn.Module):
     # ------------------------------------------------------------------
     # Convenience
     # ------------------------------------------------------------------
+
+    def set_persist_mse(self, persist_mse: "torch.Tensor") -> None:
+        """Set per-variable persistence MSE for loss normalisation (Fix 2).
+
+        Must be called before training when ``use_persist_norm=True``.
+        The values are estimated from the validation set by the
+        ``_estimate_persist_mse`` helper in main.py.
+
+        Args:
+            persist_mse: (num_target_vars,) float tensor — persistence MSE
+                         per variable in normalised (z-score) space.
+                         Typically in the range [0.05, 0.80] depending on
+                         how spatially predictable each variable is.
+
+        Example::
+
+            persist_mse = _estimate_persist_mse(val_loader, num_target_vars=5)
+            model.set_persist_mse(persist_mse)
+        """
+        self.persist_mse.copy_(persist_mse.to(self.persist_mse.device))
 
     def count_parameters(self) -> int:
         """Return the total number of trainable parameters."""

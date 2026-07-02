@@ -202,6 +202,17 @@ def parse_args() -> argparse.Namespace:
                         "to the last-timestep input tokens for all N stations. "
                         "Anchors short-horizon predictions to the most recent observation, "
                         "moving the persistence crossover from ~45 min to ~15 min.")
+    p.add_argument("--persist_norm", action="store_true",
+                   help="Normalise each variable's loss by its persistence MSE, converting "
+                        "the loss to a skill-score scale (1.0 = matches persistence baseline). "
+                        "Estimated from 200 validation batches before training starts — no "
+                        "extra data or configuration needed. "
+                        "Effect: pressure (small persist MSE, high spatial predictability) "
+                        "gets a larger gradient weight; wind (large persist MSE, low "
+                        "predictability) gets a smaller weight — automatically balancing "
+                        "gradient contributions across variables. "
+                        "Compatible with both MSE/Huber and --nll_loss modes. "
+                        "(Rasp & Lerch 2018; Demaeyer et al. 2023 EUPPBench; REVIEW.md §5.1)")
     p.add_argument("--nll_loss", action="store_true",
                    help="Replace MSE/Huber with heteroscedastic Gaussian NLL (CRPS). "
                         "Adds a log-variance head to the decoder: the model predicts both "
@@ -398,6 +409,67 @@ class CopyCheckpointToPolybox(object):
         self._copy("last.ckpt")
 
 
+def _estimate_persist_mse(
+    val_loader,
+    num_target_vars: int,
+    n_batches: int = 200,
+) -> "torch.Tensor":
+    """Estimate per-variable persistence MSE from the first *n_batches* validation batches.
+
+    Persistence prediction: repeat the last observed input step x[:, −1, :, :].
+    MSE is computed in normalised (z-score) space and averaged across all K
+    forecast horizons and all batches, weighted by sensor availability.
+
+    The result is used by StationMAE._supervised_loss() to convert each variable's
+    loss to a skill-score scale (L_v / MSE_persist_v), automatically equalising
+    gradient contributions across variables regardless of their spatial predictability.
+
+    Args:
+        val_loader:       Validation DataLoader (multi-delta batches, no gradient).
+        num_target_vars:  Number of predicted variables (typically 5).
+        n_batches:        Number of batches to average over (default 200 — fast,
+                          covers ~800 samples; set higher for more precision).
+
+    Returns:
+        persist_mse: (num_target_vars,) CPU float tensor — persistence MSE per variable.
+    """
+    totals = torch.zeros(num_target_vars)
+    counts = torch.zeros(num_target_vars)
+
+    with torch.no_grad():
+        for i, batch in enumerate(val_loader):
+            if i >= n_batches:
+                break
+            x      = batch["x"]       # (B, W, N, V)
+            y      = batch["y"]        # (B, K, N, V)  or  (B, N, V)
+            y_mask = batch["y_mask"]   # same shape
+
+            # Last observed input step — the persistence prediction for any horizon
+            persist = x[:, -1, :, :num_target_vars].float()  # (B, N, V_target)
+
+            if y.dim() == 4:           # multi-delta: (B, K, N, V)
+                K = y.shape[1]
+                for k in range(K):
+                    y_k  = y[:, k, :, :num_target_vars].float()      # (B, N, V_t)
+                    ok_k = y_mask[:, k, :, :num_target_vars].bool()   # (B, N, V_t)
+                    sq   = (y_k - persist).pow(2)                     # (B, N, V_t)
+                    for v in range(num_target_vars):
+                        ok_v = ok_k[..., v]
+                        totals[v] += (sq[..., v] * ok_v.float()).sum().item()
+                        counts[v] += ok_v.float().sum().item()
+            else:                      # single-delta: (B, N, V)
+                y_t = y[:, :, :num_target_vars].float()
+                ok  = y_mask[:, :, :num_target_vars].bool()
+                sq  = (y_t - persist).pow(2)
+                for v in range(num_target_vars):
+                    ok_v = ok[..., v]
+                    totals[v] += (sq[..., v] * ok_v.float()).sum().item()
+                    counts[v] += ok_v.float().sum().item()
+
+    persist_mse = totals / counts.clamp(min=1.0)
+    return persist_mse
+
+
 def main() -> None:
     args = parse_args()
 
@@ -477,6 +549,7 @@ def main() -> None:
         exclude_stations=args.exclude_stations,
         delta_mode=args.delta_mode,
         delta_grid_stride=args.delta_grid_stride,
+        index_mode="blocks",                # non-overlapping windows for val
     )
 
     # K = number of lead-times per sample
@@ -543,6 +616,8 @@ def main() -> None:
         input_context_cross_attn=args.input_context_cross_attn,
         delta0_weight=args.delta0_weight,
         use_nll_loss=args.nll_loss,
+        use_persist_norm=args.persist_norm,
+        window_size=args.window,
     )
 
     _mode_labels = {
@@ -582,6 +657,21 @@ def main() -> None:
     if args.cross_attn_decoder:
         print("Cross-attention decoder  : ON")
     print(f"Model: {model.count_parameters():,} trainable parameters")
+
+    # ── Persistence MSE normalisation (Fix 2) ───────────────────────────────
+    # Estimate per-variable persistence MSE from the validation set and store
+    # as a buffer in the model.  Must run BEFORE torch.compile so that the
+    # buffer is part of the compiled computation graph.
+    if args.persist_norm:
+        from model.embeddings import TARGET_VARIABLE_NAMES, NUM_TARGET_VARIABLES
+        _n_persist = len(val_loader)
+        print(f"Estimating persistence MSE from validation set ({_n_persist} batches) …")
+        _persist_mse = _estimate_persist_mse(val_loader, NUM_TARGET_VARIABLES, n_batches=_n_persist)
+        model.set_persist_mse(_persist_mse)
+        print("  Persistence MSE per variable (normalised space):")
+        for _v, (_name, _mse) in enumerate(zip(TARGET_VARIABLE_NAMES, _persist_mse)):
+            print(f"    {_name:12s}  persist_mse = {_mse:.4f}  "
+                  f"(σ_persist = {_mse.sqrt():.4f}  →  loss scale factor = {1/_mse.clamp(min=1e-6):.2f}×)")
 
     # ── torch.compile ────────────────────────────────────────────────────────
     # Compile BEFORE wrapping in Lightning so that the compiled forward()
@@ -649,6 +739,7 @@ def main() -> None:
         "masked_only_loss":    args.masked_only_loss,
         "delta0_weight":       args.delta0_weight,
         "use_nll_loss":        args.nll_loss,
+        "use_persist_norm":    args.persist_norm,
         "joint_encoder":       args.joint_encoder,
         "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,

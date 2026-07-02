@@ -29,8 +29,8 @@ each metric is logged with exactly one mode:
     val/{var}_rmse_phys   — per-variable RMSE in physical units (RMSE_norm × obs_std[v])
     val/{var}_mae_phys    — per-variable MAE  in physical units (MAE_norm  × obs_std[v])
                             Physical metrics require cfg["obs_stats_std"] set by main.py.
-    val/step_sensitivity  — mean |pred(delta=36) − pred(delta=3)| on the first val batch.
-                            ≈ 0 → StepIndexEmbedding is being ignored by the decoder;
+    val/horizon_sensitivity — mean |pred(delta=36) − pred(delta=3)| on the first val batch.
+                            ≈ 0 → decoder output is flat across lead times (DeltaTimeEmbedding not used);
                             > 0.05 → decoder output varies meaningfully with lead time.
 """
 
@@ -112,13 +112,12 @@ class StationMAELightning(pl.LightningModule):
         self.log("train/lr",   lr,   on_step=True, on_epoch=False, prog_bar=False)
 
         # ── train/overall_rmse — epoch-level, mirrors val/overall_rmse ────────
-        # Use k=1 (delta=3 = 30 min) to match the val horizon exactly.
-        # k=0 (delta=0, nowcast) would make train RMSE look artificially
-        # better than val RMSE because visible stations at delta=0 trivially
-        # copy their own input — not a meaningful comparison.
+        # Use k=1 (delta=3 = 30 min, all stations) to mirror val/overall_rmse.
+        # k=0 is delta=0 with masked-only loss — not representative of
+        # forecasting skill and would make train RMSE incomparable to val.
         with torch.no_grad():
             if is_multi:
-                _k_train = min(1, preds.shape[1] - 1)   # k=1 if K>1, else k=0
+                _k_train = min(1, preds.shape[1] - 1)   # k=1 → delta=3 (30 min)
                 p_flat = preds[:, _k_train].reshape(-1, NUM_TARGET_VARIABLES)
                 t_flat = y[:, _k_train, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES)
                 m_flat = y_mask[:, _k_train, :, :NUM_TARGET_VARIABLES].reshape(-1, NUM_TARGET_VARIABLES).bool()
@@ -142,25 +141,46 @@ class StationMAELightning(pl.LightningModule):
 
     def on_validation_epoch_start(self) -> None:
         """
-        Fix the global RNG state before every validation epoch.
+        Initialise two independent RNG streams for dual-seed validation.
 
-        The encoder's _mask_stations() uses torch.rand() to sample which
-        stations to mask.  Without a fixed seed this differs every epoch,
-        making validation metrics subtly noisy (some epochs happen to mask
-        easier/harder stations).  Fixing the seed guarantees identical station
-        masks across epochs so val/loss changes reflect model improvement, not
-        sampling noise.
+        Each validation batch is evaluated twice — once with seed 42 (stream A)
+        and once with seed 123 (stream B) — producing two different station-mask
+        assignments.  Predictions and metrics are averaged over both passes.
 
-        Strategy: save the current training RNG state, then set a fixed seed.
-        on_validation_epoch_end restores the original state so the training
-        random stream is completely unaffected.
+        This halves the variance of val metrics compared to a single random mask,
+        making epoch-to-epoch comparisons more reliable without doubling compute
+        (each val batch is only ~23 batches total with block-mode val).
+
+        Both streams are advanced consistently across batches so batch N of stream
+        A is always reproducible from one training run to the next.
+
+        The training RNG state is saved here and restored in on_validation_epoch_end
+        so the training random stream is completely unaffected.
         """
         self._saved_rng_state = torch.get_rng_state()
         if torch.cuda.is_available():
             self._saved_cuda_rng_state = torch.cuda.get_rng_state_all()
+
+        # Initialise stream A (seed 42)
         torch.manual_seed(42)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(42)
+        self._val_rng_a      = torch.get_rng_state()
+        self._val_cuda_rng_a = (torch.cuda.get_rng_state_all()
+                                if torch.cuda.is_available() else None)
+
+        # Initialise stream B (seed 123)
+        torch.manual_seed(123)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(123)
+        self._val_rng_b      = torch.get_rng_state()
+        self._val_cuda_rng_b = (torch.cuda.get_rng_state_all()
+                                if torch.cuda.is_available() else None)
+
+        # Activate stream A for the first batch
+        torch.set_rng_state(self._val_rng_a)
+        if torch.cuda.is_available() and self._val_cuda_rng_a is not None:
+            torch.cuda.set_rng_state_all(self._val_cuda_rng_a)
 
     def on_validation_epoch_end(self) -> None:
         """Restore the training RNG state saved in on_validation_epoch_start."""
@@ -175,31 +195,47 @@ class StationMAELightning(pl.LightningModule):
         )
 
         # ── Choose validation lead-time ──────────────────────────────────
-        # We use k=1 (delta_steps[:, 1] = 3 half-hour steps = 30 min ahead)
-        # rather than k=0 (nowcast / delta=0).
-        #
-        # Why NOT k=0:
-        #   At delta=0 the target equals the last input step.  The encoder sees
-        #   the visible stations' own current values, so their predictions are
-        #   trivially near-perfect (≈ copy of input → RMSE ≈ 0).  This pulls
-        #   val/overall_rmse down to ~0.07, completely masking the true error
-        #   on masked stations and giving a false sense of model quality.
-        #   The derived physical metrics (_phys) then also appear ~10× too good.
-        #
-        # k=1 (30 min ahead) is the minimal "real" forecast horizon:
-        #   • Visible stations: 30-min extrapolation from their own context
-        #   • Masked stations: gap-fill from neighbours + 30-min extrapolation
-        #   This is consistent with what lead1_metrics.csv measures in test.py.
+        # delta_grid = [0, 3, 6, …, 36]  (K=13):
+        #   k=0 → delta=0  (reconstruction, masked stations only — not useful as
+        #                   a monitoring metric since it covers only ~50% of stations)
+        #   k=1 → delta=3  (30 min ahead, all stations — the primary forecast metric)
+        # We monitor at k=1 so val/overall_rmse reflects genuine forecasting skill.
         _is_multi = (delta_steps.dim() == 2 and delta_steps.shape[1] > 1)
-        _k = 1 if _is_multi else 0          # k=1 for multi-delta batches
+        _k = 1 if (_is_multi and delta_steps.shape[1] > 1) else 0  # k=1 → delta=3 (30 min)
         ds = delta_steps[:, _k] if _is_multi else delta_steps
         y_ = y[:, _k]       if y.dim()      == 4 else y
         ym = y_mask[:, _k]  if y_mask.dim() == 4 else y_mask
         yh = y_hours[:, _k] if y_hours.dim() == 2 else y_hours
 
-        loss, preds, _ = self.model(
+        # ── Dual-seed forward passes — average to reduce mask-sampling variance ─
+        # Pass A uses stream A RNG (already active on entry to this step).
+        loss_a, preds_a, _ = self.model(
             x, x_mask, spatial, x_hours, y_, ym, yh, ds
         )
+        # Checkpoint stream A state, switch to stream B
+        self._val_rng_a = torch.get_rng_state()
+        if torch.cuda.is_available():
+            self._val_cuda_rng_a = torch.cuda.get_rng_state_all()
+
+        torch.set_rng_state(self._val_rng_b)
+        if torch.cuda.is_available() and self._val_cuda_rng_b is not None:
+            torch.cuda.set_rng_state_all(self._val_cuda_rng_b)
+
+        loss_b, preds_b, _ = self.model(
+            x, x_mask, spatial, x_hours, y_, ym, yh, ds
+        )
+        # Checkpoint stream B, restore stream A for the next batch
+        self._val_rng_b = torch.get_rng_state()
+        if torch.cuda.is_available():
+            self._val_cuda_rng_b = torch.cuda.get_rng_state_all()
+
+        torch.set_rng_state(self._val_rng_a)
+        if torch.cuda.is_available() and self._val_cuda_rng_a is not None:
+            torch.cuda.set_rng_state_all(self._val_cuda_rng_a)
+
+        # Averaged loss and predictions
+        loss  = (loss_a  + loss_b)  * 0.5
+        preds = (preds_a + preds_b) * 0.5
 
         # Metrics over ALL N stations wherever sensors are present —
         # consistent with the training objective which also covers all stations.
@@ -260,31 +296,23 @@ class StationMAELightning(pl.LightningModule):
             self.log("val/overall_mae",  (pf - tf).abs().mean(),
                      on_epoch=True, sync_dist=True)
 
-        # ── Step-sensitivity probe (first batch of each val epoch only) ─
-        # Checks whether the StepIndexEmbedding actually influences decoder
-        # output.  Runs a second forward pass at the FAR delta (last K index,
-        # delta=36 = 6 h) and compares to the NEAR delta (k=1, 30 min).
-        #
-        # val/step_sensitivity = mean |pred_far - pred_near|
-        #   ≈ 0.0  → decoder is IGNORING the step index (StepIndexEmbedding
-        #            has no effect — model predicts the same regardless of
-        #            how far ahead it is asked to forecast)
-        #   > 0.05 → decoder is using the step index to modulate output
-        #
-        # Only computed when multi-delta batches are available (K > 2) so
-        # near and far deltas are distinct.
-        if batch_idx == 0 and _is_multi and delta_steps.shape[1] > 2:
-            _k_far = delta_steps.shape[1] - 1   # last K index (delta=36)
+        # ── Horizon-sensitivity probe (first batch of each val epoch only) ─
+        # Measures mean |pred(delta=6h) − pred(delta=30min)| to verify the
+        # decoder modulates its output with lead time.
+        #   ≈ 0.0  → decoder ignores DeltaTimeEmbedding (constant output)
+        #   > 0.05 → decoder varies meaningfully across horizons
+        # Uses stream A's current RNG state (advances independently of A/B above).
+        if batch_idx == 0 and _is_multi and delta_steps.shape[1] > 1:
+            _k_far = delta_steps.shape[1] - 1   # last K index (delta=36 = 6h)
             ds_far = delta_steps[:, _k_far]
-            y_far  = y[:, _k_far]  if y.dim()      == 4 else y
+            y_far  = y[:, _k_far]      if y.dim()      == 4 else y
             ym_far = y_mask[:, _k_far] if y_mask.dim() == 4 else y_mask
             yh_far = y_hours[:, _k_far] if y_hours.dim() == 2 else y_hours
             with torch.no_grad():
                 _, preds_far, _ = self.model(
                     x, x_mask, spatial, x_hours, y_far, ym_far, yh_far, ds_far
                 )
-            step_sensitivity = (preds_far - preds).abs().mean()
-            self.log("val/step_sensitivity", step_sensitivity,
+            self.log("val/horizon_sensitivity", (preds_far - preds).abs().mean(),
                      on_epoch=True, sync_dist=True)
 
     # ------------------------------------------------------------------

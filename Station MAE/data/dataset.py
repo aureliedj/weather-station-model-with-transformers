@@ -692,7 +692,13 @@ class StationMAEDataset(Dataset):
         self.max_delta_steps = max_delta_steps if max_delta_steps is not None \
                                else delta_steps
 
-        # Fixed-grid lead-times: 0, stride, 2·stride, …, max_delta_steps
+        # Fixed-grid lead-times: stride, 2·stride, …, max_delta_steps
+        # delta=0 is the reconstruction / inpainting horizon: the target is the
+        # last input timestep itself.  Loss is computed on MASKED stations only
+        # (see forward_multi_delta in mae.py) — visible stations see their own
+        # values directly in the encoder and can trivially copy them, so
+        # supervising them at delta=0 contributes near-zero gradient.
+        # Restricting to masked stations gives a pure gap-filling signal.
         # E.g. max_delta=36, stride=3 → [0, 3, 6, …, 36]  (K=13 horizons)
         if delta_mode == "fixed_grid":
             self.delta_grid = list(range(0, self.max_delta_steps + 1, delta_grid_stride))
