@@ -201,7 +201,7 @@ class StationMAELightning(pl.LightningModule):
         #   k=1 → delta=3  (30 min ahead, all stations — the primary forecast metric)
         # We monitor at k=1 so val/overall_rmse reflects genuine forecasting skill.
         _is_multi = (delta_steps.dim() == 2 and delta_steps.shape[1] > 1)
-        _k = 1 if (_is_multi and delta_steps.shape[1] > 1) else 0  # k=1 → delta=3 (30 min)
+        _k = 1 if _is_multi else 0   # k=1 → delta=3 (30 min); k=0 fallback for single-delta
         ds = delta_steps[:, _k] if _is_multi else delta_steps
         y_ = y[:, _k]       if y.dim()      == 4 else y
         ym = y_mask[:, _k]  if y_mask.dim() == 4 else y_mask

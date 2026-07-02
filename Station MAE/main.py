@@ -440,9 +440,10 @@ def _estimate_persist_mse(
         for i, batch in enumerate(val_loader):
             if i >= n_batches:
                 break
-            x      = batch["x"]       # (B, W, N, V)
-            y      = batch["y"]        # (B, K, N, V)  or  (B, N, V)
-            y_mask = batch["y_mask"]   # same shape
+            x           = batch["x"]            # (B, W, N, V)
+            y           = batch["y"]             # (B, K, N, V)  or  (B, N, V)
+            y_mask      = batch["y_mask"]        # same shape
+            delta_steps = batch["delta_steps"]   # (B, K) or (B,)
 
             # Last observed input step — the persistence prediction for any horizon
             persist = x[:, -1, :, :num_target_vars].float()  # (B, N, V_target)
@@ -450,6 +451,11 @@ def _estimate_persist_mse(
             if y.dim() == 4:           # multi-delta: (B, K, N, V)
                 K = y.shape[1]
                 for k in range(K):
+                    # Skip delta=0: the target IS the last input step, so
+                    # (persist - y_k)^2 = 0 exactly — including it inflates
+                    # the count without adding signal, biasing persist_mse low.
+                    if delta_steps[0, k].item() == 0:
+                        continue
                     y_k  = y[:, k, :, :num_target_vars].float()      # (B, N, V_t)
                     ok_k = y_mask[:, k, :, :num_target_vars].bool()   # (B, N, V_t)
                     sq   = (y_k - persist).pow(2)                     # (B, N, V_t)

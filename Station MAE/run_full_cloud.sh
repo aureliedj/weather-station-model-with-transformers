@@ -122,6 +122,12 @@ TEMPORAL_WINDOW="--temporal_window 6"
 # in a later step is NOT redundant — a different 50% of stations are masked,
 # creating a genuinely different training task.
 #
+# Delta grid: --delta_mode fixed_grid --delta_grid_stride 3 --max_delta 36
+#   K=13 horizons: [0, 3, 6, …, 36] steps = [now, 30min, 1h, …, 6h]
+#   k=0 (delta=0): inpainting — loss on MASKED stations only
+#   k=1..12 (delta=3..36): forecasting — loss on ALL stations
+#   Decoder step indices: W-1+delta = [71, 74, 77, …, 107] (unified timeline)
+#
 # Epoch size rationale
 # --------------------
 # The non-overlapping block count for 5 training years is:
@@ -190,8 +196,8 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v8 \
+    --wandb_run_name   tw6-d1024-v9 \
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
-#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v7-best.ckpt
+#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v9-best.ckpt
