@@ -168,7 +168,7 @@ class StationMAE(nn.Module):
         its predictive uncertainty for hard samples (large residuals, long horizons,
         spatially isolated masked stations).
 
-        use_nll_loss=False : default — MSE for non-wind, Huber for wind (backward compat)
+        use_nll_loss=False : default — Huber(δ=1.0) for ALL variables with per-variable weights
         use_nll_loss=True  : Gaussian NLL for all variables; enables calibrated uncertainty
 
         References: Gneiting & Raftery (2007), Andrychowicz et al. (2023, MetNet-3),
@@ -217,15 +217,21 @@ class StationMAE(nn.Module):
 
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
-        # Temperature gets 2.0× — primary variable of interest; stronger gradient
-        # signal pushes the model to sharpen its temperature predictions.
-        # Pressure and humidity stay at 1.0 (physically coupled — down-weighting
-        # pressure cascades to degraded humidity learning).
-        # Wind gets 1.5× weight + Huber loss to reduce mean-regression bias.
-        _w = torch.tensor([2.0, 1.0, 1.0, 1.5, 1.5], dtype=torch.float32)
+        #
+        # Rationale (all variables use Huber(δ=1.0) in per-station-normalised space):
+        #   • Per-station normalisation already equalises raw scale (std≈1 per var).
+        #   • These weights address the *predictability* imbalance: pressure is very
+        #     easy to forecast (small residuals, small gradient) while wind is hard.
+        #   • temperature 1.0 — primary variable; well-calibrated Huber gradient
+        #   • pressure    0.5 — highly predictable; down-weighted to avoid
+        #                       dominating updates with easy, small-error samples
+        #   • humidity    0.8 — moderately predictable; slight down-weight
+        #   • wind u/v    1.5 — hardest to predict; amplified gradient to push
+        #                       the model beyond naive mean-regression
+        _w = torch.tensor([1.0, 0.5, 0.8, 1.5, 1.5], dtype=torch.float32)
         self.register_buffer("var_weights", _w)
-        self.huber_delta   = 1.0          # Huber transition point in normalised space
-        self._wind_indices = {3, 4}       # wind_u=3, wind_v=4 in TARGET_VARIABLE_NAMES
+        self.huber_delta = 1.0   # Huber δ in normalised space (= 1 std-dev)
+        # Huber is applied to ALL variables (not just wind) — see _supervised_loss.
 
         self.encoder = StationMAEEncoder(
             d_model=d_model,
@@ -438,15 +444,20 @@ class StationMAE(nn.Module):
     ) -> torch.Tensor:
         """
         Variable-weighted loss: Gaussian NLL when log_var is provided, otherwise
-        Huber for wind components and half-MSE for all others.
+        Huber(δ=1.0) for ALL variables.
 
         Two modes, selected by whether log_var is passed:
 
-        MSE/Huber mode (log_var=None, default):
-          Weights (temperature=2.0, pressure=1.0, humidity=1.0, wind_u=1.5, wind_v=1.5):
-            • Temperature 2.0× — primary variable; stronger gradient signal.
-            • Pressure and humidity equal weight — physically correlated.
-            • Wind 1.5× + Huber — reduces systematic underprediction bias.
+        Huber mode (log_var=None, default):
+          Weights (temperature=1.0, pressure=0.5, humidity=0.8, wind_u=1.5, wind_v=1.5):
+            • Huber(δ=1.0) applied to every variable in per-station-normalised space.
+              Below δ=1σ the loss is L2 (standard MSE gradient); above δ it is L1
+              (capped gradient), preventing extreme meteorological events from
+              dominating parameter updates.
+            • Weights correct for predictability imbalance: pressure is easy to
+              predict (0.5×), wind is hard (1.5×), others at intermediate levels.
+            • Per-station normalisation already handles raw scale (std≈1), so these
+              weights target the gradient imbalance from residual difficulty alone.
 
         NLL mode (log_var provided, --nll_loss):
           Heteroscedastic Gaussian NLL for all variables:
@@ -493,16 +504,18 @@ class StationMAE(nn.Module):
                 # Clamp to [-10, 10]: σ² = e^{-10} ≈ 4.5e-5 (min), e^{10} ≈ 22026 (max)
                 lv   = log_var[..., v].clamp(-10.0, 10.0)          # (B, N)
                 elem = 0.5 * (err.pow(2) * (-lv).exp() + lv)
-            elif v in self._wind_indices:
-                # ── Huber loss: L2 below delta, L1 above ─────────────────
+            else:
+                # ── Huber(δ=1.0): applied to ALL variables ────────────────
+                # L2 for |err| ≤ δ, L1 for |err| > δ.
+                # In per-station-normalised space δ=1.0 means errors within
+                # one standard deviation are penalised quadratically;
+                # outliers (extreme events) contribute a capped linear gradient.
                 abs_err = err.abs()
                 elem = torch.where(
                     abs_err <= self.huber_delta,
                     0.5 * err.pow(2),
-                    self.huber_delta * (abs_err - 0.5 * self.huber_delta)
+                    self.huber_delta * (abs_err - 0.5 * self.huber_delta),
                 )
-            else:
-                elem = 0.5 * err.pow(2)                            # half-MSE matches Huber scale
 
             # Normalise by this variable's own sensor count, not the global total
             var_loss = (elem * ok.float()).sum() / ok.float().sum().clamp(min=1.0)

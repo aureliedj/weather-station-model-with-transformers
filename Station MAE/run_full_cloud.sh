@@ -155,6 +155,26 @@ INDEX_MODE="--index_mode random --random_epoch_size 10000"
 # INDEX_MODE="--index_mode blocks"                           # non-overlapping train (fast ablation)
 # INDEX_MODE="--index_mode sliding --train_stride 4"         # sliding, hourly stride
 
+# ── Loss function ─────────────────────────────────────────────────────────────
+#
+# v10 loss: Huber(δ=1.0) for ALL variables, with per-variable weights.
+#
+#   Loss = (1/K) Σ_k  Σ_v  w_v · Huber(ŷ_kvn − y_kvn, δ=1.0)
+#
+# Weights [temperature=1.0, pressure=0.5, humidity=0.8, wind_u=1.5, wind_v=1.5]:
+#   • Per-station normalisation already handles scale (std≈1 per variable).
+#   • Weights correct for predictability imbalance: pressure is easy (0.5×),
+#     wind is hard (1.5×).  Temperature at 1.0 — primary monitoring variable.
+#   • δ=1.0 in normalised space = 1 std-dev: L2 for typical errors,
+#     L1 (capped gradient) for extreme events.
+#   • No σ² head — simpler decoder, stable gradients, no exploitation of
+#     inflated uncertainty to artificially reduce NLL.
+#   • Precipitation excluded from targets (num_target_vars=5).
+#
+# Previous v9 used --nll_loss (heteroscedastic Gaussian NLL). Removed here
+# because: σ² head can reduce loss without improving point predictions;
+# Gaussian is a poor fit for some variables; and RMSE is the primary metric.
+#
 # ─────────────────────────────────────────────────────────────────────────────
 
 python main.py \
@@ -183,7 +203,6 @@ python main.py \
     --grad_clip        1.0 \
     --accumulate_grad_batches 4 \
     --input_context_cross_attn \
-    --nll_loss \
     --patience         40 \
     --min_lr           5e-7 \
     --amp \
@@ -196,7 +215,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v9 \
+    --wandb_run_name   tw6-d1024-v10 \
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
