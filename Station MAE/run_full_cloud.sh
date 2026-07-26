@@ -64,7 +64,7 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 # after training with:
 #   cp checkpoints/full_run_cloud/best.ckpt /home/renku/work/polybox-capstone/checkpoints/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SAVE_DIR="${SCRIPT_DIR}/checkpoints/full_run_cloud"
+SAVE_DIR="${SCRIPT_DIR}/checkpoints/full_run_cloud_v11"   # own dir — don't overwrite v10's best.ckpt/last.ckpt (also avoids auto-resume from v10's last.ckpt)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
@@ -157,23 +157,27 @@ INDEX_MODE="--index_mode random --random_epoch_size 10000"
 
 # ── Loss function ─────────────────────────────────────────────────────────────
 #
-# v10 loss: Huber(δ=1.0) for ALL variables, with per-variable weights.
+# v11 loss: Huber(δ=1.0) for ALL variables, UNIFORM per-variable weights.
 #
-#   Loss = (1/K) Σ_k  Σ_v  w_v · Huber(ŷ_kvn − y_kvn, δ=1.0)
+#   Loss = (1/K) Σ_k  Σ_v  Huber(ŷ_kvn − y_kvn, δ=1.0)
 #
-# Weights [temperature=1.0, pressure=0.5, humidity=0.8, wind_u=1.5, wind_v=1.5]:
-#   • Per-station normalisation already handles scale (std≈1 per variable).
-#   • Weights correct for predictability imbalance: pressure is easy (0.5×),
-#     wind is hard (1.5×).  Temperature at 1.0 — primary monitoring variable.
+# Weights [1.0, 1.0, 1.0, 1.0, 1.0] (set in model/mae.py):
+#   • Uniform weights match NLL mode's implicit weighting, so v11-vs-v9 is a
+#     clean A/B on the loss function alone — nothing else differs.
+#   • v10 used hand-tuned weights [T=1.0, P=0.5, RH=0.8, u=1.5, v=1.5] and
+#     overfitted on the up-weighted noisy variables: wind u/v val MAE bottomed
+#     ~epoch 35 then degraded; humidity followed ~epoch 45. The 1.5× wind
+#     gradient pushed the model into fitting unpredictable local wind noise.
 #   • δ=1.0 in normalised space = 1 std-dev: L2 for typical errors,
 #     L1 (capped gradient) for extreme events.
+#     If wind/humidity still overfit with uniform weights, next loss-only
+#     lever: δ=0.5 (earlier switch to capped-L1 on large residuals).
 #   • No σ² head — simpler decoder, stable gradients, no exploitation of
 #     inflated uncertainty to artificially reduce NLL.
 #   • Precipitation excluded from targets (num_target_vars=5).
 #
-# Previous v9 used --nll_loss (heteroscedastic Gaussian NLL). Removed here
-# because: σ² head can reduce loss without improving point predictions;
-# Gaussian is a poor fit for some variables; and RMSE is the primary metric.
+# v9 (= saved best.ckpt, all current test results) used --nll_loss
+# (heteroscedastic Gaussian NLL with σ² head, uniform variable weights).
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -215,8 +219,8 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v10 \
+    --wandb_run_name   tw6-d1024-v11 \
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
-#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v9-best.ckpt
+#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v11-best.ckpt

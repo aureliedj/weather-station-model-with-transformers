@@ -218,17 +218,14 @@ class StationMAE(nn.Module):
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
         #
-        # Rationale (all variables use Huber(δ=1.0) in per-station-normalised space):
-        #   • Per-station normalisation already equalises raw scale (std≈1 per var).
-        #   • These weights address the *predictability* imbalance: pressure is very
-        #     easy to forecast (small residuals, small gradient) while wind is hard.
-        #   • temperature 1.0 — primary variable; well-calibrated Huber gradient
-        #   • pressure    0.5 — highly predictable; down-weighted to avoid
-        #                       dominating updates with easy, small-error samples
-        #   • humidity    0.8 — moderately predictable; slight down-weight
-        #   • wind u/v    1.5 — hardest to predict; amplified gradient to push
-        #                       the model beyond naive mean-regression
-        _w = torch.tensor([1.0, 0.5, 0.8, 1.5, 1.5], dtype=torch.float32)
+        # UNIFORM weights (v11): all 1.0, matching NLL mode's implicit uniform
+        # weighting, so the Huber-vs-NLL comparison isolates the loss function
+        # alone.  The previous hand-tuned weights [1.0, 0.5, 0.8, 1.5, 1.5]
+        # (rationale: correct predictability imbalance — pressure easy 0.5x,
+        # wind hard 1.5x) drove the v10 overfit: wind u/v val MAE bottomed
+        # ~epoch 35 then degraded — the 1.5x amplified gradient pushed the
+        # model into fitting unpredictable local wind noise.
+        _w = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32)
         self.register_buffer("var_weights", _w)
         self.huber_delta = 1.0   # Huber δ in normalised space (= 1 std-dev)
         # Huber is applied to ALL variables (not just wind) — see _supervised_loss.
