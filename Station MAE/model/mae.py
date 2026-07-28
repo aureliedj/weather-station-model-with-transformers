@@ -218,14 +218,23 @@ class StationMAE(nn.Module):
         # ── Variable-weighted Huber loss ──────────────────────────────────
         # Weights: [temperature, pressure, humidity, wind_u, wind_v]
         #
-        # UNIFORM weights (v11): all 1.0, matching NLL mode's implicit uniform
-        # weighting, so the Huber-vs-NLL comparison isolates the loss function
-        # alone.  The previous hand-tuned weights [1.0, 0.5, 0.8, 1.5, 1.5]
-        # (rationale: correct predictability imbalance — pressure easy 0.5x,
-        # wind hard 1.5x) drove the v10 overfit: wind u/v val MAE bottomed
-        # ~epoch 35 then degraded — the 1.5x amplified gradient pushed the
-        # model into fitting unpredictable local wind noise.
-        _w = torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32)
+        # DOWN-weighted noisy variables (v12): only the weight vector changes vs
+        # v11's uniform [1,1,1,1,1] — Huber δ=1.0 for all variables is unchanged,
+        # so this stays a clean A/B on the weights alone.
+        #
+        # Diagnosis from v11's wandb curves: temperature and pressure keep
+        # improving and do NOT overfit, while humidity and wind_u/wind_v bottom
+        # out ~epoch 30-40 and then degrade (val RMSE rises).  v10 made this worse
+        # by UP-weighting wind (1.5x); the correct direction is the opposite —
+        # DOWN-weight the noisy, heavy-tailed channels so the shared encoder
+        # spends less capacity fitting unpredictable gust / saturation noise.
+        #
+        # Weights [temperature, pressure, humidity, wind_u, wind_v]:
+        #   temperature 1.0  — reference, key variable, well-behaved
+        #   pressure    1.0  — trivial/easy (tiny residuals; weight ~irrelevant)
+        #   humidity    0.7  — overfits, bounded/skewed → moderate down-weight
+        #   wind_u/v    0.5  — heaviest overfit, noise-limited → strongest down-weight
+        _w = torch.tensor([1.0, 1.0, 0.7, 0.5, 0.5], dtype=torch.float32)
         self.register_buffer("var_weights", _w)
         self.huber_delta = 1.0   # Huber δ in normalised space (= 1 std-dev)
         # Huber is applied to ALL variables (not just wind) — see _supervised_loss.

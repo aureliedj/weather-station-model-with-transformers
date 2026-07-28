@@ -302,6 +302,22 @@ def parse_args() -> argparse.Namespace:
                         "Common choices: val/loss, val/temperature_rmse, val/overall_rmse. "
                         "(default: val/temperature_rmse)")
 
+    # Overfitting-aware early stop
+    p.add_argument("--overfit_stop", action="store_true",
+                   help="Enable overfit-aware early stopping. Stops training when the "
+                        "monitored VALIDATION metric stops improving for --overfit_patience "
+                        "consecutive validation checks — the signature of overfitting — and "
+                        "also logs the val−train generalisation gap after every check. "
+                        "This is a tighter, overfit-focused complement to --patience (which "
+                        "is often left large to allow long plateaus). best.ckpt always holds "
+                        "the pre-overfit (best-validation) model.")
+    p.add_argument("--overfit_patience", type=int, default=5,
+                   help="Consecutive validation checks without improvement before the "
+                        "overfit stopper fires (default 5).")
+    p.add_argument("--overfit_min_delta", type=float, default=0.0,
+                   help="Minimum improvement in the monitored metric to reset the overfit "
+                        "counter (default 0.0 = any non-improvement counts).")
+
     # Checkpointing
     p.add_argument("--save_dir",        type=str, default="checkpoints")
     p.add_argument("--polybox_dir",     type=str, default=None,
@@ -331,6 +347,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb_project",   type=str, default=None,
                    help="WandB project name; omit to use CSV logger only")
     p.add_argument("--wandb_run_name",  type=str, default=None)
+    p.add_argument("--wandb_offline",   action="store_true",
+                   help="Run WandB in offline mode (sets WANDB_MODE=offline). "
+                        "Logs are saved locally and can be synced later with "
+                        "'wandb sync <run-dir>'.  Useful on Renku / HPC where "
+                        "outbound connections to wandb.com may be blocked.")
     p.add_argument("--log_every_n_steps", type=int, default=50)
 
     # Profiling
@@ -368,6 +389,84 @@ def set_seed(seed: int) -> None:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+class OverfitEarlyStop(object):
+    """
+    Overfit-aware early stopping callback.
+
+    After every validation run it compares the monitored validation metric to its
+    best value so far.  When the metric fails to improve (by ``min_delta``) for
+    ``patience`` consecutive checks — the tell-tale sign that the model has stopped
+    generalising and is starting to overfit — it sets ``trainer.should_stop`` and
+    training ends cleanly.  ``best.ckpt`` (saved by ModelCheckpoint on the same
+    metric) therefore always holds the pre-overfit model.
+
+    It additionally logs the val−train **generalisation gap** after every check, so
+    a widening gap (val worsening while train keeps falling) is visible in the logs
+    and in WandB as ``diag/gen_gap``.
+
+    Implemented as a plain object with a no-op ``__getattr__`` so every Lightning
+    hook we don't define is silently ignored (same pattern as
+    ``CopyCheckpointToPolybox``); this avoids importing ``pytorch_lightning`` at
+    module import time.
+    """
+
+    def __getattr__(self, name):
+        """Return a no-op for any Lightning hook not explicitly defined."""
+        return lambda *args, **kwargs: None
+
+    def __init__(self, monitor: str = "val/loss", patience: int = 5,
+                 min_delta: float = 0.0, mode: str = "min",
+                 train_metric: str = "train/loss", verbose: bool = True):
+        self.monitor      = monitor
+        self.patience     = patience
+        self.min_delta    = min_delta
+        self.mode         = mode
+        self.train_metric = train_metric
+        self.verbose      = verbose
+        self.best         = float("inf") if mode == "min" else float("-inf")
+        self.wait         = 0
+        self.best_epoch   = -1
+
+    def _is_improvement(self, value: float) -> bool:
+        if self.mode == "min":
+            return value < self.best - self.min_delta
+        return value > self.best + self.min_delta
+
+    def on_validation_end(self, trainer, pl_module) -> None:   # noqa: N802
+        metrics = trainer.callback_metrics
+        m = metrics.get(self.monitor)
+        if m is None:
+            return                          # metric not logged yet (e.g. sanity check)
+        value = float(m)
+
+        # Generalisation gap (val − train), logged for visibility.
+        tr  = metrics.get(self.train_metric)
+        gap = (value - float(tr)) if tr is not None else float("nan")
+        try:
+            pl_module.log("diag/gen_gap", gap, on_epoch=True, prog_bar=False)
+        except Exception:
+            pass
+
+        if self._is_improvement(value):
+            self.best       = value
+            self.wait       = 0
+            self.best_epoch = int(trainer.current_epoch)
+            if self.verbose:
+                print(f"[OverfitStop] new best {self.monitor}={value:.5f} "
+                      f"(epoch {self.best_epoch})  gap(val-train)={gap:+.4f}")
+        else:
+            self.wait += 1
+            if self.verbose:
+                print(f"[OverfitStop] no improvement {self.wait}/{self.patience}  "
+                      f"({self.monitor}={value:.5f}, best={self.best:.5f} "
+                      f"@ep{self.best_epoch}, gap(val-train)={gap:+.4f})")
+            if self.wait >= self.patience:
+                trainer.should_stop = True
+                print(f"[OverfitStop] ⛔ STOP — {self.monitor} has not improved for "
+                      f"{self.patience} checks (best {self.best:.5f} at epoch "
+                      f"{self.best_epoch}). best.ckpt holds the pre-overfit model.")
+
 
 class CopyCheckpointToPolybox(object):
     """
@@ -761,14 +860,27 @@ def main() -> None:
     from pytorch_lightning.loggers import CSVLogger
 
     if args.wandb_project:
-        from pytorch_lightning.loggers import WandbLogger
-        logger = WandbLogger(
-            project=args.wandb_project,
-            name=args.wandb_run_name,
-            config=vars(args),          # logs all CLI flags to WandB
-            save_dir=args.save_dir,
-        )
-        print(f"WandB logger             : project='{args.wandb_project}'")
+        # Set offline mode BEFORE importing wandb so the env-var is picked up.
+        if args.wandb_offline:
+            os.environ["WANDB_MODE"] = "offline"
+        # Suppress WandB's own network-error tracebacks — we handle them below.
+        os.environ.setdefault("WANDB_SILENT", "true")
+        try:
+            from pytorch_lightning.loggers import WandbLogger
+            logger = WandbLogger(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                config=vars(args),          # logs all CLI flags to WandB
+                save_dir=args.save_dir,
+            )
+            _mode = "offline" if args.wandb_offline else "online"
+            print(f"WandB logger             : project='{args.wandb_project}'  [{_mode}]")
+        except Exception as _wandb_err:
+            print(f"[WARNING] WandB init failed: {_wandb_err}")
+            print("          Falling back to CSV logger — training will continue.")
+            print("          Tip: re-run with --wandb_offline to log without internet,")
+            print("               or run 'wandb login' in the terminal first.")
+            logger = CSVLogger(save_dir=args.save_dir, name="logs")
     else:
         logger = CSVLogger(save_dir=args.save_dir, name="logs")
         print("Logger                   : CSV only  (use --wandb_project to enable WandB)")
@@ -837,6 +949,29 @@ def main() -> None:
         print(f"EarlyStopping            : monitor={args.monitor}  "
               f"patience={args.patience} checks  "
               f"(= {_patience_val} {_patience_unit})  min_delta={args.min_delta}")
+
+    # ── Overfit-aware early stopping ──────────────────────────────────────
+    # Stops as soon as the validation metric stops improving for a short window
+    # (overfit_patience), regardless of the more permissive --patience above.
+    # Logs the val−train gap after every check.  best.ckpt = pre-overfit model.
+    if args.overfit_stop:
+        callbacks.append(
+            OverfitEarlyStop(
+                monitor      = args.monitor,
+                patience     = args.overfit_patience,
+                min_delta    = args.overfit_min_delta,
+                mode         = "min",
+                train_metric = "train/loss",
+                verbose      = True,
+            )
+        )
+        _ofp_unit = "steps" if _step_based else "epochs"
+        _ofp_val  = (args.overfit_patience * args.val_check_interval
+                     if _step_based else args.overfit_patience)
+        print(f"OverfitStop              : ON  monitor={args.monitor}  "
+              f"patience={args.overfit_patience} checks "
+              f"(= {_ofp_val} {_ofp_unit})  min_delta={args.overfit_min_delta}  "
+              f"(logs diag/gen_gap)")
 
     # ── Precision (AMP) ─────────────────────────────────────────────────────
     # "bf16-mixed" — preferred on A100/H100/RTX 3090+: same tensor-core speed
@@ -967,8 +1102,11 @@ def main() -> None:
 
     print(f"\nTraining complete.  Checkpoints saved to: {args.save_dir}")
     if args.wandb_project:
-        import wandb
-        wandb.finish()
+        try:
+            import wandb
+            wandb.finish()
+        except Exception:
+            pass   # WandB may not have initialised if network failed at startup
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 # Resolve paths relative to this script so they work from any working directory.
 # Checkpoints are saved by run_full_cloud.sh inside the project directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECKPOINT="${SCRIPT_DIR}/checkpoints/full_run_cloud_v11/best.ckpt"
+CHECKPOINT="${SCRIPT_DIR}/checkpoints/full_run_cloud/best.ckpt"
 
 # Save test results inside the project directory (guaranteed writable on Renku)
 SAVE_DIR="${SCRIPT_DIR}/test_results"

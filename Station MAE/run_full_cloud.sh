@@ -64,7 +64,7 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 # after training with:
 #   cp checkpoints/full_run_cloud/best.ckpt /home/renku/work/polybox-capstone/checkpoints/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SAVE_DIR="${SCRIPT_DIR}/checkpoints/full_run_cloud_v11"   # own dir — don't overwrite v10's best.ckpt/last.ckpt (also avoids auto-resume from v10's last.ckpt)
+SAVE_DIR="${SCRIPT_DIR}/checkpoints/full_run_cloud_v12"   # own dir — don't overwrite v10's best.ckpt/last.ckpt (also avoids auto-resume from v10's last.ckpt)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
@@ -157,21 +157,22 @@ INDEX_MODE="--index_mode random --random_epoch_size 10000"
 
 # ── Loss function ─────────────────────────────────────────────────────────────
 #
-# v11 loss: Huber(δ=1.0) for ALL variables, UNIFORM per-variable weights.
+# v12 loss: Huber(δ=1.0) for ALL variables — SAME as v11, only the per-variable
+# WEIGHTS change.  Clean A/B on the weights alone (δ, loss family unchanged).
 #
-#   Loss = (1/K) Σ_k  Σ_v  Huber(ŷ_kvn − y_kvn, δ=1.0)
+#   Loss = (1/K) Σ_k  Σ_v  w_v · Huber(ŷ_kvn − y_kvn, δ=1.0)  /  Σ_v w_v
 #
-# Weights [1.0, 1.0, 1.0, 1.0, 1.0] (set in model/mae.py):
-#   • Uniform weights match NLL mode's implicit weighting, so v11-vs-v9 is a
-#     clean A/B on the loss function alone — nothing else differs.
-#   • v10 used hand-tuned weights [T=1.0, P=0.5, RH=0.8, u=1.5, v=1.5] and
-#     overfitted on the up-weighted noisy variables: wind u/v val MAE bottomed
-#     ~epoch 35 then degraded; humidity followed ~epoch 45. The 1.5× wind
-#     gradient pushed the model into fitting unpredictable local wind noise.
+# Weights [T=1.0, P=1.0, RH=0.7, u=0.5, v=0.5] (set in model/mae.py):
+#   • v11 (uniform [1,1,1,1,1]) wandb curves: temperature & pressure keep
+#     improving and do NOT overfit; humidity + wind_u/v bottom ~epoch 30-40 then
+#     degrade.  So DOWN-weight the noisy channels (opposite of v10, which
+#     UP-weighted wind 1.5× and overfit worse) → encoder spends less capacity
+#     fitting unpredictable gust / saturation noise.
+#   • Temperature/pressure held at 1.0 → their gradient is unchanged vs v11,
+#     keeping the comparison interpretable.
 #   • δ=1.0 in normalised space = 1 std-dev: L2 for typical errors,
 #     L1 (capped gradient) for extreme events.
-#     If wind/humidity still overfit with uniform weights, next loss-only
-#     lever: δ=0.5 (earlier switch to capped-L1 on large residuals).
+#     If wind/humidity still overfit, next loss-only lever: δ=0.5.
 #   • No σ² head — simpler decoder, stable gradients, no exploitation of
 #     inflated uncertainty to artificially reduce NLL.
 #   • Precipitation excluded from targets (num_target_vars=5).
@@ -196,8 +197,8 @@ python main.py \
     --enc_layers       8 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
-    --dropout          0.0 \
-    --drop_path_rate   0.0 \
+    --dropout          0.1 \
+    --drop_path_rate   0.1 \
     --batch_size       4 \
     --num_workers      3 \
     --epochs           300 \
@@ -208,6 +209,9 @@ python main.py \
     --accumulate_grad_batches 4 \
     --input_context_cross_attn \
     --patience         40 \
+    --monitor          val/overall_rmse \
+    --overfit_stop \
+    --overfit_patience 5 \
     --min_lr           5e-7 \
     --amp \
     --bf16 \
@@ -219,8 +223,10 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v11 \
+    --wandb_run_name   tw6-d1024-v12 \
+    # --wandb_offline \   # ← uncomment if Renku blocks outbound connections;
+                          #   logs saved locally, sync later: wandb sync <run-dir>
     --save_dir         "$SAVE_DIR"
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
-#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v11-best.ckpt
+#   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v12-best.ckpt
