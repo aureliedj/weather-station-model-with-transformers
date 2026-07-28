@@ -224,11 +224,9 @@ python main.py \
     $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   tw6-d1024-v12 \
-    --wandb_offline \
     --save_dir         "$SAVE_DIR"
-# WandB runs OFFLINE (no login / no outbound connection needed on Renku).
-# Logs are written locally under $SAVE_DIR/wandb/; sync later if you want the
-# online dashboard:  wandb sync "$SAVE_DIR"/wandb/offline-run-*
+# WandB runs ONLINE (default). If Renku blocks outbound connections, add
+# --wandb_offline above and sync later with: wandb sync <run-dir>
 # NOTE: --polybox_dir removed — Polybox writes during training are unreliable.
 # After training finishes, manually copy checkpoints:
 #   cp "$SAVE_DIR/best.ckpt" /home/renku/work/polybox-capstone/checkpoints/tw6-d1024-v12-best.ckpt
