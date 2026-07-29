@@ -26,8 +26,10 @@ SAVE_DIR="${SCRIPT_DIR}/test_results"
 # ── Window mode ───────────────────────────────────────────────────────────────
 # blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default
 # sliding: all overlapping windows (~105k)  — slow, most stable — for final paper metrics
-INDEX_MODE="blocks"
-# INDEX_MODE="sliding"
+# Rolling-origin evaluation: sliding windows every STRIDE steps (9 = 90 min = 1h30).
+INDEX_MODE="sliding"
+STRIDE=9
+# INDEX_MODE="blocks"   # fast non-overlapping alternative
 
 # ── Mask ratio sweep ──────────────────────────────────────────────────────────
 # 0.0 → all stations visible to encoder (pure temporal forecasting)
@@ -52,10 +54,11 @@ python test.py \
     --batch_size       8 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
+    --stride           "$STRIDE" \
     --exclude_stations PFA \
     --test_mask_ratios $MASK_RATIOS \
     --gap_fill_repeats 3 \
-    --save_predictions 200 \
+    --save_predictions 100000 \
     --seasonal \
     $GLOBAL_NORM \
     --save_dir         "$SAVE_DIR" \

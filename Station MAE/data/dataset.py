@@ -92,6 +92,8 @@ SPATIAL_FEATURE_NAMES = [
 TRAIN_YEARS = list(range(2017, 2022))   # 2017–2021
 VAL_YEARS   = [2022]
 TEST_YEARS  = [2023, 2024]
+# Both test.py and test_lstm.py read this same constant, so the LSTM and transformer
+# are guaranteed to evaluate on the identical test loader / windows.
 
 
 # ---------------------------------------------------------------------------
@@ -1119,6 +1121,11 @@ class StationMAEDataset(Dataset):
                         result.append(i)
                         next_ok = i + window_size
                 return result
+            # sliding (or random) on val/test. For sliding, honour the stride so the
+            # forecast-origin spacing is controllable (e.g. train_stride=9 → every
+            # 90 min = rolling-origin evaluation, denser than blocks).
+            if index_mode == "sliding" and train_stride > 1:
+                return list(all_valid)[::train_stride]
             return list(all_valid)
 
         if index_mode == "random":

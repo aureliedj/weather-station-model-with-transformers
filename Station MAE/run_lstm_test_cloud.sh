@@ -29,7 +29,10 @@ EXCLUDE="--exclude_stations PFA"   # same station dropped as during training
 
 # blocks: non-overlapping windows (~1,460) — fast, clean — recommended default
 # sliding: all overlapping windows — slower, most stable for final metrics
-INDEX_MODE="blocks"
+# Rolling-origin evaluation: sliding windows every STRIDE steps (9 = 90 min = 1h30).
+INDEX_MODE="sliding"
+STRIDE=9
+# INDEX_MODE="blocks"   # fast non-overlapping alternative
 
 # NOTE on batch size: the LSTM folds all 155 stations of a window into the batch,
 # so effective sequences per step = batch_size × 155. Keep batch_size modest on the
@@ -43,7 +46,8 @@ python test_lstm.py \
     --batch_size  16 \
     --num_workers 4 \
     --index_mode  "$INDEX_MODE" \
-    --save_predictions 200 \
+    --stride      "$STRIDE" \
+    --max_windows 0 `# 0 = save ALL windows (sliding/9 over 2023-24 ≈ 11k windows ≈ 1.5 GB)` \
     --save_dir    "$SAVE_DIR" \
     --run_name    "$RUN_NAME"
 

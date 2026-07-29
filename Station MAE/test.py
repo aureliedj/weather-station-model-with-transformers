@@ -157,6 +157,10 @@ def parse_args() -> argparse.Namespace:
                         "    Most stable metrics; slow.\n"
                         "  blocks: non-overlapping windows only (~1,460 samples).\n"
                         "    Fast evaluation; use for paper metrics and quick checks.")
+    p.add_argument("--stride",            type=int, default=1,
+                   help="Sliding forecast-origin spacing in 10-min steps (9 = 90 min = "
+                        "1h30 → rolling-origin evaluation). Only used with --index_mode "
+                        "sliding; ignored for blocks. Default 1 = every window.")
     p.add_argument("--save_dir",          type=str, default="test_results")
     p.add_argument("--no_plots",          action="store_true")
     p.add_argument("--save_predictions",  type=int, default=0,
@@ -665,6 +669,7 @@ def main() -> None:
         delta_mode=delta_mode,
         delta_grid_stride=delta_grid_stride,
         index_mode=args.index_mode,
+        train_stride=args.stride,
         global_norm=args.global_norm,
     )
     _window_mode_str = (
