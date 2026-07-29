@@ -84,19 +84,6 @@ python train_lstm.py \
     --wandb_run_name   "$RUN_NAME" \
     --save_dir         "$SAVE_DIR"
 
-echo "=== [2/2] Evaluating on test split (predictions + persistence check) ==="
-python test_lstm.py \
-    --data_root   "$DATA_ROOT" \
-    --cache_dir   "$DATA_ROOT" \
-    --checkpoint  "${SAVE_DIR}/best.ckpt" \
-    $EXCLUDE \
-    --batch_size  64 \
-    --num_workers 4 \
-    --index_mode  blocks \
-    --save_predictions 200 \
-    --save_dir    "${SCRIPT_DIR}/test_results" \
-    --run_name    "$RUN_NAME"
-
-echo "Done. LSTM predictions saved under test_results/${RUN_NAME}/best_mr0.00/ —"
-echo "add \"${RUN_NAME}\" to CMP_VERSIONS in Test_Results_Exploration.ipynb to compare"
-echo "against the transformer's mr0.00 results."
+echo "=== [2/2] Evaluating on test split (delegates to run_lstm_test_cloud.sh) ==="
+# Keep RUN_NAME in sync: run_lstm_test_cloud.sh reads the same default.
+bash "${SCRIPT_DIR}/run_lstm_test_cloud.sh"
