@@ -43,7 +43,7 @@ python test_lstm.py \
     --cache_dir   "$DATA_ROOT" \
     --checkpoint  "$CHECKPOINT" \
     $EXCLUDE \
-    --batch_size  16 \
+    --batch_size  8 \
     --num_workers 4 \
     --index_mode  "$INDEX_MODE" \
     --stride      "$STRIDE" \
