@@ -126,7 +126,10 @@ def main() -> None:
 
     train_ds = StationMAEDataset(ds, split="train", index_mode=args.index_mode,
                                  random_epoch_size=args.random_epoch_size, **common)
-    val_ds   = StationMAEDataset(ds, split="val", obs_stats=train_ds.obs_stats, **common)
+    # Validation uses non-overlapping blocks — same as the transformer (main.py),
+    # so the val metric is fast (~728 windows for 2022) and directly comparable.
+    val_ds   = StationMAEDataset(ds, split="val", obs_stats=train_ds.obs_stats,
+                                 index_mode="blocks", **common)
 
     K = len(train_ds.delta_grid)
     print(f"  train {len(train_ds):,} windows | val {len(val_ds):,} | K={K} horizons")

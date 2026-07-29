@@ -80,12 +80,13 @@ def main() -> None:
     K    = len(test_ds.delta_grid)
     GRID = [int(d) for d in test_ds.delta_grid]
 
-    # per-station physical std (kept stations), for physical metrics
+    # per-station physical std, aligned to the prediction station axis.
     _obs = train_ds.obs_stats
     _keep = getattr(test_ds, "_keep_indices", None)
-    if _keep is not None and _obs["std"].dim() == 2:
-        std_ps = _obs["std"][_keep][:, :Vt].to(device)          # (N, Vt)
-    else:
+    if _obs["std"].dim() == 2:                                   # (N_full, V) per-station
+        _rows = _keep if _keep is not None else slice(None)      # slice kept stations (or all)
+        std_ps = _obs["std"][_rows][:, :Vt].to(device)          # (N, Vt)
+    else:                                                        # (V,) global 1-D
         std_ps = _obs["std"][:Vt].to(device)                    # (Vt,)
 
     # ── Model ─────────────────────────────────────────────────────────────
@@ -168,7 +169,6 @@ def main() -> None:
     print(f"Saved {collected} windows → {os.path.join(out_dir, 'predictions.pt')}")
 
     # ── Aggregate metrics (same field names as test.py) ───────────────────
-    def rmse(sse, c): return float(np.sqrt(sse.sum() / max(c.sum(), 1)))
     def agg(sse, c):  return float(np.sqrt(sse.sum() / max(c.sum(), 1)))
 
     row = {"checkpoint": args.run_name}

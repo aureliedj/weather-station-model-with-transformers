@@ -37,6 +37,13 @@ HIDDEN=1024
 LAYERS=3
 DROPOUT=0.1
 
+# ── Missing-sensor handling ────────────────────────────────────────────────────
+# Feed the sensor-availability mask as extra input features (6 vars → 12) so the
+# LSTM can distinguish a true 0 (station mean in normalised space) from a missing
+# sensor. Set to "" to fall back to plain zero-imputation.
+MASK_FEATURE="--use_mask_feature"
+# MASK_FEATURE=""   # ← plain: missing values are just zeros
+
 # ── Loss: same family as the transformer (Huber δ=1.0). Uniform weights for a
 # neutral baseline. Change to match a specific transformer run if desired. ──────
 HUBER_DELTA=1.0
@@ -61,6 +68,7 @@ python train_lstm.py \
     --hidden           "$HIDDEN" \
     --lstm_layers      "$LAYERS" \
     --lstm_dropout     "$DROPOUT" \
+    $MASK_FEATURE \
     --huber_delta      "$HUBER_DELTA" \
     --var_weights      $VAR_WEIGHTS \
     --batch_size       16 \
