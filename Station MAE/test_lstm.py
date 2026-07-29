@@ -37,7 +37,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cache_dir",  type=str, default=None)
     p.add_argument("--checkpoint", type=str, required=True)
     p.add_argument("--exclude_stations", type=str, nargs="+", default=None)
-    p.add_argument("--batch_size", type=int, default=64)
+    p.add_argument("--batch_size", type=int, default=16,
+                   help="Windows per step. Effective sequences = batch_size × N_stations "
+                        "(≈155), so keep modest on small-VRAM GPUs (16 fits a 20 GB MIG; "
+                        "64 OOMs).")
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--index_mode", type=str, default="blocks", choices=["blocks", "sliding"])
     p.add_argument("--save_predictions", type=int, default=200,
@@ -122,7 +125,15 @@ def main() -> None:
 
             xf  = x.permute(0, 2, 1, 3).reshape(B * N, W, V)
             xmf = xm.permute(0, 2, 1, 3).reshape(B * N, W, V)
-            preds = model(xf, xmf).view(B, N, K, Vt).permute(0, 2, 1, 3)   # (B,K,N,Vt)
+            # bf16 autocast on CUDA halves LSTM activation memory and speeds up the
+            # forward; cast preds back to float32 for the metric accumulation.
+            if device.type == "cuda":
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    _p = model(xf, xmf)
+                _p = _p.float()
+            else:
+                _p = model(xf, xmf)
+            preds = _p.view(B, N, K, Vt).permute(0, 2, 1, 3)               # (B,K,N,Vt)
             persist = x[:, -1, :, :Vt].unsqueeze(1).expand(B, K, N, Vt)
 
             tt  = y[:, :, :, :Vt]

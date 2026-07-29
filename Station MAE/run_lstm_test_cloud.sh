@@ -31,12 +31,16 @@ EXCLUDE="--exclude_stations PFA"   # same station dropped as during training
 # sliding: all overlapping windows — slower, most stable for final metrics
 INDEX_MODE="blocks"
 
+# NOTE on batch size: the LSTM folds all 155 stations of a window into the batch,
+# so effective sequences per step = batch_size × 155. Keep batch_size modest on the
+# 20 GB MIG partition (16 → ~2,480 seqs, fits; 64 → ~9,920 → cuDNN OOM). Raise only
+# if you have more VRAM.
 python test_lstm.py \
     --data_root   "$DATA_ROOT" \
     --cache_dir   "$DATA_ROOT" \
     --checkpoint  "$CHECKPOINT" \
     $EXCLUDE \
-    --batch_size  64 \
+    --batch_size  16 \
     --num_workers 4 \
     --index_mode  "$INDEX_MODE" \
     --save_predictions 200 \
