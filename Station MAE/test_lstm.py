@@ -118,8 +118,15 @@ def main() -> None:
 
     print(f"Dumping predictions for {len(test_ds):,} test windows "
           f"(index_mode={args.index_mode}) …")
+    try:
+        from tqdm import tqdm
+        _n_batches = (len(loader) if limit == float("inf")
+                      else min(len(loader), -(-int(limit) // args.batch_size)))
+        _iter = tqdm(loader, total=_n_batches, desc="predict", unit="batch")
+    except ImportError:
+        _iter = loader
     with torch.no_grad():
-        for batch in loader:
+        for batch in _iter:
             if collected >= limit:
                 break
             x  = batch["x"].to(device)
@@ -138,15 +145,21 @@ def main() -> None:
             preds = _p.view(B, N, K, Vt).permute(0, 2, 1, 3).cpu()        # (B,K,N,Vt)
 
             take = B if limit == float("inf") else min(B, int(limit - collected))
-            keep["preds"].append(preds[:take])
-            keep["targets"].append(y[:take])
-            keep["masks"].append(ym[:take])
-            keep["delta_steps"].append(batch["delta_steps"][:take])
-            keep["window_hours"].append(batch["x_hours"][:take, 0])
-            keep["target_hours"].append(batch["y_hours"][:take])
+            # .clone() the CPU batch tensors before keeping them: with the
+            # file_system sharing strategy each worker batch is backed by a
+            # mapped temp file that stays open as long as any VIEW of it lives.
+            # Keeping raw slices across all ~1.5k batches pins thousands of
+            # mapped files → "Too many open files" in _new_shared mid-run.
+            # clone() copies into process memory and releases the shared file.
+            keep["preds"].append(preds[:take])                   # already a fresh tensor (.cpu() of GPU output)
+            keep["targets"].append(y[:take].clone())
+            keep["masks"].append(ym[:take].clone())
+            keep["delta_steps"].append(batch["delta_steps"][:take].clone())
+            keep["window_hours"].append(batch["x_hours"][:take, 0].clone())
+            keep["target_hours"].append(batch["y_hours"][:take].clone())
             if spatial_saved is None:
                 sp = batch["spatial"]
-                spatial_saved = (sp[0] if sp.dim() == 3 else sp).cpu()
+                spatial_saved = (sp[0] if sp.dim() == 3 else sp).cpu().clone()
             collected += take
 
     out_dir = os.path.join(args.save_dir, args.run_name, "best_mr0.00")

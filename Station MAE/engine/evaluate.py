@@ -1076,7 +1076,15 @@ def collect_predictions(
     spatial_saved = None
     collected = 0
 
-    for batch in loader:
+    try:
+        from tqdm import tqdm
+        _bs = getattr(loader, "batch_size", None) or 1
+        _total = min(len(loader), -(-int(n_windows) // _bs))
+        _iter = tqdm(loader, total=_total, desc="predict", unit="batch")
+    except ImportError:
+        _iter = loader
+
+    for batch in _iter:
         if collected >= n_windows:
             break
 
@@ -1113,14 +1121,20 @@ def collect_predictions(
         B = preds.shape[0]
         take = min(B, n_windows - collected)
 
-        all_preds.append(preds[:take].cpu())
-        all_targets.append(y_raw[:take].cpu())
-        all_masks.append(y_mask_raw[:take].cpu())
+        # .clone(): on CPU devices .cpu() is a no-op returning a VIEW of the
+        # worker's shared-memory tensor; keeping views across the whole test
+        # set pins one mapped temp file per batch (file_system strategy) →
+        # "Too many open files". clone() copies out and releases the file.
+        # (On CUDA the .cpu() round-trip already copies; clone is a no-cost
+        # safety net there.)
+        all_preds.append(preds[:take].cpu().clone())
+        all_targets.append(y_raw[:take].cpu().clone())
+        all_masks.append(y_mask_raw[:take].cpu().clone())
         if midx is not None:
-            all_midx.append(midx[:take].cpu())
-        all_deltas.append(delta_steps[:take].cpu())
-        all_w_hours.append(x_hours[:take, 0].cpu())   # start of window
-        all_t_hours.append(y_hours[:take].cpu())
+            all_midx.append(midx[:take].cpu().clone())
+        all_deltas.append(delta_steps[:take].cpu().clone())
+        all_w_hours.append(x_hours[:take, 0].cpu().clone())   # start of window
+        all_t_hours.append(y_hours[:take].cpu().clone())
         collected += take
 
     result = {
