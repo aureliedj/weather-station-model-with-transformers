@@ -45,7 +45,7 @@ python test_lstm.py \
     --checkpoint  "$CHECKPOINT" \
     $EXCLUDE \
     --batch_size  8 \
-    --num_workers 4 \
+    --num_workers 0 \
     --index_mode  "$INDEX_MODE" \
     --stride      "$STRIDE" \
     --max_windows 0 `# 0 = save ALL windows (sliding/9 over 2023-24 ≈ 11k windows ≈ 1.5 GB)` \
