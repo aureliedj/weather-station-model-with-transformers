@@ -67,6 +67,15 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAVE_DIR="${SCRIPT_DIR}/checkpoints/full_run_cloud_v12"   # own dir — don't overwrite v10's best.ckpt/last.ckpt (also avoids auto-resume from v10's last.ckpt)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
+# ── WandB: offline on Renku ──────────────────────────────────────────────────
+# Renku egress is unreliable: when heartbeats drop for a few minutes the wandb
+# server marks the run "crashed" (stuck at the last epoch it received) while
+# training continues normally. Offline mode logs everything locally instead.
+# Backfill the dashboard any time with:
+#   wandb sync "$(ls -dt wandb/run-* | head -1)"
+# Override for a live run: WANDB_MODE=online ./run_full_cloud.sh
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
 # ── Station exclusion ────────────────────────────────────────────────────────
 # Drop stations with insufficient historical coverage before training.
 # Matched case-insensitively against the stations_table index / name / abbr.
@@ -148,12 +157,12 @@ TEMPORAL_WINDOW="--temporal_window 6"
 #   Val year 2022 → ~728 windows → ~23 batches at batch_size=4 → ~6 s/epoch
 #   No --limit_val_batches needed — the full val set is evaluated every epoch.
 #
-INDEX_MODE="--index_mode random --random_epoch_size 10000"
+#INDEX_MODE="--index_mode random --random_epoch_size 10000"
 # INDEX_MODE="--index_mode random --random_epoch_size 5000"  # ~1.4× non-overlapping (fast ablation)
 # INDEX_MODE="--index_mode random --random_epoch_size 3611"  # exact 1× non-overlapping
 # INDEX_MODE="--index_mode random --random_epoch_size 40000" # previous (11× redundant)
 # INDEX_MODE="--index_mode blocks"                           # non-overlapping train (fast ablation)
-# INDEX_MODE="--index_mode sliding --train_stride 4"         # sliding, hourly stride
+INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly stride
 
 # ── Loss function ─────────────────────────────────────────────────────────────
 #

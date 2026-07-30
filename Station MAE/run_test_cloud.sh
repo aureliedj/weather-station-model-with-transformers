@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
-# run_test_cloud.sh — test-set evaluation on the cloud
+# run_test_cloud.sh — prediction dump on the cloud (predictions-only)
 #
-# Loads the best checkpoint, runs full evaluation on the 2023-2024 test split,
-# and saves metrics to test_results/.
+# Loads the best checkpoint and runs ONE forward pass over the sliding test
+# windows per mask ratio, saving raw predictions only:
+#
+#   test_results/best_mr0.00/predictions.pt   (all stations visible)
+#   test_results/best_mr0.50/predictions.pt   (50% masked; masked_idx included)
+#
+# NO metrics are computed here — persistence, skill, per-station, seasonal etc.
+# are all derived downstream from predictions.pt in Test_Results_Exploration.ipynb.
+# Same schema as the LSTM dump (test_lstm.py), so runs drop into the same
+# comparison cells.
 #
 # All architecture settings are auto-read from the checkpoint.
-# Only --data_root and --checkpoint are required.
 #
 # Usage:
 #   chmod +x run_test_cloud.sh
@@ -18,7 +25,8 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 # Resolve paths relative to this script so they work from any working directory.
 # Checkpoints are saved by run_full_cloud.sh inside the project directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CHECKPOINT="${SCRIPT_DIR}/checkpoints/full_run_cloud/best.ckpt"
+CHECKPOINT="${SCRIPT_DIR}/checkpoints/full_run_cloud_v11/best.ckpt"
+# CHECKPOINT="${SCRIPT_DIR}/checkpoints/best.ckpt"   # ← v9 (NLL) saved checkpoint
 
 # Save test results inside the project directory (guaranteed writable on Renku)
 SAVE_DIR="${SCRIPT_DIR}/test_results"
@@ -46,8 +54,10 @@ GLOBAL_NORM=""
 
 MASK_RATIOS="0.0 0.5"
 # MASK_RATIOS="0.5"                 # single ratio (faster)
-# MASK_RATIOS="0.0 0.25 0.5 0.75"  # full robustness sweep
 
+# The model is loaded ONCE; each ratio is a single forward sweep over the same
+# sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
+# 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
@@ -57,10 +67,11 @@ python test.py \
     --stride           "$STRIDE" \
     --exclude_stations PFA \
     --test_mask_ratios $MASK_RATIOS \
-    --gap_fill_repeats 3 \
-    --save_predictions 100000 \
-    --seasonal \
+    --predictions_only \
+    --save_predictions 0 \
     $GLOBAL_NORM \
-    --save_dir         "$SAVE_DIR" \
-    --wandb_project    station-mae \
-    --wandb_run_name   "test-$(basename $CHECKPOINT .ckpt)-${INDEX_MODE}"
+    --save_dir         "$SAVE_DIR"
+
+echo ""
+echo "Done. Predictions at: ${SAVE_DIR}/best_mr0.00/ and best_mr0.50/"
+echo "Compute all metrics in Test_Results_Exploration.ipynb."

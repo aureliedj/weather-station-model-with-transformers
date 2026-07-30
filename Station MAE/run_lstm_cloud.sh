@@ -23,6 +23,10 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 LOCAL_CACHE="/tmp/station_mae_cache"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# WandB offline on Renku (flaky egress falsely marks runs "crashed"; training is
+# unaffected). Backfill later: wandb sync "$(ls -dt wandb/run-* | head -1)"
+export WANDB_MODE="${WANDB_MODE:-offline}"
+
 RUN_NAME="lstm-baseline-v1"
 SAVE_DIR="${SCRIPT_DIR}/checkpoints/${RUN_NAME}"
 

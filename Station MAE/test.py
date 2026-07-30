@@ -91,6 +91,13 @@ import numpy as np
 import pandas as pd
 from torch.utils.data import DataLoader
 
+# Renku session containers cap /dev/shm (often 64 MB), which the default sharing
+# strategy can exhaust when DataLoader workers hand batches back to the main
+# process on the large sliding test set → "No space left on device". Route the
+# handoff through temp files instead. Same guard as main.py / train_lstm.py /
+# test_lstm.py.
+torch.multiprocessing.set_sharing_strategy("file_system")
+
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -169,6 +176,13 @@ def parse_args() -> argparse.Namespace:
                         "the notebook. Each window includes preds, targets, masks, "
                         "delta_steps, timestamps, and station spatial features. "
                         "~40 MB per 100 windows at d_model=1024.")
+    p.add_argument("--predictions_only",  action="store_true",
+                   help="Dump predictions.pt per mask ratio and nothing else: no "
+                        "persistence baseline, no lead-30min pass, no metrics CSVs, "
+                        "no plots. One forward pass over the test windows per mask "
+                        "ratio; all metrics are computed downstream from the saved "
+                        "predictions (Test_Results_Exploration.ipynb). "
+                        "--save_predictions caps the window count (0 = ALL).")
     p.add_argument("--seasonal",          action="store_true",
                    help="Compute and save per-season metrics (DJF/MAM/JJA/SON). "
                         "Useful for analysing model behaviour across weather regimes.")
@@ -703,7 +717,7 @@ def main() -> None:
     lead1_loader   = None
     persist_metrics: dict = {}
 
-    if not _is_inpainting:
+    if not _is_inpainting and not args.predictions_only:
         _lead_delta = delta_grid_stride   # 3 steps = 30 min (matches training grid)
         print(f"Building lead-{_lead_delta*10}min test dataset (delta={_lead_delta} steps) …")
         lead1_ds = StationMAEDataset(
@@ -741,6 +755,8 @@ def main() -> None:
             print(f"    {var_name:<14}  {r:.5f}")
         print(f"    {'[overall]':<14}  "
               f"{persist_metrics.get('persist_overall_rmse_norm', float('nan')):.5f}")
+    elif args.predictions_only:
+        print("  [predictions-only] Skipping lead-30min dataset and persistence baseline.")
     else:
         print("  [Inpainting mode] Skipping lead-30min dataset and persistence baseline.")
 
@@ -872,6 +888,22 @@ def main() -> None:
             print(f"  mask_ratio={_test_mr:.2f}  "
                   f"({'trained setting' if _test_mr == c_mask_ratio else 'override'})  "
                   f"→ save_dir: {mr_save}")
+
+            # ── Predictions-only mode: one forward pass, dump, next ratio ──
+            if args.predictions_only:
+                from engine.evaluate import collect_predictions
+                t0 = _time.time()
+                _n = args.save_predictions if args.save_predictions > 0 else len(test_ds)
+                print(f"  [predictions-only] Dumping {_n:,} windows "
+                      f"(index_mode={args.index_mode}, stride={args.stride}) …")
+                _pred_path = os.path.join(mr_save, "predictions.pt")
+                collect_predictions(
+                    model, test_loader, device,
+                    n_windows=_n,
+                    save_path=_pred_path,
+                )
+                print(f"  ⏱  {_time.time()-t0:.0f}s")
+                continue
 
             skill:         dict = {}
             lead1_metrics: dict = {}
@@ -1045,8 +1077,8 @@ def main() -> None:
                       f"{r['skill_overall']:>+7.3f}  {r['temperature_rmse']:>10.5f}  {gap_str}")
             print()
 
-        # ── WandB logging (optional) ─────────────────────────────────────
-        if args.wandb_project:
+        # ── WandB logging (optional; no metrics exist in predictions-only) ─
+        if args.wandb_project and not args.predictions_only:
             try:
                 import wandb
                 # Use last evaluated mask ratio for WandB label
@@ -1110,6 +1142,12 @@ def main() -> None:
                       f"(project={args.wandb_project})")
             except ImportError:
                 print("  [WandB] wandb not installed — skipping logging")
+
+    if args.predictions_only:
+        print(f"\n[predictions-only] Done — predictions.pt written per mask ratio "
+              f"under: {os.path.abspath(args.save_dir)}")
+        print("Compute metrics downstream in Test_Results_Exploration.ipynb.")
+        return
 
     if not all_results:
         print("\nNo valid checkpoints evaluated.")

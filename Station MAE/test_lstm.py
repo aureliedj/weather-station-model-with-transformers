@@ -35,7 +35,14 @@ import os
 
 import numpy as np
 import torch
+import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
+
+# Renku session containers give /dev/shm a small fixed quota (often 64 MB), which
+# the default "file_descriptor" sharing strategy can exhaust when DataLoader workers
+# pass batch tensors back to the main process. "file_system" routes that handoff
+# through temp files instead of /dev/shm, avoiding "No space left on device" crashes.
+mp.set_sharing_strategy("file_system")
 
 
 def parse_args() -> argparse.Namespace:

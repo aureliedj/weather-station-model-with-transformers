@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
 # run_lstm_test_cloud.sh — evaluate a trained LSTM baseline checkpoint.
 #
-# Mirror of run_test_cloud.sh (the transformer evaluator), for the LSTM baseline.
-# Loads best.ckpt, runs the test split, and writes — in the SAME layout as the
-# transformer — so the LSTM drops into the comparison / diagnostic notebooks:
+# Mirror of run_test_cloud.sh (the transformer dump), for the LSTM baseline.
+# Loads best.ckpt and dumps raw predictions over the sliding test windows —
+# predictions ONLY, no metrics files:
 #
 #   test_results/<run>/best_mr0.00/predictions.pt   (same schema as test.py)
-#   test_results/<run>/test_metrics.csv             (per-variable norm+phys, per-delta, skill)
-#   test_results/<run>/persistence_metrics.csv
 #
-# The LSTM has no masking → pure forecaster → results are mr0.00; compare against
-# the transformer's mr0.00 numbers. A persistence-collapse check is printed.
+# All metrics are computed downstream in Test_Results_Exploration.ipynb from
+# predictions.pt (persistence is derived from targets[:, 0] there — no CSV).
+# The LSTM has no station masking → pure forecaster → results live under
+# best_mr0.00; compare against the transformer's best_mr0.00 dump.
+# A persistence-collapse sanity check is printed at the end.
 #
 # Usage:
 #   chmod +x run_lstm_test_cloud.sh
@@ -31,7 +32,7 @@ EXCLUDE="--exclude_stations PFA"   # same station dropped as during training
 # sliding: all overlapping windows — slower, most stable for final metrics
 # Rolling-origin evaluation: sliding windows every STRIDE steps (9 = 90 min = 1h30).
 INDEX_MODE="sliding"
-STRIDE=9
+STRIDE = 9
 # INDEX_MODE="blocks"   # fast non-overlapping alternative
 
 # NOTE on batch size: the LSTM folds all 155 stations of a window into the batch,

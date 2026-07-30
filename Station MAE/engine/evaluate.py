@@ -1048,6 +1048,10 @@ def collect_predictions(
         preds          (M, K, N, V_target)  — model predictions (normalised)
         targets        (M, K, N, V)         — ground truth (normalised)
         masks          (M, K, N, V)         — sensor availability
+        masked_idx     (M, N_masked)        — encoder-hidden station indices per
+                                              window (N_masked = mask_ratio × N;
+                                              empty at mask_ratio = 0.0) — needed
+                                              for gap-filling analysis downstream
         delta_steps    (M, K)               — lead-time steps
         window_hours   (M,)                 — hours-since-epoch of window start
         target_hours   (M, K)               — hours-since-epoch of each target
@@ -1065,6 +1069,7 @@ def collect_predictions(
     all_preds   = []
     all_targets = []
     all_masks   = []
+    all_midx    = []
     all_deltas  = []
     all_w_hours = []
     all_t_hours = []
@@ -1091,14 +1096,14 @@ def collect_predictions(
 
         # Use multi-delta forward for efficiency
         if y_raw.dim() == 4:
-            _, preds, _ = model.forward_multi_delta(
+            _, preds, midx = model.forward_multi_delta(
                 x, x_mask, spatial, x_hours,
                 y_raw, y_mask_raw, y_hours, delta_steps,
             )
             # preds: (B, K, N, V_target)
         else:
-            _, preds, _ = model(x, x_mask, spatial, x_hours,
-                                y_raw, y_mask_raw, y_hours, delta_steps)
+            _, preds, midx = model(x, x_mask, spatial, x_hours,
+                                   y_raw, y_mask_raw, y_hours, delta_steps)
             preds       = preds.unsqueeze(1)
             y_raw       = y_raw.unsqueeze(1)
             y_mask_raw  = y_mask_raw.unsqueeze(1)
@@ -1111,6 +1116,8 @@ def collect_predictions(
         all_preds.append(preds[:take].cpu())
         all_targets.append(y_raw[:take].cpu())
         all_masks.append(y_mask_raw[:take].cpu())
+        if midx is not None:
+            all_midx.append(midx[:take].cpu())
         all_deltas.append(delta_steps[:take].cpu())
         all_w_hours.append(x_hours[:take, 0].cpu())   # start of window
         all_t_hours.append(y_hours[:take].cpu())
@@ -1120,6 +1127,8 @@ def collect_predictions(
         "preds":        torch.cat(all_preds,   dim=0),   # (M, K, N, V_target)
         "targets":      torch.cat(all_targets, dim=0),   # (M, K, N, V)
         "masks":        torch.cat(all_masks,   dim=0),   # (M, K, N, V)
+        "masked_idx":   (torch.cat(all_midx, dim=0) if all_midx
+                         else torch.empty(collected, 0, dtype=torch.long)),  # (M, N_masked)
         "delta_steps":  torch.cat(all_deltas,  dim=0),   # (M, K)
         "window_hours": torch.cat(all_w_hours, dim=0),   # (M,)
         "target_hours": torch.cat(all_t_hours, dim=0),   # (M, K)
