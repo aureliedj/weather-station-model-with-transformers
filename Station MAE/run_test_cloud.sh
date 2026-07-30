@@ -28,8 +28,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECKPOINT="${SCRIPT_DIR}/checkpoints/full_run_cloud_v11/best.ckpt"
 # CHECKPOINT="${SCRIPT_DIR}/checkpoints/best.ckpt"   # ← v9 (NLL) saved checkpoint
 
-# Save test results inside the project directory (guaranteed writable on Renku)
-SAVE_DIR="${SCRIPT_DIR}/test_results"
+# Save under a per-run subfolder — Test_Results_Exploration.ipynb expects
+# test_results/<run>/best_mr0.00/ (same layout as the LSTM's lstm-baseline-v1/).
+# Keep RUN_NAME in sync with the checkpoint being evaluated.
+RUN_NAME="v11"
+# RUN_NAME="v9"          # ← when evaluating checkpoints/best.ckpt (v9, NLL)
+SAVE_DIR="${SCRIPT_DIR}/test_results/${RUN_NAME}"
 
 # ── Window mode ───────────────────────────────────────────────────────────────
 # blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default

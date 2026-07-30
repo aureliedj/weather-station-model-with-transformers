@@ -1,7 +1,13 @@
 peakweather @ git+https://github.com/MeteoSwiss/PeakWeather.git@28a28c2d17f47b8bf33f22ee62fc92adac9b4778
 
 # Core deep learning
-torch>=2.2,<3.0
+# Linux (Renku): pin the CUDA 12.8 build — the host driver supports CUDA 12.8,
+# and the default PyPI wheel (cu130) fails CUDA init → silent CPU fallback.
+# Install on Renku with:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
+# macOS (local): plain build (MPS/CPU; no CUDA-variant wheels exist).
+torch==2.13.0+cu128; sys_platform == "linux"
+torch==2.13.0;       sys_platform == "darwin"
 
 # Training framework + experiment tracking
 pytorch-lightning>=2.2
