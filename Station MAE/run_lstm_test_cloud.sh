@@ -32,7 +32,7 @@ EXCLUDE="--exclude_stations PFA"   # same station dropped as during training
 # sliding: all overlapping windows — slower, most stable for final metrics
 # Rolling-origin evaluation: sliding windows every STRIDE steps (9 = 90 min = 1h30).
 INDEX_MODE="sliding"
-STRIDE = 9
+STRIDE=9
 # INDEX_MODE="blocks"   # fast non-overlapping alternative
 
 # NOTE on batch size: the LSTM folds all 155 stations of a window into the batch,
