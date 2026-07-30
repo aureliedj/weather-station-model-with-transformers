@@ -1102,16 +1102,27 @@ def collect_predictions(
         if spatial_saved is None:
             spatial_saved = spatial.cpu()
 
+        # bf16 autocast on CUDA: halves activation memory (the flat d1024
+        # encoder OOMs in fp32 on small MIG slices) and matches the bf16 AMP
+        # the model was trained with. No-op on CPU/MPS.
+        import contextlib
+        _amp = (torch.autocast("cuda", dtype=torch.bfloat16)
+                if device.type == "cuda" else contextlib.nullcontext())
+
         # Use multi-delta forward for efficiency
         if y_raw.dim() == 4:
-            _, preds, midx = model.forward_multi_delta(
-                x, x_mask, spatial, x_hours,
-                y_raw, y_mask_raw, y_hours, delta_steps,
-            )
+            with _amp:
+                _, preds, midx = model.forward_multi_delta(
+                    x, x_mask, spatial, x_hours,
+                    y_raw, y_mask_raw, y_hours, delta_steps,
+                )
+            preds = preds.float()
             # preds: (B, K, N, V_target)
         else:
-            _, preds, midx = model(x, x_mask, spatial, x_hours,
-                                   y_raw, y_mask_raw, y_hours, delta_steps)
+            with _amp:
+                _, preds, midx = model(x, x_mask, spatial, x_hours,
+                                       y_raw, y_mask_raw, y_hours, delta_steps)
+            preds       = preds.float()
             preds       = preds.unsqueeze(1)
             y_raw       = y_raw.unsqueeze(1)
             y_mask_raw  = y_mask_raw.unsqueeze(1)

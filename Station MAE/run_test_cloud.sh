@@ -31,7 +31,7 @@ CHECKPOINT="${SCRIPT_DIR}/checkpoints/full_run_cloud_v11/best.ckpt"
 # Save under a per-run subfolder — Test_Results_Exploration.ipynb expects
 # test_results/<run>/best_mr0.00/ (same layout as the LSTM's lstm-baseline-v1/).
 # Keep RUN_NAME in sync with the checkpoint being evaluated.
-RUN_NAME="v11"
+RUN_NAME="v9"
 # RUN_NAME="v9"          # ← when evaluating checkpoints/best.ckpt (v9, NLL)
 SAVE_DIR="${SCRIPT_DIR}/test_results/${RUN_NAME}"
 
@@ -62,10 +62,13 @@ MASK_RATIOS="0.0 0.5"
 # The model is loaded ONCE; each ratio is a single forward sweep over the same
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
 # 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
+# batch_size 2: the flat d1024 encoder at W=72, N=155 is memory-hungry even in
+# bf16; batch 8 fp32 OOMs on an 8 GB MIG slice. Throughput is data-loading
+# bound anyway, so small batches cost little. Raise to 8 on a 20 GB partition.
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       8 \
+    --batch_size       2 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --stride           "$STRIDE" \
