@@ -22,7 +22,8 @@ import sys
 
 import numpy as np
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PROJ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.join(_PROJ, "src")          # packages moved under src/
 sys.path.insert(0, _ROOT)
 # Load engine/lstm_metrics.py directly (bypass engine/__init__, which imports torch),
 # so this test runs anywhere — with or without torch installed.
