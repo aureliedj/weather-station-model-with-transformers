@@ -548,18 +548,58 @@ def main() -> None:
         torch.backends.cuda.enable_flash_sdp(True)
 
     print(f"\n[test.py]  device={device}")
+
+    # ── Fail fast on missing checkpoints ──────────────────────────────────
+    # Building the datasets takes minutes. Validate first, and refuse to run at
+    # all if NOTHING can be evaluated — otherwise the config below silently
+    # falls back to library defaults (d_model=128, window=288, max_delta=18),
+    # the run "succeeds", and writes nothing. That failure mode cost a full
+    # evaluation cycle once; it must be loud.
+    _missing = [p for p in args.checkpoint if not os.path.exists(p)]
+    _present = [p for p in args.checkpoint if os.path.exists(p)]
+    if _missing:
+        print("\n[ERROR] checkpoint(s) not found:")
+        for p in _missing:
+            print(f"    {p}")
+            _d = os.path.dirname(p)
+            if os.path.isdir(_d):
+                _sib = sorted(f for f in os.listdir(_d) if f.endswith(".ckpt"))
+                print(f"      dir exists; .ckpt files here: {_sib or '(none)'}")
+            elif os.path.isdir(os.path.dirname(_d)):
+                _runs = sorted(os.listdir(os.path.dirname(_d)))
+                print(f"      no such dir. Available runs in "
+                      f"{os.path.dirname(_d)}: {_runs or '(none)'}")
+            else:
+                print(f"      parent directory does not exist either: {_d}")
+    if not _present:
+        raise SystemExit(
+            "\n[ABORT] none of the requested checkpoints exist — nothing to evaluate.\n"
+            "        Check CHECKPOINT in src/scripts/run_test_cloud.sh, and that it\n"
+            "        matches RUN_NAME (the run being written to test_results/)."
+        )
+    if _missing:
+        print(f"\n  continuing with {len(_present)} of {len(args.checkpoint)} checkpoint(s)")
+
     os.makedirs(args.save_dir, exist_ok=True)
 
     # ── Auto-read settings from first Lightning checkpoint ────────────────
     # Loads only the cfg sub-dict (no weights); fast even for large checkpoints.
     # CLI flags always win when explicitly provided (non-None).
     _ckpt_cfg: dict = {}
-    for _p in args.checkpoint:
-        if os.path.exists(_p):
-            _ckpt_cfg = _read_lightning_cfg(_p)
-            if _ckpt_cfg:
-                print(f"Auto-detected settings from checkpoint: {_p}")
-                break
+    for _p in _present:
+        _ckpt_cfg = _read_lightning_cfg(_p)
+        if _ckpt_cfg:
+            print(f"Auto-detected settings from checkpoint: {_p}")
+            break
+    if not _ckpt_cfg:
+        # The checkpoint exists but carries no hyper_parameters. Every setting
+        # below then falls back to a library default that almost certainly does
+        # not match how the model was trained — say so rather than printing a
+        # confident banner full of wrong numbers.
+        print("\n[WARN] no cfg found inside the checkpoint(s).")
+        print("       Architecture and window settings will fall back to DEFAULTS")
+        print("       (window=288, max_delta=18, d_model=128) unless passed on the CLI.")
+        print("       If the banner below does not match your training run, stop now.\n")
 
     def _resolve(cli_val, cfg_key: str, fallback):
         """Return CLI value if set (not None), else checkpoint cfg, else fallback."""
@@ -689,7 +729,7 @@ def main() -> None:
     _window_mode_str = (
         f"non-overlapping blocks (~{len(test_ds):,} windows)"
         if args.index_mode == "blocks"
-        else f"sliding stride=1 ({len(test_ds):,} windows)"
+        else f"sliding stride={args.stride} ({len(test_ds):,} windows)"
     )
     print(f"  test samples: {_window_mode_str}  "
           f"(delta_mode={delta_mode}"

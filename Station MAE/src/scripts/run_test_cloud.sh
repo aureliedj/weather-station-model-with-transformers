@@ -28,15 +28,35 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-CHECKPOINT="${PROJ_DIR}/checkpoints/full_run_cloud_v11/best.ckpt"
-# CHECKPOINT="${PROJ_DIR}/checkpoints/best.ckpt"   # ← v9 (NLL) saved checkpoint
-
-# Save under a per-run subfolder — Test_Results_Exploration.ipynb expects
-# test_results/<run>/best_mr0.00/ (same layout as the LSTM's lstm-baseline-v1/).
-# Keep RUN_NAME in sync with the checkpoint being evaluated.
+# ── Which run to evaluate ────────────────────────────────────────────────────
+# Set RUN_NAME only. The checkpoint path and the output folder are both derived
+# from it, so they cannot drift apart — editing one and forgetting the other
+# previously produced a run that loaded v11 while writing into test_results/v12.
+#
+#   RUN_NAME    checkpoint directory              notes
+#   v9          checkpoints/run_full_cloud_v9     NLL — predicts σ
+#   v11         checkpoints/full_run_cloud_v11    Huber, unweighted
+#   v12         checkpoints/full_run_cloud_v12    Huber, down-weighted vars
 RUN_NAME="v12"
-# RUN_NAME="v9"          # ← when evaluating checkpoints/best.ckpt (v9, NLL)
+
+case "$RUN_NAME" in
+  v9)  CKPT_DIR="run_full_cloud_v9"  ;;
+  *)   CKPT_DIR="full_run_cloud_${RUN_NAME}" ;;
+esac
+CHECKPOINT="${PROJ_DIR}/checkpoints/${CKPT_DIR}/best.ckpt"
 SAVE_DIR="${PROJ_DIR}/test_results/${RUN_NAME}"
+
+# Fail here rather than 4 minutes into the dataset build.
+if [[ ! -f "$CHECKPOINT" ]]; then
+  echo "[run_test_cloud.sh] checkpoint for RUN_NAME='${RUN_NAME}' not found:"
+  echo "    $CHECKPOINT"
+  echo "  available runs under ${PROJ_DIR}/checkpoints:"
+  ls -1 "${PROJ_DIR}/checkpoints" 2>/dev/null | sed 's/^/    /' || echo "    (no checkpoints/ directory)"
+  exit 1
+fi
+echo "[run_test_cloud.sh] RUN_NAME=${RUN_NAME}"
+echo "                    checkpoint: ${CHECKPOINT}"
+echo "                    output:     ${SAVE_DIR}"
 
 # ── Window mode ───────────────────────────────────────────────────────────────
 # blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default

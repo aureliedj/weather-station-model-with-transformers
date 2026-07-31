@@ -1,0 +1,21 @@
+# ── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# ── Data, artefacts and logs (large, regenerable, machine-specific) ──────────
+Station MAE/PeakWeatherDataset/
+Station MAE/checkpoints/
+Station MAE/checkpoints_mini/
+Station MAE/test_results/
+Station MAE/wandb/
+Station MAE/archive/_junk/
+*.ckpt
+*.log
