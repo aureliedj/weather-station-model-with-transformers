@@ -1070,6 +1070,7 @@ def collect_predictions(
     all_targets = []
     all_masks   = []
     all_midx    = []
+    all_log_var = []          # predicted log σ² (NLL models only; empty otherwise)
     all_deltas  = []
     all_w_hours = []
     all_t_hours = []
@@ -1109,15 +1110,21 @@ def collect_predictions(
         _amp = (torch.autocast("cuda", dtype=torch.bfloat16)
                 if device.type == "cuda" else contextlib.nullcontext())
 
-        # Use multi-delta forward for efficiency
+        # Use multi-delta forward for efficiency.
+        # return_log_var=True also retrieves the predicted log σ² when the model
+        # was built with use_nll_loss (v9-style NLL runs); it is None otherwise.
+        log_var = None
         if y_raw.dim() == 4:
             with _amp:
-                _, preds, midx = model.forward_multi_delta(
+                _, preds, midx, log_var = model.forward_multi_delta(
                     x, x_mask, spatial, x_hours,
                     y_raw, y_mask_raw, y_hours, delta_steps,
+                    return_log_var=True,
                 )
             preds = preds.float()
-            # preds: (B, K, N, V_target)
+            if log_var is not None:
+                log_var = log_var.float()
+            # preds / log_var: (B, K, N, V_target)
         else:
             with _amp:
                 _, preds, midx = model(x, x_mask, spatial, x_hours,
@@ -1141,6 +1148,8 @@ def collect_predictions(
         all_preds.append(preds[:take].cpu().clone())
         all_targets.append(y_raw[:take].cpu().clone())
         all_masks.append(y_mask_raw[:take].cpu().clone())
+        if log_var is not None:
+            all_log_var.append(log_var[:take].cpu().clone())
         if midx is not None:
             all_midx.append(midx[:take].cpu().clone())
         all_deltas.append(delta_steps[:take].cpu().clone())
@@ -1161,6 +1170,10 @@ def collect_predictions(
         "var_names":    TARGET_VARIABLE_NAMES,
         "n_windows":    collected,
     }
+    # Predicted uncertainty — only present for NLL models (v9-style).
+    # log_var = log σ² in normalised space; σ = exp(0.5 · log_var).
+    if all_log_var:
+        result["log_var"] = torch.cat(all_log_var, dim=0)   # (M, K, N, V_target)
 
     if save_path:
         import os

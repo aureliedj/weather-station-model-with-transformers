@@ -336,9 +336,17 @@ class StationMAE(nn.Module):
         y_mask:      torch.Tensor,   # (B, K, N, V)
         y_hours:     torch.Tensor,   # (B, K)
         delta_steps: torch.Tensor,   # (B, K)  long tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_log_var: bool = False,
+    ) -> tuple:
         """
         Multi-delta training forward: encoder once, decoder once for all K.
+
+        Args:
+            return_log_var: if True, also return the predicted log σ² tensor
+                (B, K, N, num_target_vars) — or None when the model was not
+                built with use_nll_loss.  Used by the evaluation pipeline to
+                persist calibrated uncertainty alongside the point predictions.
+                Default False keeps the original 3-tuple for existing callers.
 
         The encoder processes the input window once (the expensive O(L²) step).
         The decoder also runs once — it builds N×K query tokens (one per
@@ -413,6 +421,8 @@ class StationMAE(nn.Module):
                 preds_all[:, k], y_target_k, y_mask_target_k, _midx_k, log_var=lv_k
             )
 
+        if return_log_var:
+            return loss_acc, preds_all, masked_idx, log_var_all
         return loss_acc, preds_all, masked_idx
 
     # ------------------------------------------------------------------

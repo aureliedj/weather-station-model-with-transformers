@@ -835,6 +835,16 @@ def main() -> None:
         print(f"  factorised_encoder={factorised}  no_spatial_attn={no_spatial}  "
               f"temporal_window={temp_window}  cross_attn_decoder={cross_attn}")
 
+        # ── Detect an NLL (heteroscedastic) checkpoint ────────────────────────
+        # The cfg key "nll_loss" is unreliable (absent/None on older runs such as
+        # v9), so infer it from the weights: an NLL model has a second decoder
+        # head predicting log σ².  Without this the head would be silently
+        # dropped by strict=False and the predicted uncertainty lost.
+        _use_nll = any(k.endswith("decoder.log_var_head.weight") or
+                       k.endswith("decoder.log_var_head.bias")
+                       for k in state_dict)
+        print(f"  NLL uncertainty head: {'FOUND — σ will be predicted and saved' if _use_nll else 'absent (point predictions only)'}")
+
         # Build model
         from model.mae import StationMAE
         model = StationMAE(
@@ -850,6 +860,7 @@ def main() -> None:
             encoder_spatial_attn=not no_spatial,
             temporal_window=temp_window,
             cross_attention_decoder=cross_attn,
+            use_nll_loss=_use_nll,
         ).to(device)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
