@@ -136,6 +136,8 @@ def parse_args() -> argparse.Namespace:
                    help="Axial attention encoder (auto-detected from Lightning checkpoints)")
     p.add_argument("--no_spatial_attn", action="store_true", default=None,
                    help="Temporal-only encoder (auto-detected from Lightning checkpoints)")
+    p.add_argument("--temporal_patch", type=int, default=None,
+                   help="Auto-read from the checkpoint; override only to debug.")
     p.add_argument("--temporal_window", type=int, default=None,
                    help="Local temporal attention window (auto-detected from Lightning checkpoints)")
     p.add_argument("--cross_attn_decoder", action="store_true", default=None,
@@ -839,6 +841,7 @@ def main() -> None:
             factorised   = _arch(args.factorised_encoder, "factorised_encoder", False)
             no_spatial   = _arch(args.no_spatial_attn,   "no_spatial_attn",    False)
             temp_window  = _arch(args.temporal_window,   "temporal_window",    0)
+            temp_patch   = _arch(args.temporal_patch,    "temporal_patch",     1)
             cross_attn   = _arch(args.cross_attn_decoder,"cross_attn_decoder", False)
 
             # Strip "model." prefix (Lightning) and then "_orig_mod." prefix
@@ -865,6 +868,7 @@ def main() -> None:
             factorised   = bool(args.factorised_encoder)
             no_spatial   = bool(args.no_spatial_attn)
             temp_window  = args.temporal_window or 0
+            temp_patch   = args.temporal_patch or 1
             cross_attn   = bool(args.cross_attn_decoder)
             state_dict   = ckpt["model_state_dict"]
 
@@ -873,7 +877,8 @@ def main() -> None:
         print(f"  d_model={c_d_model}  enc_layers={c_enc_layers}  dec_layers={c_dec_layers}  "
               f"mlp_ratio={c_mlp_ratio}")
         print(f"  factorised_encoder={factorised}  no_spatial_attn={no_spatial}  "
-              f"temporal_window={temp_window}  cross_attn_decoder={cross_attn}")
+              f"temporal_window={temp_window}  temporal_patch={temp_patch}  "
+              f"cross_attn_decoder={cross_attn}")
 
         # ── Detect an NLL (heteroscedastic) checkpoint ────────────────────────
         # The cfg key "nll_loss" is unreliable (absent/None on older runs such as
@@ -899,6 +904,7 @@ def main() -> None:
             factorised_encoder=factorised,
             encoder_spatial_attn=not no_spatial,
             temporal_window=temp_window,
+            temporal_patch=temp_patch,
             cross_attention_decoder=cross_attn,
             use_nll_loss=_use_nll,
         ).to(device)

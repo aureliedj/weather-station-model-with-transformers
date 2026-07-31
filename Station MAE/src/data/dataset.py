@@ -216,9 +216,13 @@ def build_observations(
 
 
 def normalise_observations(
-    obs:         torch.Tensor,
-    mask:        torch.Tensor,
-    per_station: bool = True,
+    obs:          torch.Tensor,
+    mask:         torch.Tensor,
+    per_station:  bool = True,
+    coords:       "torch.Tensor | None" = None,
+    station_ids:  "list | None" = None,
+    alt_km_per_m: float = 0.2,
+    verbose:      bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """
     Normalise each (station, variable) pair to zero-mean unit-variance using
@@ -229,13 +233,42 @@ def normalise_observations(
     zero — the model learns the inter-station differences purely from the spatial
     and topographic embeddings rather than the raw signal level.
 
+    Sparse (station, variable) pairs
+    -------------------------------
+    A pair with fewer than MIN_OBS training observations has no usable statistics
+    of its own — GES pressure, for example, has ZERO (the sensor was installed in
+    2023, after the training period). Such pairs previously fell back to the
+    cross-station GLOBAL mean and std, which is badly wrong for altitude-driven
+    variables: the network spans ~200–3600 m, so a global mean pressure is
+    meaningless at any individual station.
+
+    We now borrow from the NEAREST station that does have data for that variable,
+    where "nearest" combines horizontal distance with an altitude penalty
+    (``alt_km_per_m``). Altitude dominates pressure (~12 hPa/100 m) and strongly
+    affects temperature (~0.65 °C/100 m), so a donor 5 km away but 500 m higher is
+    a worse choice than one 50 km away at the same elevation. The default
+    0.2 km/m makes 100 m of elevation cost as much as 20 km of distance.
+
+    Global stats remain the last resort, used only when no station has data for
+    that variable at all.
+
     Args:
-        obs:  (T, N, V) raw observations (0.0 where absent)
-        mask: (T, N, V) presence mask (1.0 present, 0.0 absent)
+        obs:          (T, N, V) raw observations (0.0 where absent)
+        mask:         (T, N, V) presence mask (1.0 present, 0.0 absent)
+        per_station:  False reproduces the old global-only behaviour.
+        coords:       (N, 3) easting[m], northing[m], height[m]. Required for
+                      nearest-donor substitution; without it we fall back to
+                      global stats and say so.
+        station_ids:  optional names, used only to make the log readable.
+        alt_km_per_m: altitude penalty in km-equivalent per metre of Δheight.
+        verbose:      print every substitution (there are few, and they matter).
 
     Returns:
         obs_norm : (T, N, V) normalised (absent values zeroed)
-        stats    : {"mean": (N, V), "std": (N, V)}
+        stats    : {"mean": (N, V), "std": (N, V), "donor": (N, V) long,
+                    "n_obs": (N, V)}
+                   donor[i, v] = index of the station whose stats station i used
+                   for variable v; -1 = its own, -2 = global fallback.
     """
     T, N, V = obs.shape
 
@@ -276,21 +309,70 @@ def normalise_observations(
     _g_diff = ((obs - _g_mean[None, None, :]) ** 2) * mask        # (T, N, V)
     _g_std  = (_g_diff.sum(dim=(0, 1)) / _g_count.clamp(min=2)).sqrt().clamp(min=1e-6)
 
-    # ── Replace sparse-station stats with global fallback ─────────────────────
-    # Any (station, variable) with fewer than MIN_OBS training observations uses
-    # the cross-station global mean and std instead of the per-station values.
-    # This guarantees normalised values stay in a sane range even for stations
-    # that had no data in the training years.
+    # ── Replace sparse-station stats: nearest donor, then global ──────────────
+    # donor[i, v]: -1 = station i used its own stats, >=0 = index of the donor
+    # station it borrowed from, -2 = no donor existed so global stats were used.
     _sparse = raw_count < MIN_OBS                                   # (N, V) bool
-    means   = torch.where(_sparse, _g_mean.unsqueeze(0).expand_as(means), means)
-    stds    = torch.where(_sparse, _g_std.unsqueeze(0).expand_as(stds),   stds)
-    stds    = stds.clamp(min=1e-6)
+    donor   = torch.full((N, V), -1, dtype=torch.long)
+
+    if _sparse.any():
+        n_bad = int(_sparse.sum())
+        if coords is None:
+            if verbose:
+                print(f"  [norm] {n_bad} sparse (station,variable) pair(s); no coords "
+                      f"supplied → GLOBAL fallback (altitude-blind, see docstring)")
+            means = torch.where(_sparse, _g_mean.unsqueeze(0).expand_as(means), means)
+            stds  = torch.where(_sparse, _g_std.unsqueeze(0).expand_as(stds),   stds)
+            donor = torch.where(_sparse, torch.full_like(donor, -2), donor)
+        else:
+            c   = coords.to(torch.float64)
+            # horizontal distance in km + altitude penalty in km-equivalent
+            dxy = torch.cdist(c[:, :2], c[:, :2]) / 1000.0            # (N, N) km
+            dz  = (c[:, 2:3] - c[:, 2:3].T).abs() * alt_km_per_m      # (N, N) km-equiv
+            dist = torch.sqrt(dxy ** 2 + dz ** 2)
+            dist.fill_diagonal_(float("inf"))                         # never self
+
+            subs = []
+            for v in range(V):
+                healthy = ~_sparse[:, v]                              # (N,) donors
+                if not healthy.any():
+                    # nobody has this variable — global is genuinely the only option
+                    sel = _sparse[:, v]
+                    means[sel, v] = _g_mean[v]
+                    stds[sel, v]  = _g_std[v]
+                    donor[sel, v] = -2
+                    continue
+                d_v = dist.clone()
+                d_v[:, ~healthy] = float("inf")                       # only healthy donors
+                nearest = d_v.argmin(dim=1)                           # (N,)
+                for i in torch.nonzero(_sparse[:, v]).flatten().tolist():
+                    j = int(nearest[i])
+                    means[i, v] = means[j, v]
+                    stds[i, v]  = stds[j, v]
+                    donor[i, v] = j
+                    subs.append((i, j, v, float(dist[i, j]),
+                                 float(c[i, 2] - c[j, 2]), int(raw_count[i, v])))
+
+            if verbose and subs:
+                _nm = (lambda k: str(station_ids[k])) if station_ids else (lambda k: f"#{k}")
+                print(f"  [norm] {len(subs)} sparse (station,variable) pair(s) "
+                      f"→ nearest-donor stats:")
+                for i, j, v, d, dzm, nobs in subs:
+                    print(f"           {_nm(i):>6}.{VARIABLE_NAMES[v]:<13} "
+                          f"n_obs={nobs:<5} ← {_nm(j):>6}  "
+                          f"({d:5.1f} km-equiv, Δalt {dzm:+.0f} m)")
+            _still = int((donor == -2).sum())
+            if verbose and _still:
+                print(f"  [norm] {_still} pair(s) had no donor at all → global fallback")
+
+    stds = stds.clamp(min=1e-6)
 
     # ── Normalise and zero-out absent entries ──────────────────────────────────
     obs_norm = (obs - means.unsqueeze(0)) / stds.unsqueeze(0)      # (T, N, V)
     obs_norm = obs_norm * mask                                      # zero absent
 
-    return obs_norm, {"mean": means, "std": stds}
+    return obs_norm, {"mean": means, "std": stds,
+                      "donor": donor, "n_obs": raw_count}
 
 
 def compute_obs_stats(
@@ -327,7 +409,30 @@ def compute_obs_stats(
     train_idx  = [i for i, ts in enumerate(timestamps) if ts.year in years]
     obs_train  = obs_full[train_idx]
     mask_train = mask_full[train_idx]
-    _, stats   = normalise_observations(obs_train, mask_train, per_station=per_station)
+
+    # Station geometry, so sparse (station, variable) pairs can borrow stats from
+    # the nearest comparable station instead of the altitude-blind global mean.
+    coords, station_ids = None, None
+    try:
+        _st = ds.stations_table
+        coords = torch.tensor(
+            _st[["swiss_easting", "swiss_northing", "station_height"]]
+            .astype(float).to_numpy(),
+            dtype=torch.float64,
+        )                                                   # (N, 3)
+        station_ids = _st.index.tolist()
+        if coords.shape[0] != obs_train.shape[1]:           # never silently misalign
+            print(f"  [norm] stations_table has {coords.shape[0]} rows but obs has "
+                  f"{obs_train.shape[1]} stations — skipping nearest-donor lookup")
+            coords, station_ids = None, None
+    except Exception as e:                                   # noqa: BLE001
+        print(f"  [norm] could not read station coordinates ({type(e).__name__}) — "
+              f"nearest-donor lookup disabled")
+
+    _, stats = normalise_observations(
+        obs_train, mask_train, per_station=per_station,
+        coords=coords, station_ids=station_ids,
+    )
     return stats
 
 

@@ -146,6 +146,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_delta",    type=int,   default=18)
     p.add_argument("--factorised_encoder",  action="store_true",
                    help="Axial attention in encoder (~100× cheaper at W=288)")
+    p.add_argument("--temporal_patch",      type=int, default=1,
+                   help="Group P consecutive timesteps into ONE encoder token "
+                        "(ViT/PatchTST-style patch merging). P must divide --window. "
+                        "P=6 turns a 72-step window into 12 tokens, so FULL attention "
+                        "over 12*N_vis costs LESS than the windowed setup it replaces "
+                        "while giving every token the whole window from layer 1. "
+                        "Use with --temporal_window 0. Default 1 = no patching.")
     p.add_argument("--temporal_window",     type=int, default=0,
                    help="Local temporal window size in timesteps (0 = full attention). "
                         "W must be exactly divisible by this value. Odd encoder layers "
@@ -417,7 +424,8 @@ class OverfitEarlyStop(object):
 
     def __init__(self, monitor: str = "val/loss", patience: int = 5,
                  min_delta: float = 0.0, mode: str = "min",
-                 train_metric: str = "train/loss", verbose: bool = True):
+                 train_metric: str = "train/loss", verbose: bool = True,
+                 warmup_epochs: int = 0):
         self.monitor      = monitor
         self.patience     = patience
         self.min_delta    = min_delta
@@ -427,6 +435,11 @@ class OverfitEarlyStop(object):
         self.best         = float("inf") if mode == "min" else float("-inf")
         self.wait         = 0
         self.best_epoch   = -1
+        # Do not count non-improving epochs while the LR is still warming up.
+        # Without this, patience=5 against warmup_epochs=15 stops training
+        # before the learning rate has even reached its peak — which is what
+        # invalidated v12.
+        self.warmup_epochs = int(warmup_epochs)
 
     def _is_improvement(self, value: float) -> bool:
         if self.mode == "min":
@@ -439,6 +452,18 @@ class OverfitEarlyStop(object):
         if m is None:
             return                          # metric not logged yet (e.g. sanity check)
         value = float(m)
+
+        # ── Warm-up guard ────────────────────────────────────────────────
+        # During warmup the LR is still ramping, so flat or worsening val is
+        # expected and must not consume patience.
+        if trainer.current_epoch < self.warmup_epochs:
+            if self.verbose:
+                print(f"[OverfitStop] warmup {trainer.current_epoch + 1}"
+                      f"/{self.warmup_epochs} — not counting "
+                      f"({self.monitor}={value:.5f})")
+            if self._is_improvement(value):
+                self.best, self.best_epoch = value, int(trainer.current_epoch)
+            return
 
         # Generalisation gap (val − train), logged for visibility.
         tr  = metrics.get(self.train_metric)
@@ -714,6 +739,7 @@ def main() -> None:
         factorised_encoder=args.factorised_encoder,
         encoder_spatial_attn=not args.no_spatial_attn,
         temporal_window=args.temporal_window,
+        temporal_patch=args.temporal_patch,
         cross_attention_decoder=args.cross_attn_decoder,
         drop_path_rate=args.drop_path_rate,
         masked_only_loss=args.masked_only_loss,
@@ -827,6 +853,7 @@ def main() -> None:
         "factorised_encoder":  args.factorised_encoder,
         "no_spatial_attn":     args.no_spatial_attn,
         "temporal_window":     args.temporal_window,
+        "temporal_patch":      args.temporal_patch,
         "cross_attn_decoder":  args.cross_attn_decoder,
         "grad_checkpoint":     args.grad_checkpoint,
         "window":              args.window,
@@ -963,6 +990,8 @@ def main() -> None:
                 mode         = "min",
                 train_metric = "train/loss",
                 verbose      = True,
+                # Never consume patience while the LR is still ramping.
+                warmup_epochs = args.warmup_epochs,
             )
         )
         _ofp_unit = "steps" if _step_based else "epochs"

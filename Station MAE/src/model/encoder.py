@@ -24,6 +24,8 @@ Masking strategy:
          from its own recent history
 """
 
+import warnings
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -506,6 +508,8 @@ class JointSpatioTemporalBlock(nn.Module):
 # ---------------------------------------------------------------------------
 
 class WindowedFlatTransformerBlock(nn.Module):
+    _warned_shift = False
+
     """
     Flat self-attention restricted to local temporal windows over (B, W, N, d).
 
@@ -598,8 +602,35 @@ class WindowedFlatTransformerBlock(nn.Module):
         num_chunks = W // tw
         shift_size = tw // 2 if self.shift else 0
 
-        # ── Swin-style half-window circular shift along temporal axis ────────────
+        # ── Half-window circular shift along the temporal axis ───────────────────
+        # WARNING — this is NOT a faithful Swin shift. Real Swin follows the roll
+        # with an attention mask that partitions the straddling window, so tokens
+        # which wrapped around cannot attend to each other. There is no such mask
+        # below, so in the LAST chunk the newest timesteps attend to the OLDEST
+        # ones as if they were adjacent: at W=72, tw=6 the token at t=71 attends
+        # to t=0, twelve hours earlier.
+        #
+        # Measured effect (tw=6, 8 layers): the apparent temporal receptive field
+        # of the newest token grows from 24 to 48 steps, but that extra 4 h is a
+        # spurious wrap-around shortcut at the window seam, not genuine locality.
+        # v9 / v11 / v12 were all trained with this.
+        #
+        # Not fixed because temporal patching retires this path: at P=6 the
+        # sequence is 12 tokens and FULL attention is ~3x cheaper than this
+        # windowed version while covering the whole window from layer 1.
+        # If you revive windowed attention (e.g. for a 24 h input window), add
+        # the Swin mask first.
         if shift_size > 0:
+            if not WindowedFlatTransformerBlock._warned_shift:
+                warnings.warn(
+                    "WindowedFlatTransformerBlock: circular temporal shift is applied "
+                    "WITHOUT a Swin attention mask, so the newest timesteps attend to "
+                    "the oldest across the window seam. Prefer temporal patching "
+                    "(--temporal_patch) with full attention. See the comment in "
+                    "encoder.py for the measured effect.",
+                    RuntimeWarning, stacklevel=2,
+                )
+                WindowedFlatTransformerBlock._warned_shift = True
             x = torch.roll(x, shifts=-shift_size, dims=1)
 
         # ── Chunk: (B, W, N, D) → (B·chunks, tw·N, D) ──────────────────────────
@@ -711,6 +742,7 @@ class StationMAEEncoder(nn.Module):
         factorised:           bool  = False,
         spatial_attn:         bool  = True,
         temporal_window:      int   = 0,
+        temporal_patch:       int   = 1,
         drop_path_rate:       float = 0.0,
         joint:                bool  = False,
         step_emb:             "nn.Module | None" = None,
@@ -719,6 +751,7 @@ class StationMAEEncoder(nn.Module):
 
         self.d_model         = d_model
         self.mask_ratio      = mask_ratio
+        self.temporal_patch  = int(temporal_patch)
         self.use_checkpoint  = use_checkpoint
         self.factorised      = factorised and not joint
         self.joint           = joint
@@ -830,6 +863,48 @@ class StationMAEEncoder(nn.Module):
             ])
 
         self.norm = nn.LayerNorm(d_model)
+
+        # ── Temporal patch merging (ViT / PatchTST / Swin patch-merge style) ────
+        # Groups P consecutive timesteps into ONE token, so the encoder sees
+        # W/P temporal positions instead of W.
+        #
+        # Why: with W=72 raw steps and windowed attention (tw=6) the newest token
+        # only reaches 4 h of the 12 h window after 8 layers — measurably too
+        # short. At P=6 the sequence is 12 tokens, and FULL attention over
+        # 12 x N_vis = 936 tokens costs ~0.88M score entries per layer versus
+        # ~2.6M for the windowed setup it replaces. Cheaper AND complete
+        # coverage from layer 1, which is why windowing is retired.
+        #
+        # Each merged token concatenates its P constituent embeddings and
+        # projects back to d_model, so the per-step positional / temporal
+        # embeddings survive the merge rather than being averaged away.
+        if self.temporal_patch > 1:
+            self.patch_norm  = nn.LayerNorm(self.temporal_patch * d_model)
+            self.patch_merge = nn.Linear(self.temporal_patch * d_model, d_model)
+        else:
+            self.patch_norm = self.patch_merge = None
+
+    def _patchify(self, t: torch.Tensor) -> torch.Tensor:
+        """
+        (B, W, N, D) -> (B, W/P, N, D), merging P consecutive timesteps.
+
+        The temporal axis is split into (W/P, P); the P embeddings for a given
+        station are concatenated along the feature axis and projected back to
+        d_model. Station and batch axes are untouched, so station masking (which
+        runs before this) is unaffected.
+        """
+        P = self.temporal_patch
+        if P <= 1:
+            return t
+        B, W, N, D = t.shape
+        assert W % P == 0, (
+            f"temporal_patch={P} must divide the window W={W} exactly. "
+            f"With W=72 the usable values are 1, 2, 3, 4, 6, 8, 9, 12, 18, 24, 36, 72."
+        )
+        t = t.reshape(B, W // P, P, N, D)          # split the time axis
+        t = t.permute(0, 1, 3, 2, 4)               # (B, W/P, N, P, D)
+        t = t.reshape(B, W // P, N, P * D)         # concat the P embeddings
+        return self.patch_merge(self.patch_norm(t))
 
     def _build_tokens(
         self,
@@ -966,6 +1041,13 @@ class StationMAEEncoder(nn.Module):
 
         # 2. Mask stations → visible_tokens: (B, W, N_vis, d_model)  [unflattened]
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
+
+        # 2b. Temporal patch merge: (B, W, N_vis, D) → (B, W/P, N_vis, D).
+        # Done AFTER masking so the station axis is already reduced — the merge
+        # then costs P·d² per surviving token rather than per original station.
+        # `tokens` (full, unpatched) is kept for input_context below, which needs
+        # the true last timestep rather than the last hour-patch.
+        visible_tokens = self._patchify(visible_tokens)
         B_sz, W_sz, N_vis, D = visible_tokens.shape
 
         # ── input_context for decoder cross-attention ──────────────────────
