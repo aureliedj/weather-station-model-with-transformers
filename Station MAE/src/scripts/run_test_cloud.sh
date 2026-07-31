@@ -34,7 +34,7 @@ CHECKPOINT="${PROJ_DIR}/checkpoints/full_run_cloud_v11/best.ckpt"
 # Save under a per-run subfolder — Test_Results_Exploration.ipynb expects
 # test_results/<run>/best_mr0.00/ (same layout as the LSTM's lstm-baseline-v1/).
 # Keep RUN_NAME in sync with the checkpoint being evaluated.
-RUN_NAME="v11"
+RUN_NAME="v12"
 # RUN_NAME="v9"          # ← when evaluating checkpoints/best.ckpt (v9, NLL)
 SAVE_DIR="${PROJ_DIR}/test_results/${RUN_NAME}"
 
