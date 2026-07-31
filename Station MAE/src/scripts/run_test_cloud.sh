@@ -79,7 +79,7 @@ STRIDE=9
 # GLOBAL_NORM="--global_norm"
 GLOBAL_NORM=""
 
-MASK_RATIOS="0.5"
+MASK_RATIOS="0.0"
 # MASK_RATIOS="0.5"                 # single ratio (faster)
 
 # The model is loaded ONCE; each ratio is a single forward sweep over the same
