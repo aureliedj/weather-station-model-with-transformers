@@ -447,7 +447,13 @@ _CACHE_FILENAME = "peakweather_obs_cache.pt"
 # Fast local cache  (numpy memmap — direct worker access, no IPC overhead)
 # ---------------------------------------------------------------------------
 
-_FAST_CACHE_VERSION = "v5"   # v5: includes log1p transform on precipitation
+# Bump whenever the CONTENT of a cached file would change: the cache stores
+# NORMALISED observations, so any change to the normalisation algorithm must
+# invalidate it or stale values are served silently.
+#   v5: log1p transform on precipitation
+#   v6: nearest-station stats for sparse (station,variable) pairs
+#       (previously the altitude-blind global fallback)
+_FAST_CACHE_VERSION = "v6"
 # Bump this when the on-disk format changes to force a rebuild.
 # v2: stores "all_valid_indices" (pre-mode pool) instead of post-stride
 #     "indices", so the windowing strategy can be changed without rebuilding.
@@ -458,15 +464,29 @@ _FAST_CACHE_VERSION = "v5"   # v5: includes log1p transform on precipitation
 #     normalised values.
 
 
-def _fast_split_paths(fast_dir: str, split: str, train_years: list) -> dict:
+def _fast_split_paths(fast_dir: str, split: str, train_years: list,
+                      per_station: bool = True,
+                      exclude_stations: "list | None" = None) -> dict:
     """
     Return a dict of expected file paths for one split's fast cache.
 
-    Files are keyed by split + training years so that different training
-    configurations (subset vs full) coexist in the same directory.
+    The key must contain EVERY input that changes the cached bytes, because the
+    files hold NORMALISED observations, not raw ones:
+
+      * split, train_years  — which rows, and which stats were fitted
+      * per_station         — per-station vs global normalisation produce
+                              completely different values. Sharing one file
+                              between the two silently mixes them, which is how
+                              tw6 and tw12 ended up incomparable earlier.
+      * exclude_stations    — changes N, so the arrays have a different shape
+
+    _FAST_CACHE_VERSION covers changes to the normalisation ALGORITHM itself.
     """
     years_key = "_".join(str(y) for y in sorted(train_years))
-    prefix    = f"{split}_{years_key}"
+    norm_key  = "ps" if per_station else "gl"
+    excl_key  = ("_x" + "-".join(sorted(str(e) for e in exclude_stations))
+                 ) if exclude_stations else ""
+    prefix    = f"{split}_{years_key}_{norm_key}{excl_key}"
     return {
         "obs":     os.path.join(fast_dir, f"{prefix}_obs.npy"),
         "mask":    os.path.join(fast_dir, f"{prefix}_mask.npy"),
@@ -489,6 +509,8 @@ def fast_cache_save(
     indices:         list,
     window_size:     int,
     max_delta_steps: int,
+    per_station:     bool = True,
+    exclude_stations: "list | None" = None,
 ) -> None:
     """
     Save split-specific normalised tensors as numpy .npy files.
@@ -503,7 +525,7 @@ def fast_cache_save(
     cache across all processes — zero duplication, no /dev/shm exhaustion.
     """
     os.makedirs(fast_dir, exist_ok=True)
-    paths = _fast_split_paths(fast_dir, split, train_years)
+    paths = _fast_split_paths(fast_dir, split, train_years, per_station, exclude_stations)
     print(f"[FastCache] Saving '{split}' split to {fast_dir} …", flush=True)
     t0 = time.time()
 
@@ -531,6 +553,8 @@ def fast_cache_load(
     fast_dir:    str,
     split:       str,
     train_years: list,
+    per_station: bool = True,
+    exclude_stations: "list | None" = None,
 ) -> "dict | None":
     """
     Load split-specific tensors as memory-mapped numpy arrays.
@@ -543,7 +567,7 @@ def fast_cache_load(
     read pages are served from the OS page cache shared across all worker
     processes; private writes go to a per-process in-memory buffer.
     """
-    paths = _fast_split_paths(fast_dir, split, train_years)
+    paths = _fast_split_paths(fast_dir, split, train_years, per_station, exclude_stations)
 
     if not all(os.path.exists(paths[k]) for k in paths):
         return None   # cache miss — caller will build from scratch
@@ -823,7 +847,9 @@ class StationMAEDataset(Dataset):
         # On Linux, /tmp is a tmpfs (RAM-backed), so reads are at memory speed.
         # ------------------------------------------------------------------
         if fast_cache_dir is not None:
-            cached = fast_cache_load(fast_cache_dir, split, effective_train_years)
+            cached = fast_cache_load(fast_cache_dir, split, effective_train_years,
+                                     per_station=per_station,
+                                     exclude_stations=exclude_stations)
 
             # Validate: cache must be built for the same window / horizon
             _cache_ok = (
@@ -1089,6 +1115,10 @@ class StationMAEDataset(Dataset):
                 indices       = all_valid,       # ← pre-mode pool, not post-mode
                 window_size   = window_size,
                 max_delta_steps = self.max_delta_steps,
+                # Must match the load key exactly, or the file is written under
+                # one name and looked up under another (silent cache miss).
+                per_station      = per_station,
+                exclude_stations = exclude_stations,
             )
 
         # ── Station exclusion (normal build path) ─────────────────────────────
