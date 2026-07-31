@@ -1,45 +1,52 @@
-# ── Package indexes ──────────────────────────────────────────────────────────
-# The +cu128 build of torch is NOT published on PyPI — it exists only on
-# PyTorch's own index. Declaring that index HERE means a plain
-#     pip install -r requirements.txt
-# works on Renku. Previously this needed an --extra-index-url flag on the
-# command line, and forgetting it produced the misleading error
-#     ERROR: Could not find a version that satisfies torch==2.13.0+cu128
-#            (from versions: 2.5.0, … 2.13.0)
-# — that version list is PyPI's, which never contains local "+cuXXX" tags.
---extra-index-url https://download.pytorch.org/whl/cu128
-
 peakweather @ git+https://github.com/MeteoSwiss/PeakWeather.git@28a28c2d17f47b8bf33f22ee62fc92adac9b4778
 
-# Core deep learning
-# Linux (Renku): the CUDA 12.8 build.
-#   History: this pin exists because an EARLIER Renku node had a driver that
-#   topped out below 12.8, so the default PyPI wheel (cu130) failed CUDA init
-#   and fell back to CPU silently.
-#   As of 2026-07-31 the node reports driver 580.159.04 / CUDA 13.0, which is
-#   NEWER than 12.8. Drivers are backward compatible, so cu128 still works, and
-#   the pin is kept because it is known-good. If you ever want to simplify, the
-#   default PyPI wheel should now also work on this driver — verify with
-#   scripts/verify_env.py before trusting it, and only change it between runs,
-#   never mid-experiment.
-# macOS (local): plain build (MPS/CPU; no CUDA-variant wheels exist).
-# After installing, run scripts/verify_env.py — a silent CPU fallback looks
-# exactly like a working install until a 3-day training run finishes.
-torch==2.13.0+cu128; sys_platform == "linux"
-torch==2.13.0;       sys_platform == "darwin"
+# ── Core deep learning ───────────────────────────────────────────────────────
+# Install with a plain:   pip install -r requirements.txt
+#
+# History of this pin (read before changing it)
+# ---------------------------------------------
+# This file used to pin `torch==2.13.0+cu128`, which DOES NOT EXIST. PyTorch's
+# cu128 index stops at 2.11.0+cu128 — from 2.12 onwards the builds moved to a
+# newer CUDA. The pin was unsatisfiable on any index, which is why installs
+# failed with the misleading "Could not find a version that satisfies".
+#
+# The reason a CUDA-12.8 build was wanted at all is also gone: an earlier Renku
+# node had a driver that topped out below 12.8, so the default PyPI wheel failed
+# CUDA init and fell back to CPU silently. As of 2026-07-31 the node reports
+#     driver 580.159.04, CUDA 13.0, A100-80GB MIG 3g.20gb (19,968 MiB, 28 SMs)
+# which is NEWER than the wheel needs, so the stock PyPI wheel works.
+#
+# ALWAYS run `python src/scripts/verify_env.py` after installing. A CUDA/driver
+# mismatch does not raise — it silently trains on CPU, and you find out days later.
+torch==2.13.0; sys_platform == "linux"
+torch==2.13.0; sys_platform == "darwin"      # macOS: MPS/CPU, no CUDA variants
 
-# Training framework + experiment tracking
+# ── Fallback: older driver that cannot run the stock wheel ───────────────────
+# If verify_env.py reports cuda.is_available() == False, the driver is older
+# than the wheel's CUDA. Check `nvidia-smi` (top-right "CUDA Version") and
+# install the matching build explicitly — do NOT put an --extra-index-url in
+# this file, as it makes pip resolve plain versions ambiguously across indexes:
+#
+#   CUDA 12.8 driver:
+#     pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu128
+#   CUDA 12.6 driver:
+#     pip install "torch==2.11.0" --index-url https://download.pytorch.org/whl/cu126
+#
+# Then re-run verify_env.py. Pin whatever works back into this file so the
+# environment is reproducible.
+
+# ── Training framework + experiment tracking ─────────────────────────────────
 pytorch-lightning>=2.2
 wandb>=0.17
 
-# Data handling
+# ── Data handling ────────────────────────────────────────────────────────────
 numpy>=1.24
 pandas>=2.0
 
-# Geospatial (station map visualisation)
+# ── Geospatial (station map visualisation) ───────────────────────────────────
 geopandas>=0.14
 rioxarray>=0.15
 matplotlib>=3.7
 
-# Notebooks
+# ── Notebooks ────────────────────────────────────────────────────────────────
 jupyterlab>=4.0
