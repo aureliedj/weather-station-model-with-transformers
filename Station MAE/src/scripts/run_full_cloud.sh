@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# run_v13_cloud.sh — PATCHED encoder: P=6, full attention, d_model=512, 16 layers
+# run_full_cloud.sh — full training run, A100 80GB PCIe (MIG 3g.20gb)
+#
+# CURRENT CONFIG (v13): patched encoder — P=6, full attention, d_model=512,
+# 16 layers. The v9/v11/v12 settings are kept as commented alternatives.
 #
 # Hardware context
 # ----------------
@@ -49,8 +52,7 @@
 #   ./run_full_cloud.sh   (Lightning restores from last.ckpt automatically)
 #
 # Usage:
-#   chmod +x run_full_cloud.sh
-#   ./run_full_cloud.sh
+#   bash src/scripts/run_full_cloud.sh
 
 # ═══════════════════════════════════════════════════════════════════════════
 # WHAT CHANGED vs v12, AND WHY

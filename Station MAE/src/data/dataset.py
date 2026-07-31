@@ -848,7 +848,7 @@ class StationMAEDataset(Dataset):
         # ------------------------------------------------------------------
         if fast_cache_dir is not None:
             cached = fast_cache_load(fast_cache_dir, split, effective_train_years,
-                                     per_station=per_station,
+                                     per_station=not global_norm,
                                      exclude_stations=exclude_stations)
 
             # Validate: cache must be built for the same window / horizon
@@ -1117,7 +1117,7 @@ class StationMAEDataset(Dataset):
                 max_delta_steps = self.max_delta_steps,
                 # Must match the load key exactly, or the file is written under
                 # one name and looked up under another (silent cache miss).
-                per_station      = per_station,
+                per_station      = not global_norm,
                 exclude_stations = exclude_stations,
             )
 
