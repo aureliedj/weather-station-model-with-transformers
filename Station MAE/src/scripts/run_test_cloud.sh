@@ -85,13 +85,16 @@ MASK_RATIOS="0.5"
 # The model is loaded ONCE; each ratio is a single forward sweep over the same
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
 # 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
-# batch_size 2: the flat d1024 encoder at W=72, N=155 is memory-hungry even in
-# bf16; batch 8 fp32 OOMs on an 8 GB MIG slice. Throughput is data-loading
-# bound anyway, so small batches cost little. Raise to 8 on a 20 GB partition.
+# batch_size: the flat d1024 encoder at W=72, N=155 is memory-hungry even in
+# bf16. 4 was tuned for an 8 GB MIG slice; the node is now a 20 GB slice
+# (A100-80GB, MIG, 19968 MiB), so 8 fits comfortably. Inference batch size
+# affects speed and memory only — predictions are identical either way.
+# Drop back to 4 if you land on a smaller slice again; verify_env.py reports
+# the free VRAM and suggests a value.
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       4 \
+    --batch_size       8 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --stride           "$STRIDE" \

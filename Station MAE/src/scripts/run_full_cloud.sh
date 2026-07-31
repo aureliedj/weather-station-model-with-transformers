@@ -194,6 +194,23 @@ INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly str
 #
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Batch size (reviewed 2026-07-31) ─────────────────────────────────────────
+# LEFT AT 4 x 4 = effective batch 16, deliberately.
+#
+# The slice (A100-80GB MIG 3g.20gb, 19,968 MiB, 28/108 SMs) is the same one
+# these settings were tuned on, and this run already uses --grad_checkpoint
+# *because* 20 GB is tight. Training memory is dominated by activations and
+# optimizer state, so doubling batch_size here is a real OOM risk — and an OOM
+# several hours into a multi-day run is expensive.
+#
+# If you want the speedup, 8 x 2 keeps the EFFECTIVE batch at 16, so the
+# optimisation problem is unchanged and the run stays comparable to v9/v11/v12:
+#     --batch_size 8 --accumulate_grad_batches 2
+# Test it first with --epochs 1 --random_epoch_size 200 and watch nvidia-smi.
+# Never raise the effective batch itself without revisiting the learning rate.
+#
+# Inference is different: test.py holds no activations or optimizer state, so
+# run_test_cloud.sh is safe at batch_size 8 on this slice.
 python main.py \
     --data_root        "$DATA_ROOT" \
     --cache_dir        "$DATA_ROOT" \
