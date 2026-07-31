@@ -40,7 +40,7 @@ SAVE_DIR="${SCRIPT_DIR}/test_results/${RUN_NAME}"
 # sliding: all overlapping windows (~105k)  — slow, most stable — for final paper metrics
 # Rolling-origin evaluation: sliding windows every STRIDE steps (9 = 90 min = 1h30).
 INDEX_MODE="sliding"
-STRIDE=18
+STRIDE=9
 # INDEX_MODE="blocks"   # fast non-overlapping alternative
 
 # ── Mask ratio sweep ──────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ STRIDE=18
 # GLOBAL_NORM="--global_norm"
 GLOBAL_NORM=""
 
-MASK_RATIOS="0.0"
+MASK_RATIOS="0.0 0.5"
 # MASK_RATIOS="0.5"                 # single ratio (faster)
 
 # The model is loaded ONCE; each ratio is a single forward sweep over the same
