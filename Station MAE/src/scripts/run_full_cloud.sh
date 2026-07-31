@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# run_full_cloud.sh — optimised full training run for A100 80GB PCIe (MIG 3g.20gb)
+# run_v13_cloud.sh — PATCHED encoder: P=6, full attention, d_model=512, 16 layers
 #
 # Hardware context
 # ----------------
@@ -52,6 +52,48 @@
 #   chmod +x run_full_cloud.sh
 #   ./run_full_cloud.sh
 
+# ═══════════════════════════════════════════════════════════════════════════
+# WHAT CHANGED vs v12, AND WHY
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# 1. TEMPORAL PATCHING  --temporal_patch 6   (was: none)
+#    Six consecutive 10-min steps become ONE token, so the encoder sees 12
+#    temporal positions instead of 72.
+#    Motivation: measured receptive field. At W=72 with tw=6 windowed attention
+#    and 8 layers, the NEWEST token could only reach 4 h of the 12 h window.
+#    Full coverage would have needed 12 layers.
+#
+# 2. WINDOWING RETIRED  --temporal_window 0  (was: 6)
+#    Windowing only existed to make 72x78 = 5,616 tokens affordable. After
+#    patching there are 12x78 = 936, and FULL attention over those costs
+#    ~0.88M score entries per layer versus ~2.63M for the windowed setup.
+#    Cheaper AND every token sees the whole window from layer 1.
+#    It also removes the unmasked circular shift (see encoder.py) that let
+#    t=71 attend to t=0 in v9/v11/v12.
+#
+# 3. d_model 1024 -> 512, enc_layers 8 -> 16
+#    Attention/FFN cost scales as d^2, so halving d buys 4x the layers at equal
+#    FLOPs. Depth is what the receptive-field analysis said was missing.
+#    No information bottleneck: each patched token carries 6 steps x 6 vars =
+#    36 numbers, so 512 is still a ~14x expansion.
+#
+# 4. REGULARISATION REMOVED  --dropout 0.0 --drop_path_rate 0.0  (was 0.1/0.1)
+#    v12 added dropout, drop-path and early stopping to a model whose problem
+#    is that it IGNORES its inputs and predicts the conditional mean. Those are
+#    all anti-overfitting measures applied to an underfitting failure — they
+#    push the model further toward the mean. Removed until it can beat
+#    persistence; re-introduce only if a genuine train/val gap appears.
+#
+# 5. OverfitEarlyStop now respects warmup (fixed in main.py).
+#    v12 ran --overfit_patience 5 against --warmup_epochs 15, so it could stop
+#    before the LR ever reached peak. v12's result should be treated as void.
+#
+# 6. Nearest-station normalisation for sparse (station,variable) pairs
+#    (data/dataset.py). GES pressure has ZERO training observations and used to
+#    borrow the altitude-blind GLOBAL mean; it now borrows from the nearest
+#    station at a comparable elevation.
+# ═══════════════════════════════════════════════════════════════════════════
+
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
@@ -67,7 +109,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v12"   # own dir — don't overwrite v10's best.ckpt/last.ckpt (also avoids auto-resume from v10's last.ckpt)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v13"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB: offline on Renku ──────────────────────────────────────────────────
@@ -122,8 +164,8 @@ ENCODER=""                                         # flat self-attention over W�
 #   Full cross-station attention within each tw×N_vis chunk.
 #   W=72, tw=6, N_vis≈65 → 390 tokens/chunk  (144× cheaper than full flat)
 #
-TEMPORAL_WINDOW="--temporal_window 6"
-# TEMPORAL_WINDOW="--temporal_window 12"  # previous setting
+TEMPORAL_WINDOW="--temporal_window 0"   # windowing retired — patching replaces it
+# TEMPORAL_WINDOW="--temporal_window 6"   # v9/v11/v12 setting (unmasked shift!)
 # TEMPORAL_WINDOW=""   # ← disable windowing (full attention)
 
 # ── Window sampling strategy ──────────────────────────────────────────────────
@@ -220,17 +262,18 @@ python main.py \
     --delta_mode       fixed_grid \
     --delta_grid_stride 3 \
     --mlp_ratio        4.0 \
-    --d_model          1024 \
-    --enc_heads        16 \
-    --dec_heads        16 \
-    --enc_layers       8 \
+    --d_model          512 \
+    --enc_heads        8 \
+    --dec_heads        8 \
+    --enc_layers       16 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
-    --dropout          0.1 \
-    --drop_path_rate   0.1 \
+    --temporal_patch   6 \
+    --dropout          0.0 \
+    --drop_path_rate   0.0 \
     --batch_size       4 \
     --num_workers      3 \
-    --epochs           300 \
+    --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    15 \
     --weight_decay     0.05 \
@@ -252,7 +295,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   tw6-d1024-v12 \
+    --wandb_run_name   patch6-d512-L16-v13 \
     --save_dir         "$SAVE_DIR"
 # WandB runs ONLINE (default). If Renku blocks outbound connections, add
 # --wandb_offline above and sync later with: wandb sync <run-dir>
