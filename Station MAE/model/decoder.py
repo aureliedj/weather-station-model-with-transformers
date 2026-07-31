@@ -214,6 +214,7 @@ class StationMAEDecoder(nn.Module):
         input_context_cross_attn: bool = False,
         predict_uncertainty:      bool = False,
         window_size:              int  = 72,
+        step_emb:                 "nn.Module | None" = None,
     ):
         super().__init__()
 
@@ -267,10 +268,20 @@ class StationMAEDecoder(nn.Module):
         # (no aliasing: "step 6 in the encoder" ≠ "step 6 in the decoder"),
         # and gives the model a common positional reference that complements
         # DeltaTimeEmbedding's continuous-hours signal with a discrete step count
-        # calibrated to the window scale.  The Fourier basis (log-spaced
-        # wavelengths 1..max_steps) is identical to the encoder's step_emb so
-        # that encoder and decoder positions are represented in the same space.
-        self.step_emb     = StepIndexEmbedding(d_model=d_model, dropout=dropout)
+        # calibrated to the window scale.
+        #
+        # This module instance is shared with the encoder (passed in from
+        # StationMAE, see mae.py) rather than built as a separate copy. The
+        # decoder's fixed_grid horizons only touch a sparse subset of indices
+        # past W-1 (e.g. stride-3 → 74, 77, ..., 107 for W=72), overlapping the
+        # encoder's dense 0..W-1 range at exactly one point (W-1, delta=0).
+        # Two independently-constructed StepIndexEmbedding instances would only
+        # share their fixed Fourier frequencies, not their trained MLP weights,
+        # so "encoder step k" and "decoder step k" would silently diverge during
+        # training. Sharing the instance makes them provably identical instead.
+        # Falls back to its own instance when used standalone.
+        self.step_emb = step_emb if step_emb is not None else \
+            StepIndexEmbedding(d_model=d_model, dropout=dropout)
 
         # --- Post-assembly normalisation for station query tokens ---
         # Applied after summing mask_token + spatial + temporal + delta,

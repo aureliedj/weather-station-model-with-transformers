@@ -713,6 +713,7 @@ class StationMAEEncoder(nn.Module):
         temporal_window:      int   = 0,
         drop_path_rate:       float = 0.0,
         joint:                bool  = False,
+        step_emb:             "nn.Module | None" = None,
     ):
         super().__init__()
 
@@ -746,11 +747,21 @@ class StationMAEEncoder(nn.Module):
         # s — Step-index positional embedding (within-window relative order).
         # Encodes the INTEGER step index 0..W-1 so the model knows WHERE each
         # token sits inside the 72-step (12 h) input window, independently of
-        # the absolute time encoded by temporal_emb.  Consistent with the
-        # decoder's step_emb: the same Fourier basis is used so that
-        # "encoder step k" and "decoder output at delta_step k" share the same
-        # sinusoidal features before their respective MLP projections.
-        self.step_emb = StepIndexEmbedding(d_model=d_model, dropout=dropout)
+        # the absolute time encoded by temporal_emb.
+        #
+        # Shared with the decoder: the decoder's forecast horizons only cover a
+        # sparse subset of the unified step timeline (e.g. stride-3 → indices
+        # 74, 77, ..., 107 for W=72), so most step indices past W-1 are never
+        # visited by either side except at the single boundary point W-1
+        # (delta=0). A separate StepIndexEmbedding per module would only share
+        # its fixed Fourier frequencies, not its trained MLP projection weights
+        # — "encoder step k" and "decoder step k" would drift apart during
+        # training despite the docstring's intent. Passing the SAME module
+        # instance in from StationMAE (see mae.py) makes the two genuinely
+        # identical rather than coincidentally similar. Falls back to building
+        # its own instance when used standalone (e.g. tests, notebooks).
+        self.step_emb = step_emb if step_emb is not None else \
+            StepIndexEmbedding(d_model=d_model, dropout=dropout)
 
         # --- Post-assembly normalisation ---
         # Applied after summing var_proj + spatial_emb + temporal_emb to keep

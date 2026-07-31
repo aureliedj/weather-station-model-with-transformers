@@ -55,6 +55,7 @@ from .embeddings import (
     NUM_VARIABLES,
     NUM_TARGET_VARIABLES,
     TEMPORAL_FOURIER_DIM,
+    StepIndexEmbedding,
 )
 
 
@@ -239,6 +240,14 @@ class StationMAE(nn.Module):
         self.huber_delta = 1.0   # Huber δ in normalised space (= 1 std-dev)
         # Huber is applied to ALL variables (not just wind) — see _supervised_loss.
 
+        # Shared step-index embedding — one instance, passed to both encoder and
+        # decoder, so "encoder step k" and "decoder step k" are provably the
+        # same vector rather than two independently-trained approximations of
+        # the same idea. See StepIndexEmbedding usage notes in encoder.py /
+        # decoder.py for why this needs to be a shared instance, not just a
+        # matching Fourier-basis formula.
+        shared_step_emb = StepIndexEmbedding(d_model=d_model, dropout=dropout)
+
         self.encoder = StationMAEEncoder(
             d_model=d_model,
             num_heads=enc_heads,
@@ -254,6 +263,7 @@ class StationMAE(nn.Module):
             temporal_window=temporal_window,
             drop_path_rate=drop_path_rate,
             joint=joint_encoder,
+            step_emb=shared_step_emb,
         )
 
         self.decoder = StationMAEDecoder(
@@ -271,6 +281,7 @@ class StationMAE(nn.Module):
             input_context_cross_attn=input_context_cross_attn,
             predict_uncertainty=use_nll_loss,
             window_size=window_size,
+            step_emb=shared_step_emb,
         )
 
     # ------------------------------------------------------------------
