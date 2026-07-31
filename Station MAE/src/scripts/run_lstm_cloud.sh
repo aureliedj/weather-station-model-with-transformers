@@ -28,9 +28,9 @@ cd "${SRC_DIR}"                                              # so `python main.p
 
 # WandB offline on Renku (flaky egress falsely marks runs "crashed"; training is
 # unaffected). Backfill later: wandb sync "$(ls -dt wandb/run-* | head -1)"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+source "${SCRIPT_DIR}/_wandb_preflight.sh"
 
-RUN_NAME="lstm-baseline-v1"
+RUN_NAME="lstm-baseline-v2"
 SAVE_DIR="${PROJ_DIR}/checkpoints/${RUN_NAME}"
 
 EXCLUDE="--exclude_stations PFA"   # same station dropped as the transformer
@@ -57,7 +57,8 @@ HUBER_DELTA=1.0
 VAR_WEIGHTS="1.0 1.0 1.0 1.0 1.0"   # [temp, pressure, humidity, wind_u, wind_v]
 
 # ── Window sampling: same random-window scheme as the transformer ──────────────
-INDEX_MODE="--index_mode random --random_epoch_size 10000"
+# INDEX_MODE="--index_mode random --random_epoch_size 10000"
+INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly stride
 
 # ── Optimizer: adamw (default) or rmsprop (classic for RNNs — supervisor's link) ─
 OPTIMIZER="adamw"

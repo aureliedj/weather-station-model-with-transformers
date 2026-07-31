@@ -89,6 +89,10 @@ SPATIAL_FEATURE_NAMES = [
     "WE_DERIVATIVE_10000M_SIGRATIO1",
 ]
 
+# Donor-similarity weighting (see normalise_observations).
+SIM_HEIGHT_IDX    = slice(6, 8)   # station_height, dem in the 15-d spatial vector
+SIM_HEIGHT_WEIGHT = 3.0           # elevation counts 3x a terrain descriptor
+
 TRAIN_YEARS = list(range(2017, 2022))   # 2017–2021
 VAL_YEARS   = [2022]
 TEST_YEARS  = [2023, 2024]
@@ -222,7 +226,7 @@ def normalise_observations(
     coords:       "torch.Tensor | None" = None,
     station_ids:  "list | None" = None,
     alt_km_per_m: float = 0.2,
-    verbose:      bool = True,
+    verbose:      bool = False,
 ) -> tuple[torch.Tensor, dict]:
     """
     Normalise each (station, variable) pair to zero-mean unit-variance using
@@ -291,6 +295,13 @@ def normalise_observations(
     # values) for stations that were inactive during the training period.
     MIN_OBS = 50
 
+    # Donor similarity is measured in the z-scored spatial-feature space built by
+    # build_spatial_features(): [easting, northing, sin/cos aspect x2,
+    # station_height, dem, TPI, slope x2, SN/WE derivatives x2] = 15 dims.
+    # Elevation (station_height, dem -> indices 6,7) is up-weighted because it
+    # governs pressure (~12 hPa/100 m) and temperature (~0.65 degC/100 m); the
+    # terrain descriptors matter, but far less.
+
     raw_count = mask.sum(dim=0)                                    # (N, V) unclipped
     count     = raw_count.clamp(min=1.0)
 
@@ -318,19 +329,28 @@ def normalise_observations(
     if _sparse.any():
         n_bad = int(_sparse.sum())
         if coords is None:
-            if verbose:
-                print(f"  [norm] {n_bad} sparse (station,variable) pair(s); no coords "
-                      f"supplied → GLOBAL fallback (altitude-blind, see docstring)")
+            print(f"  [norm] {n_bad} sparse (station,variable) pair(s) but no station "
+                  f"features supplied → global stats used (worse; see docstring)")
             means = torch.where(_sparse, _g_mean.unsqueeze(0).expand_as(means), means)
             stds  = torch.where(_sparse, _g_std.unsqueeze(0).expand_as(stds),   stds)
             donor = torch.where(_sparse, torch.full_like(donor, -2), donor)
         else:
-            c   = coords.to(torch.float64)
-            # horizontal distance in km + altitude penalty in km-equivalent
-            dxy = torch.cdist(c[:, :2], c[:, :2]) / 1000.0            # (N, N) km
-            dz  = (c[:, 2:3] - c[:, 2:3].T).abs() * alt_km_per_m      # (N, N) km-equiv
-            dist = torch.sqrt(dxy ** 2 + dz ** 2)
-            dist.fill_diagonal_(float("inf"))                         # never self
+            c = coords.to(torch.float64)
+            if c.shape[1] == 3:
+                # Legacy path: raw easting[m], northing[m], height[m].
+                dxy  = torch.cdist(c[:, :2], c[:, :2]) / 1000.0        # (N, N) km
+                dz   = (c[:, 2:3] - c[:, 2:3].T).abs() * alt_km_per_m  # km-equivalent
+                dist = torch.sqrt(dxy ** 2 + dz ** 2)
+            else:
+                # Similarity over the full station character: z-scored spatial
+                # features (position, elevation, DEM, slope, aspect, TPI, …) with
+                # elevation up-weighted, since it drives pressure and temperature
+                # far more than the terrain descriptors do.
+                w = torch.ones(c.shape[1], dtype=torch.float64)
+                w[:SIM_HEIGHT_IDX.start] = 1.0
+                w[SIM_HEIGHT_IDX] = SIM_HEIGHT_WEIGHT
+                dist = torch.cdist(c * w, c * w)
+            dist.fill_diagonal_(float("inf"))                          # never self
 
             subs = []
             for v in range(V):
@@ -354,16 +374,14 @@ def normalise_observations(
                                  float(c[i, 2] - c[j, 2]), int(raw_count[i, v])))
 
             if verbose and subs:
-                _nm = (lambda k: str(station_ids[k])) if station_ids else (lambda k: f"#{k}")
-                print(f"  [norm] {len(subs)} sparse (station,variable) pair(s) "
-                      f"→ nearest-donor stats:")
-                for i, j, v, d, dzm, nobs in subs:
-                    print(f"           {_nm(i):>6}.{VARIABLE_NAMES[v]:<13} "
-                          f"n_obs={nobs:<5} ← {_nm(j):>6}  "
-                          f"({d:5.1f} km-equiv, Δalt {dzm:+.0f} m)")
+                print(f"  [norm] {len(subs)} sparse (station,variable) pair(s) took "
+                      f"stats from their most similar station")
             _still = int((donor == -2).sum())
-            if verbose and _still:
-                print(f"  [norm] {_still} pair(s) had no donor at all → global fallback")
+            if _still:
+                # This one is always worth saying: it means the variable is
+                # missing network-wide, so the fallback really is global.
+                print(f"  [norm] {_still} (station,variable) pair(s) had no donor "
+                      f"anywhere → global stats used")
 
     stds = stds.clamp(min=1e-6)
 
@@ -412,22 +430,21 @@ def compute_obs_stats(
 
     # Station geometry, so sparse (station, variable) pairs can borrow stats from
     # the nearest comparable station instead of the altitude-blind global mean.
+    # Full z-scored station character — position, elevation, DEM, slope, aspect,
+    # TPI — so a station with too little training data borrows from the station
+    # it most resembles, not from a network-wide average that describes nowhere.
     coords, station_ids = None, None
     try:
-        _st = ds.stations_table
-        coords = torch.tensor(
-            _st[["swiss_easting", "swiss_northing", "station_height"]]
-            .astype(float).to_numpy(),
-            dtype=torch.float64,
-        )                                                   # (N, 3)
-        station_ids = _st.index.tolist()
-        if coords.shape[0] != obs_train.shape[1]:           # never silently misalign
+        coords, _ = build_spatial_features(ds)               # (N, 15), z-scored
+        coords = coords.to(torch.float64)
+        station_ids = ds.stations_table.index.tolist()
+        if coords.shape[0] != obs_train.shape[1]:            # never silently misalign
             print(f"  [norm] stations_table has {coords.shape[0]} rows but obs has "
-                  f"{obs_train.shape[1]} stations — skipping nearest-donor lookup")
+                  f"{obs_train.shape[1]} stations — similar-station lookup disabled")
             coords, station_ids = None, None
     except Exception as e:                                   # noqa: BLE001
-        print(f"  [norm] could not read station coordinates ({type(e).__name__}) — "
-              f"nearest-donor lookup disabled")
+        print(f"  [norm] could not build station features ({type(e).__name__}) — "
+              f"similar-station lookup disabled")
 
     _, stats = normalise_observations(
         obs_train, mask_train, per_station=per_station,

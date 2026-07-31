@@ -59,7 +59,15 @@ def build(n_stations=6, T=500, seed=0):
     obs[:, 5, PRESSURE] = 0.0
     mask[:, 5, PRESSURE] = 0.0
 
-    coords = torch.tensor(np.stack([east, north, hgt], axis=1), dtype=torch.float64)
+    # z-scored 15-d spatial vector, matching build_spatial_features() layout:
+    # [east, north, sin/cos aspect x2, station_height, dem, TPI, slope x2, deriv x4]
+    slope = np.array([2., 30., 3., 18., 2.5, 2.])
+    raw = np.zeros((n_stations, 15))
+    raw[:, 0], raw[:, 1] = east, north
+    raw[:, 6], raw[:, 7] = hgt, hgt
+    raw[:, 9], raw[:, 10] = slope, slope
+    sd = raw.std(0); sd[sd < 1e-9] = 1.0
+    coords = torch.tensor((raw - raw.mean(0)) / sd, dtype=torch.float64)
     ids = ["S0", "S1_HIGH", "S2_FAR", "S3_MID", "S4_NEAR", "S5_SPARSE"]
     return torch.tensor(obs), torch.tensor(mask), coords, ids, hgt
 
@@ -67,10 +75,11 @@ def build(n_stations=6, T=500, seed=0):
 obs, mask, coords, ids, hgt = build()
 
 print("=" * 72)
-print("WITH coords -> nearest-donor substitution")
+print("WITH station features -> most-similar-station substitution")
 print("=" * 72)
 _, stats = normalise_observations(obs, mask, per_station=True,
-                                  coords=coords, station_ids=ids)
+                                  coords=coords, station_ids=ids,
+                                  verbose=True)
 donor = stats["donor"]
 d = int(donor[5, PRESSURE])
 print(f"\nstation 5 pressure donor = {d} ({ids[d] if d >= 0 else 'GLOBAL' })")

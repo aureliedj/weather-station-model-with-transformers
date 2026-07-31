@@ -114,14 +114,17 @@ cd "${SRC_DIR}"                                              # so `python main.p
 SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v13"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
-# ── WandB: offline on Renku ──────────────────────────────────────────────────
-# Renku egress is unreliable: when heartbeats drop for a few minutes the wandb
-# server marks the run "crashed" (stuck at the last epoch it received) while
-# training continues normally. Offline mode logs everything locally instead.
-# Backfill the dashboard any time with:
+# ── WandB ────────────────────────────────────────────────────────────────────
+# Defaults to ONLINE and prompts for `wandb login` if no credential is present,
+# so a run never silently produces an empty dashboard.
+#
+# Caveat kept from earlier: Renku egress can drop for minutes at a time, and the
+# wandb server then marks the run "crashed" (frozen at the last epoch it
+# received) even though training continues normally. If that happens, re-launch
+# with WANDB_MODE=offline and sync afterwards:
+#   WANDB_MODE=offline bash src/scripts/run_full_cloud.sh
 #   wandb sync "$(ls -dt wandb/run-* | head -1)"
-# Override for a live run: WANDB_MODE=online ./run_full_cloud.sh
-export WANDB_MODE="${WANDB_MODE:-offline}"
+source "${SCRIPT_DIR}/_wandb_preflight.sh"
 
 # ── Station exclusion ────────────────────────────────────────────────────────
 # Drop stations with insufficient historical coverage before training.
