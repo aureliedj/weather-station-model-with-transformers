@@ -1,11 +1,22 @@
+# ── Package indexes ──────────────────────────────────────────────────────────
+# The +cu128 build of torch is NOT published on PyPI — it exists only on
+# PyTorch's own index. Declaring that index HERE means a plain
+#     pip install -r requirements.txt
+# works on Renku. Previously this needed an --extra-index-url flag on the
+# command line, and forgetting it produced the misleading error
+#     ERROR: Could not find a version that satisfies torch==2.13.0+cu128
+#            (from versions: 2.5.0, … 2.13.0)
+# — that version list is PyPI's, which never contains local "+cuXXX" tags.
+--extra-index-url https://download.pytorch.org/whl/cu128
+
 peakweather @ git+https://github.com/MeteoSwiss/PeakWeather.git@28a28c2d17f47b8bf33f22ee62fc92adac9b4778
 
 # Core deep learning
 # Linux (Renku): pin the CUDA 12.8 build — the host driver supports CUDA 12.8,
 # and the default PyPI wheel (cu130) fails CUDA init → silent CPU fallback.
-# Install on Renku with:
-#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu128
 # macOS (local): plain build (MPS/CPU; no CUDA-variant wheels exist).
+# After installing, run scripts/verify_env.py — a silent CPU fallback looks
+# exactly like a working install until a 3-day training run finishes.
 torch==2.13.0+cu128; sys_platform == "linux"
 torch==2.13.0;       sys_platform == "darwin"
 
