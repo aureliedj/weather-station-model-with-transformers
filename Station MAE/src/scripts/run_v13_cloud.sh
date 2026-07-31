@@ -273,7 +273,7 @@ python main.py \
     --drop_path_rate   0.0 \
     --batch_size       4 \
     --num_workers      3 \
-    --epochs           300 \
+    --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    15 \
     --weight_decay     0.05 \
