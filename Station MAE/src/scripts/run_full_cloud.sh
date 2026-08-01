@@ -277,9 +277,9 @@ INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly str
 # continue) but it means patience alone will not protect a resumed run --
 # set --overfit_patience appropriately.
 RESUME="${RESUME:-1}"
-RESUME_ARG=""
+RESUME_ARG=()   # array, NOT a string: the project path contains a space
 if [[ "$RESUME" == "1" && -f "${SAVE_DIR}/last.ckpt" ]]; then
-    RESUME_ARG="--resume ${SAVE_DIR}/last.ckpt"
+    RESUME_ARG=(--resume "${SAVE_DIR}/last.ckpt")
     echo "[resume] continuing from ${SAVE_DIR}/last.ckpt"
     python - "$SAVE_DIR" <<'PYEOF'
 import sys, os, torch
@@ -345,7 +345,7 @@ python main.py \
     $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   patch6-d512-L16-v13 \
-    $RESUME_ARG \
+    ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
 # WandB runs ONLINE (default). If Renku blocks outbound connections, add
 # --wandb_offline above and sync later with: wandb sync <run-dir>
