@@ -79,22 +79,28 @@ STRIDE=9
 # GLOBAL_NORM="--global_norm"
 GLOBAL_NORM=""
 
-MASK_RATIOS="0.0 0.5"
+MASK_RATIOS="0.5 0.0"   # mr0.50 FIRST: it is the trained setting and gives
+                        # skill-vs-persistence + the Delta=0 number. mr0.00 is
+                        # only needed for the masking comparison in notebook S1,
+                        # so if you have to kill the run you keep what matters.
 # MASK_RATIOS="0.5"                 # single ratio (faster)
 
 # The model is loaded ONCE; each ratio is a single forward sweep over the same
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
 # 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
-# batch_size: the flat d1024 encoder at W=72, N=155 is memory-hungry even in
-# bf16. 4 was tuned for an 8 GB MIG slice; the node is now a 20 GB slice
-# (A100-80GB, MIG, 19968 MiB), so 8 fits comfortably. Inference batch size
-# affects speed and memory only — predictions are identical either way.
-# Drop back to 4 if you land on a smaller slice again; verify_env.py reports
-# the free VRAM and suggests a value.
+# batch_size: inference keeps no optimiser state and no activations, so it can
+# run far larger batches than training. 32 on the 20 GB slice.
+#
+# Why this matters here: at mask_ratio=0.00 NOTHING is masked, so the encoder
+# carries all 155 stations instead of the ~78 it sees during training —
+# 12x155 = 1,860 tokens vs 936, i.e. 4x the attention cost of any training
+# step, on 11,684 windows. That is what made the first attempt quote ~3 h.
+# Predictions are bit-identical at any batch size; only speed changes.
+# Drop to 8 if mr0.00 OOMs (it is the heaviest configuration this runs).
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       8 \
+    --batch_size       32 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --stride           "$STRIDE" \
@@ -106,5 +112,5 @@ python test.py \
     --save_dir         "$SAVE_DIR"
 
 echo ""
-echo "Done. Predictions at: ${SAVE_DIR}/best_mr0.00/ and best_mr0.50/"
+echo "Done. Predictions under: ${SAVE_DIR}/  (one dir per mask ratio: ${MASK_RATIOS})"
 echo "Compute all metrics in Test_Results_Exploration.ipynb."

@@ -913,6 +913,31 @@ def main() -> None:
             print(f"  Missing keys (using default init): {missing}")
         if unexpected:
             print(f"  Unexpected keys (ignored): {unexpected}")
+
+        # ── Architecture mismatch guard ───────────────────────────────────
+        # strict=False is deliberate (it lets an NLL checkpoint load into a
+        # point-prediction model and vice versa), but it will just as happily
+        # drop a whole STRUCTURAL module. If the checkpoint was trained with
+        # temporal patching and cfg failed to carry temporal_patch through,
+        # the rebuilt model has no patch_merge: every patch_merge weight lands
+        # in `unexpected`, the encoder silently runs unpatched on 6x the
+        # tokens, and the predictions are garbage produced very slowly.
+        # That is a wrong result, not just a slow one, so refuse to continue.
+        _structural = ("patch_merge", "patch_norm", "var_proj",
+                       "encoder.blocks", "decoder.blocks")
+        _bad = [k for k in list(missing) + list(unexpected)
+                if any(s in k for s in _structural)]
+        if _bad:
+            raise SystemExit(
+                "\n[ABORT] structural weights did not match the checkpoint:\n"
+                + "".join(f"    {k}\n" for k in _bad[:12])
+                + (f"    ... and {len(_bad)-12} more\n" if len(_bad) > 12 else "")
+                + "\n  The rebuilt architecture differs from the trained one — most\n"
+                  "  likely temporal_patch / temporal_window / d_model / layer counts\n"
+                  "  were not read from the checkpoint cfg. Check the banner above\n"
+                  "  against the training run, or pass the values explicitly.\n"
+                  "  Evaluating anyway would produce meaningless predictions."
+            )
         print(f"  Parameters: {model.count_parameters():,}")
 
         from engine.evaluate import (
