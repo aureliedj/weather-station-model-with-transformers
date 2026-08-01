@@ -48,8 +48,14 @@
 #     At W=72, tw=6 gives 12 one-hour chunks. Score computation drops 12×
 #     (still modest savings vs FFN/QKV, but worthwhile at this window size).
 #
-# Resuming an interrupted run:
-#   ./run_full_cloud.sh   (Lightning restores from last.ckpt automatically)
+# Resuming an interrupted or early-stopped run:
+#   bash src/scripts/run_full_cloud.sh          (auto-resumes from last.ckpt)
+#   RESUME=0 bash src/scripts/run_full_cloud.sh (force a fresh run)
+#
+# This is now real. It used to say Lightning resumed automatically -- it does
+# NOT. main.py only resumes when --resume is passed, so a plain re-run started
+# from random init AND wrote into the same SAVE_DIR, which is what produced the
+# best-v1.ckpt / last-v1.ckpt pairs in full_run_cloud_v12.
 #
 # Usage:
 #   bash src/scripts/run_full_cloud.sh
@@ -258,6 +264,44 @@ INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly str
 #
 # Inference is different: test.py holds no activations or optimizer state, so
 # run_test_cloud.sh is safe at batch_size 8 on this slice.
+# ── Resume ───────────────────────────────────────────────────────────────────
+# If last.ckpt exists in SAVE_DIR, continue from it: full training state
+# (weights, optimiser, LR schedule, epoch counter) is restored.
+#
+# Without this, re-running would start from scratch and ModelCheckpoint would
+# refuse to overwrite the existing files, silently creating best-v1.ckpt --
+# leaving two runs in one folder with no indication which is which.
+#
+# NOTE: OverfitEarlyStop keeps no state_dict, so its patience counter resets to
+# zero on resume. That is deliberate here (it gives a stopped run room to
+# continue) but it means patience alone will not protect a resumed run --
+# set --overfit_patience appropriately.
+RESUME="${RESUME:-1}"
+RESUME_ARG=""
+if [[ "$RESUME" == "1" && -f "${SAVE_DIR}/last.ckpt" ]]; then
+    RESUME_ARG="--resume ${SAVE_DIR}/last.ckpt"
+    echo "[resume] continuing from ${SAVE_DIR}/last.ckpt"
+    python - "$SAVE_DIR" <<'PYEOF'
+import sys, os, torch
+p = os.path.join(sys.argv[1], "last.ckpt")
+try:
+    c = torch.load(p, map_location="cpu", weights_only=False)
+    print(f"[resume]   epoch {c.get('epoch','?')}, global_step {c.get('global_step','?')}")
+except Exception as e:
+    print(f"[resume]   (could not read epoch: {type(e).__name__})")
+PYEOF
+elif [[ "$RESUME" == "1" ]]; then
+    echo "[resume] no last.ckpt in ${SAVE_DIR} — starting fresh"
+else
+    echo "[resume] RESUME=0 — starting fresh"
+    if [[ -f "${SAVE_DIR}/best.ckpt" ]]; then
+        echo "[resume] WARNING: ${SAVE_DIR} already contains best.ckpt."
+        echo "[resume]          A fresh run will write best-v1.ckpt alongside it."
+        echo "[resume]          Use a new SAVE_DIR instead."
+        exit 1
+    fi
+fi
+
 python main.py \
     --data_root        "$DATA_ROOT" \
     --cache_dir        "$DATA_ROOT" \
@@ -288,7 +332,7 @@ python main.py \
     --patience         40 \
     --monitor          val/overall_rmse \
     --overfit_stop \
-    --overfit_patience 5 \
+    --overfit_patience 20 \
     --min_lr           5e-7 \
     --amp \
     --bf16 \
@@ -301,6 +345,7 @@ python main.py \
     $EXCLUDE \
     --wandb_project    station-mae \
     --wandb_run_name   patch6-d512-L16-v13 \
+    $RESUME_ARG \
     --save_dir         "$SAVE_DIR"
 # WandB runs ONLINE (default). If Renku blocks outbound connections, add
 # --wandb_offline above and sync later with: wandb sync <run-dir>
