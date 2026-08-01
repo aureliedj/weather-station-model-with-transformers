@@ -37,7 +37,7 @@ cd "${SRC_DIR}"                                              # so `python main.p
 #   v9          checkpoints/run_full_cloud_v9     NLL — predicts σ
 #   v11         checkpoints/full_run_cloud_v11    Huber, unweighted
 #   v12         checkpoints/full_run_cloud_v12    Huber, down-weighted vars
-RUN_NAME="v12"
+RUN_NAME="v13"
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
