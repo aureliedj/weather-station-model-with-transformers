@@ -45,7 +45,7 @@ cd "${SRC_DIR}"
 # WandB offline on Renku (flaky egress falsely marks runs "crashed").
 source "${SCRIPT_DIR}/_wandb_preflight.sh"
 
-RUN_NAME="simple-mae-v1"
+RUN_NAME="simple-mae-v2"
 SAVE_DIR="${PROJ_DIR}/checkpoints/${RUN_NAME}"
 
 EXCLUDE="--exclude_stations PFA"   # same station dropped as everywhere else
@@ -63,7 +63,7 @@ STRATEGY_PROBS="0.5 0.25 0.25"   # random / station / future per batch
 # fuse_layers>0 = mask tokens join the trunk at full width for N extra blocks:
 #   the forecast AND hidden-station gap-filling are computed BY the transformer.
 # Recommended v2 experiment: 6 visible-only + 4 full-grid layers
-FUSE="--enc_layers 6 --fuse_layers 4"     (bump RUN_NAME to simple-mae-v2)
+FUSE="--enc_layers 6 --fuse_layers 4"     #(bump RUN_NAME to simple-mae-v2)
 # Pure BERT limit: FUSE="--enc_layers 0 --fuse_layers 8"
 # FUSE=""
 
