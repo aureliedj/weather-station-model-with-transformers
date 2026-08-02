@@ -92,6 +92,7 @@ class SimpleMAE(nn.Module):
         station_ratio:  float = 0.5,
         future_slots:   int   = 6,
         strategy_probs: "tuple[float, float, float]" = (0.5, 0.25, 0.25),
+        fuse_layers:    int   = 0,
     ):
         super().__init__()
         assert window_steps % patch_steps == 0, "patch_steps must divide window_steps"
@@ -129,17 +130,37 @@ class SimpleMAE(nn.Module):
         ])
         self.enc_norm = nn.LayerNorm(d_model)
 
-        # ── Decoder: narrow, shallow, over the FULL token grid ───────────
-        self.enc2dec    = nn.Linear(d_model, dec_dim)
-        self.emb2dec    = nn.Linear(d_model, dec_dim)   # embeddings for masked slots
-        self.mask_token = nn.Parameter(torch.zeros(dec_dim))
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
-        self.dec_blocks = nn.ModuleList([
-            TransformerBlock(dec_dim, dec_heads, mlp_ratio, dropout)
-            for _ in range(dec_layers)
-        ])
-        self.dec_norm = nn.LayerNorm(dec_dim)
-        self.head     = nn.Linear(dec_dim, self.P * self.Vt)
+        # ── Reconstruction stage — one dial, two regimes ─────────────────
+        # fuse_layers == 0 (MAE-classic): narrow shallow decoder over the
+        #   full grid; the forecast is computed OUTSIDE the trunk.
+        # fuse_layers  > 0 (trunk forecasting / BERT-hybrid): mask tokens are
+        #   inserted at FULL width after the visible-only encoder and
+        #   fuse_layers more d_model blocks run over the complete grid —
+        #   the forecast is computed BY THE TRANSFORMER itself.  Pure BERT is
+        #   the limit enc_layers=0 (all layers full-grid).  The narrow-decoder
+        #   modules are not created in this regime.
+        self.fuse_layers = int(fuse_layers)
+        if self.fuse_layers > 0:
+            self.mask_token = nn.Parameter(torch.zeros(d_model))
+            nn.init.trunc_normal_(self.mask_token, std=0.02)
+            self.fuse_blocks = nn.ModuleList([
+                TransformerBlock(d_model, enc_heads, mlp_ratio, dropout)
+                for _ in range(self.fuse_layers)
+            ])
+            self.fuse_norm = nn.LayerNorm(d_model)
+            self.head      = nn.Linear(d_model, self.P * self.Vt)
+            self.enc2dec = self.emb2dec = self.dec_blocks = self.dec_norm = None
+        else:
+            self.enc2dec    = nn.Linear(d_model, dec_dim)
+            self.emb2dec    = nn.Linear(d_model, dec_dim)   # embeddings for masked slots
+            self.mask_token = nn.Parameter(torch.zeros(dec_dim))
+            nn.init.trunc_normal_(self.mask_token, std=0.02)
+            self.dec_blocks = nn.ModuleList([
+                TransformerBlock(dec_dim, dec_heads, mlp_ratio, dropout)
+                for _ in range(dec_layers)
+            ])
+            self.dec_norm = nn.LayerNorm(dec_dim)
+            self.head     = nn.Linear(dec_dim, self.P * self.Vt)
 
     # ------------------------------------------------------------------
     # Mask generation — (B, S, N) bool, True = HIDDEN from the encoder
@@ -191,6 +212,10 @@ class SimpleMAE(nn.Module):
         spatial:  torch.Tensor,            # (N, 15) or (B, N, 15)
         x_hours:  torch.Tensor,            # (B, W)        hours since epoch
         strategy: "str | None" = None,     # None → sampled from strategy_probs
+        token_mask: "torch.Tensor | None" = None,  # (B, S, N) bool override —
+                                           # custom mask pattern (evaluation
+                                           # scenarios); must hide the same
+                                           # count per sample in the batch
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, str]:
         """
         Returns:
@@ -224,7 +249,10 @@ class SimpleMAE(nn.Module):
         tok = self.token_norm(tok + emb)                       # (B, S, N, d)
 
         # ── 3. Mask & encode visible tokens only ─────────────────────────
-        token_mask, strategy = self.make_mask(B, N, x.device, strategy)
+        if token_mask is not None:
+            strategy = strategy or "custom"
+        else:
+            token_mask, strategy = self.make_mask(B, N, x.device, strategy)
         flat_tok  = tok.view(B, S * N, -1)
         flat_mask = token_mask.view(B, S * N)
         vis_idx = (~flat_mask).float().argsort(dim=1, descending=True)
@@ -235,25 +263,40 @@ class SimpleMAE(nn.Module):
             h = blk(h)
         h = self.enc_norm(h)                                   # (B, L_vis, d)
 
-        # ── 4. Decoder over the full grid ────────────────────────────────
-        # Masked slots: mask_token + their (projected) embeddings — the
-        # temporal/slot embedding of a hidden future slot IS the lead-time
-        # conditioning; no delta or step embedding needed.
+        # ── 4. Reconstruction stage over the full grid ───────────────────
+        # Masked slots: mask_token + their embeddings — the temporal/slot
+        # embedding of a hidden slot IS the conditioning (lead time for future
+        # slots, station identity for gap-filling slots); no delta embedding.
+        # BOTH task types (future forecast, hidden-station reconstruction)
+        # flow through the same stage — one mechanism, two tasks.
         emb_flat = (emb.expand(B, S, N, self.d_model)
                     .reshape(B, S * N, self.d_model))
-        grid = self.mask_token + self.emb2dec(emb_flat)        # (B, S·N, dec)
-        # .to(grid.dtype): under bf16 autocast enc2dec() returns bfloat16 while
-        # grid is fp32 (the fp32 mask_token parameter promotes the addition);
-        # scatter() requires exactly matching dtypes.
-        grid = grid.scatter(
-            1,
-            vis_idx.unsqueeze(-1).expand(-1, -1, grid.shape[-1]),
-            self.enc2dec(h).to(grid.dtype),
-        )
-        for blk in self.dec_blocks:
-            grid = blk(grid)
-        grid  = self.dec_norm(grid)
-        out   = self.head(grid)                                # (B, S·N, P·Vt)
+        if self.fuse_layers > 0:
+            # Trunk forecasting: full-width mask tokens join the transformer.
+            grid = self.mask_token + emb_flat                  # (B, S·N, d)
+            grid = grid.scatter(
+                1,
+                vis_idx.unsqueeze(-1).expand(-1, -1, grid.shape[-1]),
+                h.to(grid.dtype),          # no projection — same width
+            )
+            for blk in self.fuse_blocks:
+                grid = blk(grid)
+            grid = self.fuse_norm(grid)
+        else:
+            # MAE-classic narrow decoder.
+            grid = self.mask_token + self.emb2dec(emb_flat)    # (B, S·N, dec)
+            # .to(grid.dtype): under bf16 autocast the projections return
+            # bfloat16 while grid is fp32 (fp32 mask_token promotes the sum);
+            # scatter() requires exactly matching dtypes.
+            grid = grid.scatter(
+                1,
+                vis_idx.unsqueeze(-1).expand(-1, -1, grid.shape[-1]),
+                self.enc2dec(h).to(grid.dtype),
+            )
+            for blk in self.dec_blocks:
+                grid = blk(grid)
+            grid = self.dec_norm(grid)
+        out = self.head(grid)                                  # (B, S·N, P·Vt)
         preds = (out.view(B, S, N, P, self.Vt)
                  .permute(0, 1, 3, 2, 4)
                  .reshape(B, W, N, self.Vt))                   # (B, W, N, Vt)

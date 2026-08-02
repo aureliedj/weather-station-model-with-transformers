@@ -58,9 +58,18 @@ STATION_RATIO=0.5   # station-strategy: fraction of stations fully hidden
 FUTURE_SLOTS=6      # future-strategy: hours hidden at the window end
 STRATEGY_PROBS="0.5 0.25 0.25"   # random / station / future per batch
 
+# ── Trunk forecasting (BERT-hybrid dial) ─────────────────────────────────────
+# fuse_layers 0 = MAE-classic (narrow d128 decoder computes the forecast).
+# fuse_layers>0 = mask tokens join the trunk at full width for N extra blocks:
+#   the forecast AND hidden-station gap-filling are computed BY the transformer.
+# Recommended v2 experiment: 6 visible-only + 4 full-grid layers
+FUSE="--enc_layers 6 --fuse_layers 4"     (bump RUN_NAME to simple-mae-v2)
+# Pure BERT limit: FUSE="--enc_layers 0 --fuse_layers 8"
+# FUSE=""
+
 # ── Subset ablation first? Uncomment for a ~1 h smoke run. ──────────────────
-# SUBSET="--subset --epochs 15 --random_epoch_size 3600"
-SUBSET=""
+SUBSET="--subset --epochs 15 --random_epoch_size 3600"
+#SUBSET=""
 
 python train_simple_mae.py \
     --data_root        "$DATA_ROOT" \
@@ -93,6 +102,7 @@ python train_simple_mae.py \
     --index_mode       random \
     --random_epoch_size 10000 \
     $EXCLUDE \
+    $FUSE \
     $SUBSET \
     --wandb_project    station-mae \
     --wandb_run_name   "$RUN_NAME" \

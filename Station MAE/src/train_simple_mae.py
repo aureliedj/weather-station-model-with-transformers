@@ -55,6 +55,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dec_dim",     type=int,   default=128)
     p.add_argument("--dec_layers",  type=int,   default=2)
     p.add_argument("--dec_heads",   type=int,   default=4)
+    p.add_argument("--fuse_layers", type=int,   default=0,
+                   help="0 = MAE-classic narrow decoder. >0 = trunk "
+                        "forecasting: mask tokens join the transformer at "
+                        "full width for this many extra d_model blocks "
+                        "(forecast AND gap-filling computed in the trunk); "
+                        "the narrow decoder is not built. Pure BERT = "
+                        "--enc_layers 0 --fuse_layers L.")
     p.add_argument("--dropout",     type=float, default=0.0)
     p.add_argument("--mask_ratio",  type=float, default=0.75)
     p.add_argument("--station_ratio", type=float, default=0.5)
@@ -115,6 +122,7 @@ class SimpleMAELightning(pl.LightningModule):
             station_ratio=cfg["station_ratio"],
             future_slots=cfg["future_slots"],
             strategy_probs=tuple(cfg["strategy_probs"]),
+            fuse_layers=cfg.get("fuse_layers", 0),
         )
         # (V,) mean-over-stations std for phys-unit logging (monitoring only)
         self.register_buffer("obs_std", torch.as_tensor(obs_std, dtype=torch.float32))
