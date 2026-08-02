@@ -2,9 +2,11 @@
 # run_simple_mae_cloud.sh — train the canonical MAE (model/simple_mae.py).
 #
 # One mechanism, one objective: (station × hour) tokens, mask a subset, ViT
-# encoder on the visible tokens, shallow decoder reconstructs the hidden ones,
-# MSE on masked tokens only (strict MAE — He et al. 2022). The mask pattern
-# defines the task:
+# encoder on the visible tokens, shallow decoder reconstructs the hidden ones.
+# Loss follows the PROJECT convention (not strict MAE): context hours
+# ("time ≤ 0") are scored on masked tokens only; the future block
+# (+10 min … +6 h) is scored on ALL tokens, masked or visible.
+# The mask pattern defines the task:
 #   random tokens (75%)  → pretraining signal
 #   whole stations (50%) → gap-filling
 #   last 6 hours         → forecasting (all leads in one pass)

@@ -31,10 +31,13 @@ Token layout for a window of W = S·P steps (default S=18 hours, P=6 steps):
     token embedding  = Linear(2·P·V → d) + pos + station + temporal + slot
 
 Targets: the NUM_TARGET_VARIABLES (=5) forecast variables at all P steps of
-each masked token (precipitation stays input-only, as everywhere else in the
-project).  Loss is computed ONLY on masked tokens at present sensors — the
-strict MAE objective ("we are doing a strict MAE" — this file, unlike mae.py,
-never scores visible tokens).
+each scored token (precipitation stays input-only, as everywhere else in the
+project).  The loss follows the PROJECT convention rather than the strict
+MAE: the window always splits into context (first S − future_slots hours,
+"time ≤ 0") and future (last future_slots hours).  Context tokens are scored
+on MASKED positions only (reconstruction — visible copies would dilute the
+gradient, mae.py's δ=0 rule); future tokens are scored for EVERYONE, masked
+or visible (forecast horizon, mae.py's δ>0 rule).
 """
 
 import torch
@@ -252,8 +255,21 @@ class SimpleMAE(nn.Module):
                  .permute(0, 1, 3, 2, 4)
                  .reshape(B, W, N, self.Vt))                   # (B, W, N, Vt)
 
-        # ── 5. Strict-MAE loss: masked tokens only, present sensors only ─
-        step_mask = (token_mask.unsqueeze(2)                   # (B, S, 1, N)
+        # ── 5. Loss — project convention, not strict MAE ─────────────────
+        # The window always splits into CONTEXT (first S - future_slots hours,
+        # "time ≤ 0") and FUTURE (last future_slots hours, "time > 0"),
+        # independent of the mask strategy:
+        #   • context slots (reconstruction of observed times, the t=0 regime):
+        #     scored on MASKED tokens only — visible-token identity copies
+        #     would dilute the gradient (same rule as mae.py's δ=0).
+        #   • future slots (the forecast horizon, +10 min … +6 h):
+        #     scored on ALL tokens, masked or visible (same rule as mae.py's
+        #     δ>0 — under the random/station strategies a visible future
+        #     token still contributes forecast learning signal).
+        f0 = S - self.future_slots
+        scope = token_mask.clone()                             # (B, S, N)
+        scope[:, f0:, :] = True                                # future → everyone
+        step_mask = (scope.unsqueeze(2)                        # (B, S, 1, N)
                      .expand(B, S, P, N)
                      .reshape(B, W, N, 1))
         valid = step_mask * x_mask[..., :self.Vt]              # (B, W, N, Vt)
