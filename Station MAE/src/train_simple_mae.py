@@ -131,6 +131,21 @@ class SimpleMAELightning(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
+        """
+        Forecast-scenario validation (future block hidden), logged at TWO
+        granularities so wandb overlays are honest:
+
+        val/*            — the +30 MIN LEAD, all stations: SAME keys and SAME
+                           semantics as the v14 / LSTM panels (their val is the
+                           30-min forecast), so cross-run charts line up.
+                           The checkpoint monitor (val/overall_rmse) therefore
+                           also matches the other models' monitor semantics.
+        val/block6h_*    — averaged over the WHOLE masked 6 h block: the
+                           stricter MAE-native metric (was val/* in the subset
+                           smoke run — renamed to stop the key collision).
+        val/persist_skill — block-level skill vs last-observation persistence.
+        sanity/dispersion_min — pred/target std ratio (mean-collapse detector).
+        """
         x, xm, sp, xh = self._unpack(batch)
         sp = sp[0] if sp.dim() == 3 else sp
         # Forecast scenario: last future_slots hours hidden.
@@ -144,23 +159,47 @@ class SimpleMAELightning(pl.LightningModule):
         p  = preds[:, f0:]
         m  = xm[:, f0:, :, :Vt] > 0.5
 
-        # per-variable RMSE over the masked 6 h block (norm + phys)
+        # ── +30 min lead (comparable with v14 / LSTM val panels) ─────────
+        # future starts at +10 min → +30 min is the 3rd hidden step (index 2).
+        s30 = 2
+        t30, p30, m30 = t[:, s30], p[:, s30], m[:, s30]           # (B, N, Vt)
+        sq30 = 0.0; n30 = 0
+        for v, name in enumerate(TARGET_VARIABLE_NAMES):
+            mv = m30[..., v]
+            if not mv.any():
+                continue
+            e = p30[..., v][mv] - t30[..., v][mv]
+            rmse, mae = e.pow(2).mean().sqrt(), e.abs().mean()
+            self.log(f"val/{name}_rmse",      rmse, on_epoch=True, sync_dist=True)
+            self.log(f"val/{name}_mae",       mae,  on_epoch=True, sync_dist=True)
+            self.log(f"val/{name}_rmse_phys", rmse * self.obs_std[v],
+                     on_epoch=True, sync_dist=True)
+            self.log(f"val/{name}_mae_phys",  mae * self.obs_std[v],
+                     on_epoch=True, sync_dist=True)
+            sq30 = sq30 + e.pow(2).sum()
+            n30  = n30 + mv.sum()
+        if not isinstance(n30, int):
+            self.log("val/overall_rmse", (sq30 / n30.clamp(min=1)).sqrt(),
+                     on_epoch=True, prog_bar=True, sync_dist=True)
+
+        # ── Whole 6 h block (MAE-native, stricter) ───────────────────────
         sq_sum = 0.0; n_sum = 0
         for v, name in enumerate(TARGET_VARIABLE_NAMES):
             mv = m[..., v]
             if not mv.any():
                 continue
-            rmse = (p[..., v][mv] - t[..., v][mv]).pow(2).mean().sqrt()
-            self.log(f"val/{name}_rmse", rmse, on_epoch=True, sync_dist=True)
-            self.log(f"val/{name}_rmse_phys", rmse * self.obs_std[v],
+            e = p[..., v][mv] - t[..., v][mv]
+            self.log(f"val/block6h_{name}_rmse_phys",
+                     e.pow(2).mean().sqrt() * self.obs_std[v],
                      on_epoch=True, sync_dist=True)
-            sq_sum = sq_sum + (p[..., v][mv] - t[..., v][mv]).pow(2).sum()
+            sq_sum = sq_sum + e.pow(2).sum()
             n_sum  = n_sum + mv.sum()
-        overall = (sq_sum / n_sum.clamp(min=1)).sqrt()
-        self.log("val/overall_rmse", overall, on_epoch=True, prog_bar=True,
-                 sync_dist=True)
+        if not isinstance(n_sum, int):
+            self.log("val/block6h_overall_rmse",
+                     (sq_sum / n_sum.clamp(min=1)).sqrt(),
+                     on_epoch=True, sync_dist=True)
 
-        # persistence skill: last VISIBLE step (f0-1) repeated over the block
+        # ── Persistence skill over the block + dispersion sanity ─────────
         persist = x[:, f0 - 1:f0, :, :Vt].expand_as(t)
         mboth   = m & (xm[:, f0 - 1:f0, :, :Vt] > 0.5).expand_as(m)
         if mboth.any():
@@ -168,6 +207,13 @@ class SimpleMAELightning(pl.LightningModule):
             rp = (persist[mboth] - t[mboth]).pow(2).mean().sqrt().clamp(min=1e-6)
             self.log("val/persist_skill", 1.0 - rm / rp, on_epoch=True,
                      sync_dist=True)
+        disp = [
+            (p[..., v][m[..., v]].std() / t[..., v][m[..., v]].std().clamp(min=1e-6))
+            for v in range(Vt) if m[..., v].any()
+        ]
+        if disp:
+            self.log("sanity/dispersion_min", torch.stack(disp).min(),
+                     on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
         opt = torch.optim.AdamW(self.parameters(), lr=self.cfg["lr"],

@@ -21,11 +21,14 @@
 #
 # Size: ~10 M params — trains overnight, not over days.
 #
-# Comparability notes vs LSTM / v14 val panels:
-#   • window is 18 h (12 h context + 6 h future), others use 12 h context
-#   • val/overall_rmse here = RMSE over the WHOLE masked 6 h block,
-#     not the single 30-min lead the other models log
-#   • val/persist_skill uses the last visible step as baseline
+# Comparability vs LSTM / v14 val panels:
+#   • val/*            = the +30 MIN lead, all stations — SAME keys, SAME
+#     semantics as the v14 / LSTM panels → wandb overlays line up, and the
+#     checkpoint monitor (val/overall_rmse) matches theirs.
+#   • val/block6h_*    = whole masked 6 h block (MAE-native, stricter).
+#   • val/persist_skill = block-level skill vs last-obs persistence;
+#     sanity/dispersion_min = mean-collapse detector.
+#   • window is 18 h (12 h context + 6 h future), others use 12 h context.
 #
 # Usage:
 #   bash src/scripts/run_simple_mae_cloud.sh
@@ -56,8 +59,8 @@ FUTURE_SLOTS=6      # future-strategy: hours hidden at the window end
 STRATEGY_PROBS="0.5 0.25 0.25"   # random / station / future per batch
 
 # ── Subset ablation first? Uncomment for a ~1 h smoke run. ──────────────────
-SUBSET="--subset --epochs 15 --random_epoch_size 3600"
-# SUBSET=""
+# SUBSET="--subset --epochs 15 --random_epoch_size 3600"
+SUBSET=""
 
 python train_simple_mae.py \
     --data_root        "$DATA_ROOT" \
