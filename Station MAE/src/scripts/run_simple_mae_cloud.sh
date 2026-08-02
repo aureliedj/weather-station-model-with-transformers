@@ -54,8 +54,8 @@ FUTURE_SLOTS=6      # future-strategy: hours hidden at the window end
 STRATEGY_PROBS="0.5 0.25 0.25"   # random / station / future per batch
 
 # ── Subset ablation first? Uncomment for a ~1 h smoke run. ──────────────────
-# SUBSET="--subset --epochs 15 --random_epoch_size 3600"
-SUBSET=""
+SUBSET="--subset --epochs 15 --random_epoch_size 3600"
+# SUBSET=""
 
 python train_simple_mae.py \
     --data_root        "$DATA_ROOT" \
