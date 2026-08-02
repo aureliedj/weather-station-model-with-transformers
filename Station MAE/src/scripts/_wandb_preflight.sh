@@ -73,3 +73,18 @@ elif [[ "$WANDB_MODE" == "offline" ]]; then
 else
     echo "[wandb] mode=${WANDB_MODE} — logging disabled"
 fi
+
+# ── CUDA preflight (two Renku computes, two driver generations) ──────────────
+# The stock torch wheel (cu130) fails CUDA init on the older node (driver
+# 12.8): bare torch silently trains on CPU, Lightning hard-crashes. Refuse to
+# launch instead — the fix is one script away and takes a minute.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    if ! python -c "import torch, sys; sys.exit(0 if torch.cuda.is_available() else 1)" 2>/dev/null; then
+        echo ""
+        echo "[cuda] ✗ GPU present but torch cannot initialise CUDA (wheel/driver mismatch)."
+        echo "       Fix it with:   bash src/scripts/fix_torch_cuda.sh"
+        echo "       then re-run this script."
+        exit 1
+    fi
+    echo "[cuda] ✓ $(python -c "import torch; print(f'torch {torch.__version__} · {torch.cuda.get_device_name(0)}')" 2>/dev/null)"
+fi

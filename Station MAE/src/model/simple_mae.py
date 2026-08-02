@@ -242,10 +242,13 @@ class SimpleMAE(nn.Module):
         emb_flat = (emb.expand(B, S, N, self.d_model)
                     .reshape(B, S * N, self.d_model))
         grid = self.mask_token + self.emb2dec(emb_flat)        # (B, S·N, dec)
+        # .to(grid.dtype): under bf16 autocast enc2dec() returns bfloat16 while
+        # grid is fp32 (the fp32 mask_token parameter promotes the addition);
+        # scatter() requires exactly matching dtypes.
         grid = grid.scatter(
             1,
             vis_idx.unsqueeze(-1).expand(-1, -1, grid.shape[-1]),
-            self.enc2dec(h),
+            self.enc2dec(h).to(grid.dtype),
         )
         for blk in self.dec_blocks:
             grid = blk(grid)
