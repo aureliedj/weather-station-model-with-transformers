@@ -213,12 +213,9 @@ TEMPORAL_WINDOW="--temporal_window 0"   # windowing retired — patching replace
 #   Val year 2022 → ~728 windows → ~23 batches at batch_size=4 → ~6 s/epoch
 #   No --limit_val_batches needed — the full val set is evaluated every epoch.
 #
-#INDEX_MODE="--index_mode random --random_epoch_size 10000"
-# INDEX_MODE="--index_mode random --random_epoch_size 5000"  # ~1.4× non-overlapping (fast ablation)
-# INDEX_MODE="--index_mode random --random_epoch_size 3611"  # exact 1× non-overlapping
-# INDEX_MODE="--index_mode random --random_epoch_size 40000" # previous (11× redundant)
+INDEX_MODE="--index_mode random --random_epoch_size 10000" # ~2.8× non-overlapping (fast ablation)
 # INDEX_MODE="--index_mode blocks"                           # non-overlapping train (fast ablation)
-INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly stride
+# INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly stride
 
 # ── Loss function ─────────────────────────────────────────────────────────────
 #

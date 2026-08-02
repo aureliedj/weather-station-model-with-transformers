@@ -854,6 +854,9 @@ def main() -> None:
         "no_spatial_attn":     args.no_spatial_attn,
         "temporal_window":     args.temporal_window,
         "temporal_patch":      args.temporal_patch,
+        # Structural: MUST be recorded or evaluation rebuilds a
+        # decoder without the input-context cross-attention block.
+        "input_context_cross_attn": args.input_context_cross_attn,
         "cross_attn_decoder":  args.cross_attn_decoder,
         "grad_checkpoint":     args.grad_checkpoint,
         "window":              args.window,

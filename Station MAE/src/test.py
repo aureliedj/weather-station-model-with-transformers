@@ -885,6 +885,22 @@ def main() -> None:
         # v9), so infer it from the weights: an NLL model has a second decoder
         # head predicting log σ².  Without this the head would be silently
         # dropped by strict=False and the predicted uncertainty lost.
+        # ── Structural flags inferred from the WEIGHTS, not the cfg ───────
+        # The cfg dict is not a reliable record: `input_context_cross_attn` was
+        # never written into it, and test.py never passed it, so every
+        # evaluation ever run rebuilt the decoder WITHOUT its input-context
+        # cross-attention block. strict=False then dropped
+        # decoder.input_cross_attn.* silently, severing the direct path from the
+        # stations' current observations to the decoder. Symptom: the model
+        # predicts a hidden station exactly as well as one it was shown.
+        #
+        # The state_dict cannot lie about which modules were trained, so infer
+        # from it. This also fixes v9/v11/v12/v13 retroactively, whose cfgs
+        # predate the key.
+        _has_input_ctx = any("decoder.input_cross_attn." in k for k in state_dict)
+        print(f"  input_context_cross_attn: "
+              f"{'FOUND in weights — enabling' if _has_input_ctx else 'absent'}")
+
         _use_nll = any(k.endswith("decoder.log_var_head.weight") or
                        k.endswith("decoder.log_var_head.bias")
                        for k in state_dict)
@@ -906,6 +922,11 @@ def main() -> None:
             temporal_window=temp_window,
             temporal_patch=temp_patch,
             cross_attention_decoder=cross_attn,
+            input_context_cross_attn=_has_input_ctx,     # inferred from weights
+            joint_encoder=_arch(None, "joint_encoder", False),
+            masked_only_loss=_arch(None, "masked_only_loss", False),   # loss-only
+            use_persist_norm=_arch(None, "use_persist_norm", False),   # loss-only
+            delta0_weight=_arch(None, "delta0_weight", 1.0),           # loss-only
             use_nll_loss=_use_nll,
         ).to(device)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -924,6 +945,7 @@ def main() -> None:
         # tokens, and the predictions are garbage produced very slowly.
         # That is a wrong result, not just a slow one, so refuse to continue.
         _structural = ("patch_merge", "patch_norm", "var_proj",
+                       "input_cross_attn",   # <-- the one that was silently dropped
                        "encoder.blocks", "decoder.blocks")
         _bad = [k for k in list(missing) + list(unexpected)
                 if any(s in k for s in _structural)]
