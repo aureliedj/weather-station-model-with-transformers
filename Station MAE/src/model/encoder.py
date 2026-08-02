@@ -760,13 +760,14 @@ class StationMAEEncoder(nn.Module):
         self.windowed_flat   = (temporal_window > 0) and not joint and not factorised
 
         # --- Learnable sensor mask token (ViT-MAE style) ---
-        # When a sensor is absent (x_mask == 0), the raw observation is 0.0
-        # which, after per-station z-score normalisation, coincides with
-        # "exactly at the local mean" — ambiguous.  A learnable per-variable
-        # mask token replaces those zeros before the variable projection so the
-        # model can distinguish absent sensors from present-at-mean readings.
-        # Initialised at zero; the model learns the best fill-value from data.
-        self.sensor_mask_token = nn.Parameter(torch.zeros(num_vars))
+        # NOTE: the former ``sensor_mask_token`` (learned fill-value for absent
+        # sensors) has been REMOVED. It was a dead parameter: the fill was
+        # applied before var_proj, which then re-multiplied contributions by the
+        # sensor mask — zeroing exactly the entries the fill had written. The
+        # absent-sensor signal now lives where it takes effect:
+        # VariableProjection.var_absent_embedding (learned per-variable absent
+        # embedding, BERT-mask-style). Checkpoints from before this change are
+        # NOT numerically compatible with this encoder (token math changed).
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
         self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
@@ -923,17 +924,12 @@ class StationMAEEncoder(nn.Module):
         """
         B, W, N, V = x.shape
 
-        # --- v: Variable projection (with learnable mask token) ---
-        # Replace absent-sensor zeros with the learnable mask token so the
-        # variable projection sees a meaningful input for absent channels rather
-        # than 0.0 (which coincides with "at the per-station mean" in normalised
-        # space).  The mask is still passed to var_proj so it can zero-weight
-        # absent sensors in the summation, but the fill-value itself is now
-        # learned rather than fixed at 0.
-        # sensor_mask_token: (V,) → broadcast to (1, 1, 1, V)
-        x_filled    = x * x_mask + \
-                      self.sensor_mask_token.view(1, 1, 1, V) * (1.0 - x_mask)
-        x_flat      = x_filled.view(B * W, N, V)
+        # --- v: Variable projection ---
+        # Absent sensors are handled INSIDE var_proj: present sensors contribute
+        # their projected value, absent ones a learned per-variable absent
+        # embedding (var_absent_embedding). No pre-fill needed here — x carries
+        # zeros at absent slots and var_proj never reads them (mask-gated).
+        x_flat      = x.view(B * W, N, V)
         mask_flat   = x_mask.view(B * W, N, V)
         var_tokens  = self.var_proj(x_flat, mask_flat)             # (B*W, N, d_model)
         var_tokens  = var_tokens.view(B, W, N, self.d_model)       # (B, W, N, d_model)

@@ -572,12 +572,21 @@ class VariableProjection(nn.Module):
     Projects raw meteorological measurements into d_model space.
 
     Each variable has its own scalar-to-d_model linear projection plus a
-    learned type embedding encoding variable identity.  Contributions from
-    present variables are summed and averaged, making the token representation
-    invariant to how many sensors a station has.
+    learned type embedding encoding variable identity.
 
-    Missing variables (mask == 0) are excluded so the model cannot confuse
-    a true zero measurement with an absent sensor.
+    Present sensors contribute their projected value; ABSENT sensors contribute
+    a learned per-variable "absent" embedding (BERT-mask-style) instead of being
+    dropped.  The model therefore sees an explicit, learnable signal for
+    "sensor missing" and cannot confuse it with a true zero measurement.
+
+    The V contributions are summed and divided by the CONSTANT num_vars — not
+    by the per-station present count.  Dividing by the count (old behaviour)
+    made the embedding magnitude of the same physical value depend on how many
+    unrelated sensors the station carries (1/6 at a full station vs 1/2 at a
+    wind-only one) — a station-dependent gain the network had to undo.  A
+    constant divisor keeps every variable's weight identical across stations;
+    the encoder's token_norm handles overall scale.  (cf. ClimaX, Nguyen et
+    al. 2023, which uses attention aggregation partly to avoid this.)
 
     Implementation note:
         Variables are projected in a single vectorised operation:
@@ -608,6 +617,14 @@ class VariableProjection(nn.Module):
         # Learned type embedding: one d_model vector per variable identity
         self.var_type_embedding = nn.Embedding(num_vars, d_model)
 
+        # Learned per-variable ABSENT embedding, used in place of the value
+        # projection when a sensor is missing (mask == 0).  Zero-init: at the
+        # start of training an absent sensor contributes nothing (matching the
+        # old zero-weighting), and the model learns a useful "missing" signal
+        # from there.  Replaces the encoder-level sensor_mask_token, whose fill
+        # value was silently cancelled by the mask re-application here.
+        self.var_absent_embedding = nn.Parameter(torch.zeros(num_vars, d_model))
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -623,9 +640,15 @@ class VariableProjection(nn.Module):
         # Add variable-identity embedding; var_type_embedding.weight is (V, d_model)
         proj = proj + self.var_type_embedding.weight                   # (B, N, V, d_model)
 
-        # Zero out absent sensors and average over present variables
-        counts = mask.sum(dim=-1, keepdim=True).clamp(min=1.0)        # (B, N, 1)
-        out    = (proj * mask.unsqueeze(-1)).sum(dim=-2) / counts      # (B, N, d_model)
+        # Present sensors → projected value; absent sensors → learned absent
+        # embedding (+ type embedding so "which sensor is missing" is encoded).
+        m   = mask.unsqueeze(-1)                                       # (B, N, V, 1)
+        absent = self.var_absent_embedding + self.var_type_embedding.weight
+        mixed  = proj * m + absent * (1.0 - m)                         # (B, N, V, d_model)
+
+        # Constant divisor (NOT the per-station present count): every variable
+        # carries the same weight at every station; token_norm handles scale.
+        out = mixed.sum(dim=-2) / float(self.num_vars)                 # (B, N, d_model)
 
         return out
 

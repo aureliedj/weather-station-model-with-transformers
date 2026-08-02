@@ -301,6 +301,29 @@ class StationMAE(nn.Module):
         )
 
     # ------------------------------------------------------------------
+    # Input-context key-padding mask
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ctx_padding(
+        masked_idx: "torch.Tensor | None",   # (B, N_masked) long
+        n_stations: int,
+        device:     torch.device,
+    ) -> "torch.Tensor | None":
+        """
+        Build the (B, N) bool key-padding mask for input_context cross-attention:
+        True at MASKED stations, whose context slots are zero-filled and must
+        not be attended (a zero key still receives softmax mass otherwise).
+        Returns None when nothing is masked (mask_ratio = 0) — no-op fast path.
+        """
+        if masked_idx is None or masked_idx.numel() == 0:
+            return None
+        B   = masked_idx.shape[0]
+        pad = torch.zeros(B, n_stations, dtype=torch.bool, device=device)
+        pad.scatter_(1, masked_idx, True)
+        return pad
+
+    # ------------------------------------------------------------------
     # Single-delta training forward
     # ------------------------------------------------------------------
 
@@ -318,13 +341,22 @@ class StationMAE(nn.Module):
         """
         Full training forward pass for a single lead-time per sample.
 
+        Note on loss semantics (unchanged by the input-context padding mask):
+        the mask only affects which context KEYS the decoder may attend to.
+        WHERE the loss is computed is untouched — δ=0 is still scored on the
+        MASKED stations only (inpainting) and δ>0 on all stations, exactly as
+        before.
+
         Returns:
             loss:           scalar — MSE on all N stations (present sensors only)
             preds:          (B, N, num_target_vars)
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
         encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        ctx_pad = self._ctx_padding(masked_idx, x.shape[2], x.device)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                   input_context=input_ctx,
+                                   input_context_padding=ctx_pad)
         if self.use_nll_loss:
             preds, log_var = decoder_out
         else:
@@ -390,9 +422,12 @@ class StationMAE(nn.Module):
         # ── Encoder: runs once ──────────────────────────────────────────
         encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
         # encoded: (B, W*N_vis, d_model)
+        ctx_pad = self._ctx_padding(masked_idx, x.shape[2], x.device)
 
         # ── Decoder: runs once for all K lead-times ──────────────────────
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                   input_context=input_ctx,
+                                   input_context_padding=ctx_pad)
         if self.use_nll_loss:
             preds_all, log_var_all = decoder_out
         else:
@@ -427,11 +462,26 @@ class StationMAE(nn.Module):
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
             lv_k = log_var_all[:, k] if log_var_all is not None else None
 
-            # k=0 and delta=0: always restrict to masked stations
-            if k == 0 and delta_steps[0, 0].item() == 0:
+            # k=0 and delta=0: restrict to masked stations — but ONLY if any
+            # station is actually masked.
+            #
+            # At mask_ratio=0 masked_idx has shape (B, 0): not None, so the
+            # gather below yields empty tensors, sensor_ok.sum() == 0, and the
+            # delta=0 term contributes EXACTLY ZERO gradient. The model would
+            # then never be trained to emit delta=0 at all, while the LSTM
+            # baseline is supervised there for every station — which silently
+            # invalidates any no-masking comparison.
+            #
+            # With nothing masked there is no shortcut to protect against
+            # (the "trivial copy" concern only applies when some stations are
+            # visible and others hidden), so supervise all stations, exactly as
+            # the LSTM does.
+            _has_masked = masked_idx is not None and masked_idx.shape[1] > 0
+            if k == 0 and delta_steps[0, 0].item() == 0 and _has_masked:
                 _midx_k = masked_idx
             else:
-                _midx_k = masked_idx if self.masked_only_loss else None
+                _midx_k = (masked_idx if (self.masked_only_loss and _has_masked)
+                           else None)
 
             loss_acc = loss_acc + h_weights[k] * self._supervised_loss(
                 preds_all[:, k], y_target_k, y_mask_target_k, _midx_k, log_var=lv_k
@@ -466,8 +516,11 @@ class StationMAE(nn.Module):
             preds: (B, N, num_target_vars) predictions for all stations.
         """
         self.eval()
-        encoded, _, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps, input_context=input_ctx)
+        encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
+        ctx_pad = self._ctx_padding(masked_idx, x.shape[2], x.device)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                   input_context=input_ctx,
+                                   input_context_padding=ctx_pad)
         # When NLL mode is active, decoder returns (mean, log_var) — return mean only.
         if self.use_nll_loss:
             return decoder_out[0]

@@ -146,8 +146,18 @@ class CrossAttentionBlock(nn.Module):
         self,
         q:  torch.Tensor,   # (B, L_q,  d_model) — decoder query tokens
         kv: torch.Tensor,   # (B, L_kv, d_model) — encoder context (key/value)
+        kv_padding_mask: "torch.Tensor | None" = None,  # (B, L_kv) bool; True = ignore key
     ) -> torch.Tensor:
         """
+        Args:
+            kv_padding_mask: optional (B, L_kv) bool mask, True where the K/V
+                token must NOT be attended (softmax logit = −inf). Used for
+                input_context, whose masked-station slots are zero-filled:
+                without this mask those zero vectors become LayerNorm-bias keys
+                that still receive attention mass and dilute the readout —
+                softmax has no native notion of an "empty" key (standard
+                padding-mask practice, cf. Transformer/BERT).
+
         Returns:
             (B, L_q, d_model)
         """
@@ -162,6 +172,7 @@ class CrossAttentionBlock(nn.Module):
             self.norm_q(q),               # Q: normalised queries
             kv_n,                         # K: normalised encoder context
             kv_n,                         # V: same
+            key_padding_mask=kv_padding_mask,
             need_weights=False,
         )
         q = q + self.drop_path(ca)
@@ -373,6 +384,7 @@ class StationMAEDecoder(nn.Module):
         y_hours:       torch.Tensor,           # (B,) or (B, K)
         delta_steps:   torch.Tensor,           # (B,) or (B, K)
         input_context: "torch.Tensor | None" = None,  # (B, N, d_model) last-timestep tokens
+        input_context_padding: "torch.Tensor | None" = None,  # (B, N) bool; True = masked station (do not attend)
     ) -> torch.Tensor:
         """
         Predict variables for all N stations at one or K target times.
@@ -465,8 +477,11 @@ class StationMAEDecoder(nn.Module):
                 h = h[:, -N:, :]                                    # (B, N, d_model)
 
             # ── Optional: cross-attend to last-timestep input tokens ────
+            # Masked stations' zero-filled slots are excluded via the padding
+            # mask instead of being attended as degenerate LayerNorm-bias keys.
             if self.use_input_context and input_context is not None:
-                h = self.input_cross_attn(h, input_context)         # (B, N, d_model)
+                h = self.input_cross_attn(h, input_context,
+                                          kv_padding_mask=input_context_padding)  # (B, N, d_model)
 
             h = self.norm(h)
             mean = self.head(h)                                     # (B, N, num_target_vars)
@@ -515,7 +530,8 @@ class StationMAEDecoder(nn.Module):
             # (Expanding to N*K would make each query attend only to its own
             #  station's context, defeating the purpose of cross-station attention.)
             if self.use_input_context and input_context is not None:
-                h = self.input_cross_attn(h, input_context)              # h: (B, N*K, D) ← ctx: (B, N, D)
+                h = self.input_cross_attn(h, input_context,
+                                          kv_padding_mask=input_context_padding)  # h: (B, N*K, D) ← ctx: (B, N, D)
 
             h = self.norm(h)                                       # (B, N*K, d_model)
 
