@@ -68,8 +68,8 @@ FUSE="--enc_layers 6 --fuse_layers 4"     #(bump RUN_NAME to simple-mae-v2)
 # FUSE=""
 
 # ── Subset ablation first? Uncomment for a ~1 h smoke run. ──────────────────
-SUBSET="--subset --epochs 15 --random_epoch_size 3600"
-#SUBSET=""
+#SUBSET="--subset --epochs 15 --random_epoch_size 3600"
+SUBSET=""
 
 python train_simple_mae.py \
     --data_root        "$DATA_ROOT" \
