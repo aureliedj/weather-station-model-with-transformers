@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # run_full_cloud.sh — full training run, A100 80GB PCIe (MIG 3g.20gb)
 #
-# CURRENT CONFIG (v13): patched encoder — P=6, full attention, d_model=512,
-# 16 layers. The v9/v11/v12 settings are kept as commented alternatives.
+# CURRENT CONFIG (v14): patched encoder — P=6, full attention, d_model=512,
+# 16 layers, 100-epoch schedule, uniform variable weights.
+# Earlier settings are kept as commented alternatives.
 #
 # Hardware context
 # ----------------
@@ -61,6 +62,33 @@
 #   bash src/scripts/run_full_cloud.sh
 
 # ═══════════════════════════════════════════════════════════════════════════
+# v14 vs v13 — WHY THIS IS A FRESH RUN
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# A. 100-EPOCH SCHEDULE (was 300, of which v13 completed 23).
+#    Fresh rather than resumed: v13's 23 epochs were trained against a cosine
+#    denominator of 285 epochs. Resuming into a 100-epoch schedule would leave
+#    the first quarter of training on one LR curve and the rest on another.
+#    At ~12x cheaper than v12, a clean run costs a few hours and is far easier
+#    to defend in the write-up. v13's checkpoints are untouched in
+#    checkpoints/full_run_cloud_v13 and should still be re-evaluated with the
+#    input_context fix, since that number is now meaningful.
+#
+# B. warmup 15 -> 10 epochs (10% of the schedule, the usual proportion).
+#
+# C. --var_weights 1.0 1.0 1.0 1.0 1.0   (was hardcoded [1, 1, 0.7, 0.5, 0.5])
+#    The LSTM baseline trains at 1.0 across the board, so the old defaults gave
+#    the transformer 0.7x gradient on humidity and 0.5x on wind — precisely the
+#    variables where it loses. The per-variable comparison was not like-for-like.
+#
+# D. EVALUATION BUG FIXED (test.py). Every test-set number from v9 onwards was
+#    produced by a decoder rebuilt WITHOUT its input-context cross-attention:
+#    36 trained tensors were silently dropped by strict=False, severing the path
+#    from the stations' current observations to the decoder. Validation during
+#    training was always correct, which is why val and test disagreed ~3.7x.
+#    The "model ignores its inputs" diagnosis was measured through that bug.
+#
+# ═══════════════════════════════════════════════════════════════════════════
 # WHAT CHANGED vs v12, AND WHY
 # ═══════════════════════════════════════════════════════════════════════════
 #
@@ -117,7 +145,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v13"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v14"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -315,13 +343,14 @@ python main.py \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --temporal_patch   6 \
+    --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.0 \
     --batch_size       4 \
     --num_workers      3 \
     --epochs           100 \
     --lr               1e-4 \
-    --warmup_epochs    15 \
+    --warmup_epochs    10 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
     --accumulate_grad_batches 4 \
@@ -341,7 +370,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   patch6-d512-L16-v13 \
+    --wandb_run_name   patch6-d512-L16-v14 \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
 # WandB runs ONLINE (default). If Renku blocks outbound connections, add

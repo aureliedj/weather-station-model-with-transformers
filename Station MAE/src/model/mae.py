@@ -140,6 +140,7 @@ class StationMAE(nn.Module):
         joint_encoder:            bool  = False,
         input_context_cross_attn: bool  = False,
         delta0_weight:            float = 1.0,
+        var_weights:              "list | None" = None,
         use_nll_loss:             bool  = False,
         use_persist_norm:         bool  = False,
         window_size:              int   = 72,
@@ -236,7 +237,20 @@ class StationMAE(nn.Module):
         #   pressure    1.0  — trivial/easy (tiny residuals; weight ~irrelevant)
         #   humidity    0.7  — overfits, bounded/skewed → moderate down-weight
         #   wind_u/v    0.5  — heaviest overfit, noise-limited → strongest down-weight
-        _w = torch.tensor([1.0, 1.0, 0.7, 0.5, 0.5], dtype=torch.float32)
+        # Per-variable loss weights — UNIFORM by default, matching the LSTM
+        # baseline (run_lstm_cloud.sh: VAR_WEIGHTS="1.0 1.0 1.0 1.0 1.0").
+        #
+        # This used to default to [1.0, 1.0, 0.7, 0.5, 0.5], down-weighting
+        # humidity and wind as "noisy". That made the per-variable comparison
+        # against the LSTM invalid: the transformer got 0.7x and 0.5x the
+        # gradient on exactly the two variables it was losing on. Any run
+        # trained before 2026-08-02 used the old weights — note it when
+        # comparing v13 or earlier against v14.
+        #
+        # Weights affect the LOSS only, never the predictions, so evaluating an
+        # old checkpoint under the new default changes nothing that is dumped.
+        _w = (torch.tensor(var_weights, dtype=torch.float32) if var_weights
+              else torch.tensor([1.0, 1.0, 1.0, 1.0, 1.0], dtype=torch.float32))
         self.register_buffer("var_weights", _w)
         self.huber_delta = 1.0   # Huber δ in normalised space (= 1 std-dev)
         # Huber is applied to ALL variables (not just wind) — see _supervised_loss.
@@ -478,7 +492,8 @@ class StationMAE(nn.Module):
         Two modes, selected by whether log_var is passed:
 
         Huber mode (log_var=None, default):
-          Weights (temperature=1.0, pressure=0.5, humidity=0.8, wind_u=1.5, wind_v=1.5):
+          Weights (default [1.0, 1.0, 0.7, 0.5, 0.5] = temp, pressure,
+          humidity, wind_u, wind_v; override with --var_weights):
             • Huber(δ=1.0) applied to every variable in per-station-normalised space.
               Below δ=1σ the loss is L2 (standard MSE gradient); above δ it is L1
               (capped gradient), preventing extreme meteorological events from

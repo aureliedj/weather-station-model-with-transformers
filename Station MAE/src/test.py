@@ -927,6 +927,7 @@ def main() -> None:
             masked_only_loss=_arch(None, "masked_only_loss", False),   # loss-only
             use_persist_norm=_arch(None, "use_persist_norm", False),   # loss-only
             delta0_weight=_arch(None, "delta0_weight", 1.0),           # loss-only
+            var_weights=_arch(None, "var_weights", None),              # loss-only
             use_nll_loss=_use_nll,
         ).to(device)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)

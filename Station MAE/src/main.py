@@ -192,6 +192,15 @@ def parse_args() -> argparse.Namespace:
                         "--grad_checkpoint on ≤24 GB GPUs. Takes precedence over "
                         "--factorised_encoder.")
 
+    p.add_argument("--var_weights", type=float, nargs=5, default=None,
+                   metavar=("TEMP","PRES","HUM","WIND_U","WIND_V"),
+                   help="Per-variable loss weights. Default None keeps the values "
+                        "hardcoded in mae.py: [1.0, 1.0, 0.7, 0.5, 0.5]. "
+                        "NOTE the LSTM baseline trains with 1.0 across the board "
+                        "(run_lstm_cloud.sh), so the default makes the per-variable "
+                        "comparison on humidity and wind unfair to the transformer — "
+                        "it gets 0.7x and 0.5x the gradient on exactly the variables "
+                        "where it loses. Pass 1.0 1.0 1.0 1.0 1.0 for a fair match.")
     p.add_argument("--delta0_weight", type=float, default=1.0,
                    help="Relative loss weight for the k=0 horizon (delta=0, reconstruction) "
                         "vs all forecast horizons (k≥1, weight=1.0). Weights are normalised "
@@ -745,6 +754,7 @@ def main() -> None:
         masked_only_loss=args.masked_only_loss,
         joint_encoder=args.joint_encoder,
         input_context_cross_attn=args.input_context_cross_attn,
+        var_weights=args.var_weights,
         delta0_weight=args.delta0_weight,
         use_nll_loss=args.nll_loss,
         use_persist_norm=args.persist_norm,
@@ -854,6 +864,7 @@ def main() -> None:
         "no_spatial_attn":     args.no_spatial_attn,
         "temporal_window":     args.temporal_window,
         "temporal_patch":      args.temporal_patch,
+        "var_weights":         args.var_weights,
         # Structural: MUST be recorded or evaluation rebuilds a
         # decoder without the input-context cross-attention block.
         "input_context_cross_attn": args.input_context_cross_attn,
