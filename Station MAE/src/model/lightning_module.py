@@ -34,6 +34,7 @@ each metric is logged with exactly one mode:
                             > 0.05 → decoder output varies meaningfully with lead time.
 """
 
+import contextlib
 import math
 
 import torch
@@ -182,14 +183,116 @@ class StationMAELightning(pl.LightningModule):
         if torch.cuda.is_available() and self._val_cuda_rng_a is not None:
             torch.cuda.set_rng_state_all(self._val_cuda_rng_a)
 
+    @torch.no_grad()
+    def _sanity_check(self) -> None:
+        """
+        Per-epoch architecture sanity check on one cached validation batch.
+
+        Catches at TRAINING time the failure classes found in the v10–v13
+        post-mortems, instead of days later in the notebook:
+          • finiteness      — NaN/Inf predictions
+          • dispersion      — pred std / target std per variable
+                              (≪ 1 = conditional-mean collapse, v10/v13 symptom)
+          • persistence     — Δ>0 RMSE vs last-observation baseline
+          • context path    — at Δ=0, VISIBLE stations must beat MASKED ones;
+                              visible ≈ masked = input_context severed or
+                              ignored (the v13 evaluation-bug signature, and
+                              the live check that the v14 key_padding_mask /
+                              absent-embedding changes behave as intended).
+        Logged to wandb as sanity/* and printed as one line. Runs one extra
+        multi-delta forward per epoch — negligible cost.
+        """
+        batch = getattr(self, "_sanity_batch", None)
+        if batch is None:
+            return
+        self._sanity_batch = None
+        x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps = (
+            self._unpack_batch(batch)
+        )
+        if delta_steps.dim() != 2 or delta_steps.shape[1] < 2 or y.dim() != 4:
+            return  # sanity check needs a multi-delta batch
+
+        _amp = (torch.autocast("cuda", dtype=torch.bfloat16)
+                if x.is_cuda else contextlib.nullcontext())
+        with _amp:
+            _, preds, midx = self.model.forward_multi_delta(
+                x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps
+            )
+        preds = preds.float()
+        Vt = preds.shape[-1]
+        t  = y[..., :Vt]
+        m  = y_mask[..., :Vt] > 0.5
+
+        # 1. finiteness
+        finite = bool(torch.isfinite(preds).all())
+
+        # 2. dispersion (mean-collapse detector)
+        disp = []
+        for v in range(Vt):
+            mv = m[..., v]
+            if mv.any():
+                disp.append((preds[..., v][mv].std()
+                             / t[..., v][mv].std().clamp(min=1e-6)).item())
+        disp_min = min(disp) if disp else float("nan")
+
+        # 3. persistence skill on Δ>0 (norm space; last obs = Δ=0 target)
+        K       = preds.shape[1]
+        persist = t[:, :1].expand_as(t)
+        both    = m & m[:, :1]
+        fc      = slice(1, K)
+        e, ep   = (preds[:, fc] - t[:, fc])[both[:, fc]], \
+                  (persist[:, fc] - t[:, fc])[both[:, fc]]
+        skill = float("nan")
+        if e.numel() > 0:
+            skill = (1.0 - e.pow(2).mean().sqrt()
+                     / ep.pow(2).mean().sqrt().clamp(min=1e-6)).item()
+
+        # 4. context path: visible must beat masked at Δ=0
+        ctx_ratio = float("nan")
+        if (midx is not None and midx.numel() > 0
+                and int(delta_steps[0, 0]) == 0):
+            B, _, N, _ = preds.shape
+            sel = torch.zeros(B, N, dtype=torch.bool, device=preds.device)
+            sel.scatter_(1, midx, True)
+            e0, m0 = (preds[:, 0] - t[:, 0]).abs(), m[:, 0]
+            mm, vv = m0 & sel.unsqueeze(-1), m0 & ~sel.unsqueeze(-1)
+            if mm.any() and vv.any():
+                ctx_ratio = (e0[vv].mean()
+                             / e0[mm].mean().clamp(min=1e-6)).item()
+
+        parts = [
+            ("✓" if finite else "⚠ NaN/Inf in preds!"),
+            f"disp_min {disp_min:.2f}"
+            + ("" if not disp_min == disp_min or disp_min > 0.5 else " ⚠ mean-collapse"),
+            f"persist_skill {skill:+.3f}"
+            + ("" if not skill == skill or skill > -0.5 else " ⚠ far below persistence"),
+            f"ctx_ratio {ctx_ratio:.2f}"
+            + ("" if not ctx_ratio == ctx_ratio or ctx_ratio < 0.9
+               else " ⚠ visible≈masked — context path?"),
+        ]
+        print(f"  [sanity e{self.current_epoch}] " + " | ".join(parts))
+        for k_, v_ in [("sanity/dispersion_min", disp_min),
+                       ("sanity/persist_skill", skill),
+                       ("sanity/ctx_ratio",     ctx_ratio)]:
+            if v_ == v_:   # skip NaN
+                self.log(k_, v_, on_epoch=True, sync_dist=True)
+
     def on_validation_epoch_end(self) -> None:
-        """Restore the training RNG state saved in on_validation_epoch_start."""
+        """Run the sanity check, then restore the training RNG state saved in
+        on_validation_epoch_start. Order matters: the sanity forward consumes
+        validation-stream RNG (mask sampling), never the training stream."""
+        self._sanity_check()
         if hasattr(self, "_saved_rng_state"):
             torch.set_rng_state(self._saved_rng_state)
         if torch.cuda.is_available() and hasattr(self, "_saved_cuda_rng_state"):
             torch.cuda.set_rng_state_all(self._saved_cuda_rng_state)
 
     def validation_step(self, batch: dict, batch_idx: int) -> None:
+        # Cache the first val batch for the per-epoch sanity check
+        # (consumed and released in on_validation_epoch_end).
+        if batch_idx == 0:
+            self._sanity_batch = batch
+
         x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps = (
             self._unpack_batch(batch)
         )

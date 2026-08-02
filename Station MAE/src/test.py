@@ -529,6 +529,88 @@ def plot_delta_rmse(
 # Main
 # ---------------------------------------------------------------------------
 
+def _prediction_sanity_check(res: dict, label: str = "") -> None:
+    """
+    Fast post-dump sanity check on the freshly collected predictions.
+
+    Purpose: catch a broken model rebuild AT DUMP TIME, not days later in the
+    notebook. The v13 incident (input-context block silently dropped) would
+    have tripped three of the four checks below.
+
+    Checks (on a ≤500-window subsample, normalised space, ~1 s):
+      1. finiteness            — NaN/Inf in predictions
+      2. dispersion            — pred std vs target std per variable
+                                 (conditional-mean collapse → ratio ≪ 1)
+      3. persistence collapse  — Δ>0 overall RMSE vs the last-observation
+                                 baseline (same definition as test_lstm.py)
+      4. context pathway       — at Δ=0, VISIBLE stations must beat MASKED
+                                 ones: the decoder can read visible stations
+                                 directly from input_context. visible ≈ masked
+                                 is the signature of a severed context path.
+    Warnings are printed, never raised — the dump is already on disk and may
+    still be useful for diagnosis.
+    """
+    import numpy as np
+    Vt   = res["preds"].shape[-1]
+    Mw   = res["preds"].shape[0]
+    sub  = torch.arange(0, Mw, max(1, Mw // 500))
+    P    = res["preds"][sub].numpy()
+    T    = res["targets"][sub][..., :Vt].numpy()
+    M    = res["masks"][sub][..., :Vt].numpy() > 0.5
+    MI   = res.get("masked_idx")
+    vnames = list(res.get("var_names", [f"var{v}" for v in range(Vt)]))
+    print(f"\n  ── Sanity check ({label}, {len(sub)} windows) ──")
+
+    # 1. finiteness
+    n_bad = int(np.count_nonzero(~np.isfinite(P)))
+    print(f"  {'✓' if n_bad == 0 else '⚠'} finiteness: "
+          f"{'all finite' if n_bad == 0 else f'{n_bad} NaN/Inf values!'}")
+
+    # 2. dispersion (conditional-mean collapse)
+    ratios = []
+    for v in range(Vt):
+        m = M[..., v]
+        r = float(P[..., v][m].std() / max(T[..., v][m].std(), 1e-6))
+        ratios.append(r)
+    worst = min(ratios)
+    flag  = "✓" if worst > 0.5 else "⚠"
+    print(f"  {flag} dispersion (pred std / target std): "
+          + "  ".join(f"{vnames[v][:4]}={ratios[v]:.2f}" for v in range(Vt))
+          + ("" if worst > 0.5 else "   ← ≪1 = mean-collapse"))
+
+    # 3. persistence collapse on Δ>0 (identical definition to test_lstm.py)
+    K  = P.shape[1]
+    fc = slice(1, K)
+    persist = np.repeat(T[:, :1], K, axis=1)
+    both    = M & M[:, :1]
+    e  = (P[:, fc] - T[:, fc])[both[:, fc]]
+    ep = (persist[:, fc] - T[:, fc])[both[:, fc]]
+    rm, rp = float(np.sqrt(np.mean(e**2))), float(np.sqrt(np.mean(ep**2)))
+    skill  = 1.0 - rm / rp if rp > 0 else float("nan")
+    flag   = "✓" if skill > -0.5 else "⚠"
+    print(f"  {flag} vs persistence (Δ>0 norm RMSE): model {rm:.4f} "
+          f"vs persist {rp:.4f} → skill {skill:+.3f}"
+          + ("" if skill > -0.5 else "   ← far below persistence: check the rebuild"))
+
+    # 4. context pathway: visible vs masked stations at Δ=0
+    if MI is not None and MI.shape[1] > 0:
+        mi  = MI[sub].numpy()
+        N   = P.shape[2]
+        selm = np.zeros((len(sub), N), bool)
+        np.put_along_axis(selm, mi, True, axis=1)
+        m0   = M[:, 0]                                    # (m, N, Vt) at Δ=0
+        e0   = np.abs(P[:, 0] - T[:, 0])
+        mae_mask = float(e0[m0 & selm[:, :, None]].mean())
+        mae_vis  = float(e0[m0 & ~selm[:, :, None]].mean())
+        ratio    = mae_vis / max(mae_mask, 1e-6)
+        flag     = "✓" if ratio < 0.9 else "⚠"
+        print(f"  {flag} Δ=0 context path: visible MAE {mae_vis:.4f} vs "
+              f"masked {mae_mask:.4f} (ratio {ratio:.2f})"
+              + ("" if ratio < 0.9 else
+                 "   ← visible ≈ masked: input_context may be severed"))
+    print()
+
+
 def main() -> None:
     args = parse_args()
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -1002,12 +1084,14 @@ def main() -> None:
                 print(f"  [predictions-only] Dumping {_n:,} windows "
                       f"(index_mode={args.index_mode}, stride={args.stride}) …")
                 _pred_path = os.path.join(mr_save, "predictions.pt")
-                collect_predictions(
+                _res = collect_predictions(
                     model, test_loader, device,
                     n_windows=_n,
                     save_path=_pred_path,
                 )
                 print(f"  ⏱  {_time.time()-t0:.0f}s")
+                _prediction_sanity_check(_res, label)
+                del _res
                 continue
 
             skill:         dict = {}

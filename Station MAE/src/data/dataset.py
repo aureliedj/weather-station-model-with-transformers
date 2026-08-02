@@ -1011,8 +1011,9 @@ class StationMAEDataset(Dataset):
         #
         # obs_stats["mean"] / ["std"] are (N, V) per-station-per-variable
         # tensors.  Broadcasting: (T, N, V) - (1, N, V) / (1, N, V).
-        # Absent values (mask==0) are zeroed after normalisation so the
-        # learnable sensor_mask_token in the encoder can fill them cleanly.
+        # Absent values (mask==0) are zeroed after normalisation; the model
+        # handles them via VariableProjection.var_absent_embedding (the zeros
+        # themselves are never read — contributions are mask-gated).
         # ------------------------------------------------------------------
         _mean = self.obs_stats["mean"]
         _std  = self.obs_stats["std"]

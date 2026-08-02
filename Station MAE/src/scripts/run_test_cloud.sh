@@ -37,7 +37,10 @@ cd "${SRC_DIR}"                                              # so `python main.p
 #   v9          checkpoints/run_full_cloud_v9     NLL — predicts σ
 #   v11         checkpoints/full_run_cloud_v11    Huber, unweighted
 #   v12         checkpoints/full_run_cloud_v12    Huber, down-weighted vars
-RUN_NAME="v13"
+RUN_NAME="v14"
+# RUN_NAME="v13"   # ← pre-audit-fix architecture; ONLY evaluable with the code
+#                    that trained it (var_proj/absent-embedding math changed in
+#                    v14 — the test.py structural guard will abort on a mix).
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
