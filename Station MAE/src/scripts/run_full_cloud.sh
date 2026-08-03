@@ -281,6 +281,45 @@ TEMPORAL_WINDOW="--temporal_window 0"   # windowing retired — patching replace
 #   No --limit_val_batches needed — the full val set is evaluated every epoch.
 #
 INDEX_MODE="--index_mode random --random_epoch_size 10000" # ~2.8× non-overlapping (fast ablation)
+
+# ── Sanity / smoke run ───────────────────────────────────────────────────────
+# v15 changes the encoder tokenization AND the prediction head, so the FIRST
+# launch should exercise those code paths cheaply before the 100-epoch budget.
+# Enable with the env var (no need to edit this file):
+#
+#     SANITY=1 bash src/scripts/run_full_cloud.sh      # ~5 min, 2 epochs
+#     SANITY=2 bash src/scripts/run_full_cloud.sh      # ~1 h, 15 epochs, 2 yr
+#     bash src/scripts/run_full_cloud.sh               # full run (default)
+#
+# SANITY=1 — does it RUN?  2 epochs x 200 windows, subset years, no compile.
+#            Checks: telescopic merge shapes, residual head, finite val/loss,
+#            sanity/* line printed, [cuda] preflight, checkpoint writes.
+# SANITY=2 — does it LEARN? 15 epochs x 3,600 windows on 2020-21. Expect
+#            val/overall_rmse falling and sanity/ctx_ratio dropping below 1
+#            (visible stations beating masked ones = the residual head and the
+#            raw last hour are being used — what input_context used to do).
+# Both write to <SAVE_DIR>-sanity so they can never collide with the real run.
+SANITY="${SANITY:-0}"
+SANITY_ARGS=()
+if [[ "$SANITY" == "1" ]]; then
+    SANITY_ARGS=(--epochs 2 --random_epoch_size 200 --subset
+                 --warmup_epochs 1 --patience 100 --val_check_interval 0)
+    INDEX_MODE="--index_mode random"
+    SAVE_DIR="${SAVE_DIR}-sanity"
+    RUN_SUFFIX="-sanity1"
+elif [[ "$SANITY" == "2" ]]; then
+    SANITY_ARGS=(--epochs 15 --random_epoch_size 3600 --subset --warmup_epochs 2)
+    INDEX_MODE="--index_mode random"
+    SAVE_DIR="${SAVE_DIR}-sanity"
+    RUN_SUFFIX="-sanity2"
+else
+    RUN_SUFFIX=""
+fi
+if [[ "$SANITY" != "0" ]]; then
+    echo "[sanity] SANITY=${SANITY} — short run into ${SAVE_DIR}"
+    echo "[sanity]   ${SANITY_ARGS[*]}"
+    echo "[sanity]   this is NOT the real run; unset SANITY for the full budget."
+fi
 # INDEX_MODE="--index_mode blocks"                           # non-overlapping train (fast ablation)
 # INDEX_MODE="--index_mode sliding --train_stride 9"         # sliding, hourly stride
 
@@ -425,7 +464,8 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   telescopic-d384-L8-v15 \
+    --wandb_run_name   "telescopic-d384-L8-v15${RUN_SUFFIX}" \
+    ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
 # WandB runs ONLINE (default). If Renku blocks outbound connections, add
