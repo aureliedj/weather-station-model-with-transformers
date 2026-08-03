@@ -153,6 +153,18 @@ def parse_args() -> argparse.Namespace:
                         "over 12*N_vis costs LESS than the windowed setup it replaces "
                         "while giving every token the whole window from layer 1. "
                         "Use with --temporal_window 0. Default 1 = no patching.")
+    p.add_argument("--patch_schedule",      type=str, default="",
+                   help="v15 TELESCOPIC tokenization, overrides --temporal_patch. "
+                        "Comma-separated 'steps x patch' segments, oldest→newest, "
+                        "summing to --window. E.g. '48x6,18x3,6x1' for W=72: "
+                        "oldest 8 h hourly, middle 3 h half-hourly, last 1 h RAW "
+                        "(20 temporal positions). Native resolution where short "
+                        "leads need it — replaces the input-context side-channel.")
+    p.add_argument("--residual_head", action="store_true",
+                   help="v15: predict the DEVIATION from the last observation "
+                        "(ŷ = y(t0) + f). Visible stations start at persistence; "
+                        "masked stations keep a zero base (no leakage), so the "
+                        "gap-filling regime is unchanged.")
     p.add_argument("--temporal_window",     type=int, default=0,
                    help="Local temporal window size in timesteps (0 = full attention). "
                         "W must be exactly divisible by this value. Odd encoder layers "
@@ -214,10 +226,9 @@ def parse_args() -> argparse.Namespace:
                         "(Challu et al. 2023, N-HiTS; see REVIEW.md §5.4)")
 
     p.add_argument("--input_context_cross_attn", action="store_true",
-                   help="Add a final cross-attention block in the decoder that attends "
-                        "to the last-timestep input tokens for all N stations. "
-                        "Anchors short-horizon predictions to the most recent observation, "
-                        "moving the persistence crossover from ~45 min to ~15 min.")
+                   help="REMOVED in v15 (accepted for compatibility, ignored with a "
+                        "warning). Its job is done structurally by --patch_schedule "
+                        "(raw last hour in the main sequence) + --residual_head.")
     p.add_argument("--persist_norm", action="store_true",
                    help="Normalise each variable's loss by its persistence MSE, converting "
                         "the loss to a skill-score scale (1.0 = matches persistence baseline). "
@@ -611,6 +622,10 @@ def _estimate_persist_mse(
 
 def main() -> None:
     args = parse_args()
+    if args.input_context_cross_attn:
+        print("[v15] WARNING: --input_context_cross_attn is removed and IGNORED. "
+              "Recency is handled by --patch_schedule (raw last hour) and "
+              "--residual_head instead.")
 
     # ── Seed ────────────────────────────────────────────────────────────────
     set_seed(args.seed)
@@ -749,11 +764,12 @@ def main() -> None:
         encoder_spatial_attn=not args.no_spatial_attn,
         temporal_window=args.temporal_window,
         temporal_patch=args.temporal_patch,
+        patch_schedule=(args.patch_schedule or None),
         cross_attention_decoder=args.cross_attn_decoder,
         drop_path_rate=args.drop_path_rate,
         masked_only_loss=args.masked_only_loss,
         joint_encoder=args.joint_encoder,
-        input_context_cross_attn=args.input_context_cross_attn,
+        residual_head=args.residual_head,
         var_weights=args.var_weights,
         delta0_weight=args.delta0_weight,
         use_nll_loss=args.nll_loss,
@@ -864,10 +880,11 @@ def main() -> None:
         "no_spatial_attn":     args.no_spatial_attn,
         "temporal_window":     args.temporal_window,
         "temporal_patch":      args.temporal_patch,
+        # Structural (v15): MUST be recorded or evaluation rebuilds the
+        # wrong tokenization / head parameterisation.
+        "patch_schedule":      args.patch_schedule,
+        "residual_head":       args.residual_head,
         "var_weights":         args.var_weights,
-        # Structural: MUST be recorded or evaluation rebuilds a
-        # decoder without the input-context cross-attention block.
-        "input_context_cross_attn": args.input_context_cross_attn,
         "cross_attn_decoder":  args.cross_attn_decoder,
         "grad_checkpoint":     args.grad_checkpoint,
         "window":              args.window,

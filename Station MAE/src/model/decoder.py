@@ -151,12 +151,13 @@ class CrossAttentionBlock(nn.Module):
         """
         Args:
             kv_padding_mask: optional (B, L_kv) bool mask, True where the K/V
-                token must NOT be attended (softmax logit = −inf). Used for
-                input_context, whose masked-station slots are zero-filled:
-                without this mask those zero vectors become LayerNorm-bias keys
-                that still receive attention mass and dilute the readout —
-                softmax has no native notion of an "empty" key (standard
-                padding-mask practice, cf. Transformer/BERT).
+                token must NOT be attended (softmax logit = −inf).
+                v15: unused by this project's decoder (the input_context
+                pathway that needed it was removed); kept because
+                CrossAttentionBlock is generic and a zero/degenerate key would
+                otherwise still receive softmax mass — softmax has no native
+                notion of an "empty" key (standard padding-mask practice,
+                cf. Transformer/BERT).
 
         Returns:
             (B, L_q, d_model)
@@ -222,7 +223,6 @@ class StationMAEDecoder(nn.Module):
         use_checkpoint:          bool  = False,
         cross_attention:         bool  = False,
         drop_path_rate:          float = 0.0,
-        input_context_cross_attn: bool = False,
         predict_uncertainty:      bool = False,
         window_size:              int  = 72,
         step_emb:                 "nn.Module | None" = None,
@@ -326,23 +326,15 @@ class StationMAEDecoder(nn.Module):
         self.norm = nn.LayerNorm(d_model)
 
         # ------------------------------------------------------------------
-        # Optional: final cross-attention to last-timestep input tokens.
-        #
-        # After the main decoder blocks have integrated encoder context, this
-        # extra CrossAttentionBlock lets query tokens directly read the most
-        # recent (t=W-1) observation of ALL N stations — including the masked
-        # ones whose last known value is still visible here.
-        #
-        # This anchors short-horizon predictions to the last observed state,
-        # which is exactly what persistence uses.  The model can now learn
-        # "copy + small correction" rather than having to reconstruct the
-        # recent state from the compressed encoder output alone.
+        # v15: the input-context cross-attention block has been REMOVED.
+        # Its job — anchoring short leads to the raw last observation — is
+        # now done structurally: the telescopic patch schedule keeps the last
+        # hour at native resolution in the encoder sequence, and the
+        # persistence-residual head (mae.py) provides the "copy + small
+        # correction" prior directly. Checkpoints containing
+        # decoder.input_cross_attn.* weights predate v15 and must be
+        # evaluated with the code that trained them.
         # ------------------------------------------------------------------
-        self.use_input_context = input_context_cross_attn
-        if input_context_cross_attn:
-            self.input_cross_attn = CrossAttentionBlock(
-                d_model, num_heads, mlp_ratio, dropout, drop_path=0.0
-            )
 
         # ------------------------------------------------------------------
         # Prediction head: d_model → num_target_vars
@@ -383,8 +375,6 @@ class StationMAEDecoder(nn.Module):
         spatial:       torch.Tensor,           # (N, 15) or (B, N, 15)
         y_hours:       torch.Tensor,           # (B,) or (B, K)
         delta_steps:   torch.Tensor,           # (B,) or (B, K)
-        input_context: "torch.Tensor | None" = None,  # (B, N, d_model) last-timestep tokens
-        input_context_padding: "torch.Tensor | None" = None,  # (B, N) bool; True = masked station (do not attend)
     ) -> torch.Tensor:
         """
         Predict variables for all N stations at one or K target times.
@@ -476,13 +466,6 @@ class StationMAEDecoder(nn.Module):
                         h = block(h)
                 h = h[:, -N:, :]                                    # (B, N, d_model)
 
-            # ── Optional: cross-attend to last-timestep input tokens ────
-            # Masked stations' zero-filled slots are excluded via the padding
-            # mask instead of being attended as degenerate LayerNorm-bias keys.
-            if self.use_input_context and input_context is not None:
-                h = self.input_cross_attn(h, input_context,
-                                          kv_padding_mask=input_context_padding)  # (B, N, d_model)
-
             h = self.norm(h)
             mean = self.head(h)                                     # (B, N, num_target_vars)
             if self.predict_uncertainty:
@@ -523,15 +506,6 @@ class StationMAEDecoder(nn.Module):
                     else:
                         h = block(h)
                 h = h[:, -N * K:, :]                               # (B, N*K, d_model)
-
-            # ── Optional: cross-attend to last-timestep input tokens ────
-            # Pass input_context (B, N, D) as keys/values so every query token
-            # can attend across ALL visible stations — not just its own station.
-            # (Expanding to N*K would make each query attend only to its own
-            #  station's context, defeating the purpose of cross-station attention.)
-            if self.use_input_context and input_context is not None:
-                h = self.input_cross_attn(h, input_context,
-                                          kv_padding_mask=input_context_padding)  # h: (B, N*K, D) ← ctx: (B, N, D)
 
             h = self.norm(h)                                       # (B, N*K, d_model)
 

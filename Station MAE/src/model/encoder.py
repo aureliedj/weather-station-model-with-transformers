@@ -743,6 +743,7 @@ class StationMAEEncoder(nn.Module):
         spatial_attn:         bool  = True,
         temporal_window:      int   = 0,
         temporal_patch:       int   = 1,
+        patch_schedule:       "str | None" = None,   # v15 telescopic, e.g. "48x6,18x3,6x1"
         drop_path_rate:       float = 0.0,
         joint:                bool  = False,
         step_emb:             "nn.Module | None" = None,
@@ -885,23 +886,67 @@ class StationMAEEncoder(nn.Module):
         else:
             self.patch_norm = self.patch_merge = None
 
+        # ── v15: TELESCOPIC patch schedule (overrides temporal_patch) ─────
+        # Resolution matched to forecast-relevance: coarse patches for the
+        # distant past, RAW steps for the recent past (WaveNet/Pyraformer
+        # logic applied to tokenization). Schedule string, oldest→newest,
+        # "steps x patch" segments, e.g. "48x6,18x3,6x1" for W=72:
+        #     oldest 8 h @ patch 6 → 8 tokens
+        #     middle 3 h @ patch 3 → 6 tokens
+        #     last   1 h @ raw     → 6 tokens      (20 temporal positions)
+        # One merge layer per distinct patch size (>1). This is what lets the
+        # input_context side-channel be deleted: full 10-min resolution of the
+        # last hour lives in the main sequence.
+        self.patch_schedule: "list[tuple[int, int]] | None" = None
+        if patch_schedule:
+            segs = []
+            for part in str(patch_schedule).split(","):
+                n, p = part.lower().split("x")
+                segs.append((int(n), int(p)))
+            for n, p in segs:
+                assert n % p == 0, f"segment {n}x{p}: patch must divide steps"
+            self.patch_schedule = segs
+            self.sched_merges = nn.ModuleDict({
+                f"p{p}": nn.Sequential(nn.LayerNorm(p * d_model),
+                                       nn.Linear(p * d_model, d_model))
+                for p in sorted({p for _, p in segs if p > 1})
+            })
+
+    def _merge_segment(self, t: torch.Tensor, P: int) -> torch.Tensor:
+        """(B, n, N, D) → (B, n/P, N, D) with the merge layer for patch size P."""
+        if P <= 1:
+            return t
+        B, n, N, D = t.shape
+        t = t.reshape(B, n // P, P, N, D).permute(0, 1, 3, 2, 4)
+        t = t.reshape(B, n // P, N, P * D)
+        return self.sched_merges[f"p{P}"](t)
+
     def _patchify(self, t: torch.Tensor) -> torch.Tensor:
         """
-        (B, W, N, D) -> (B, W/P, N, D), merging P consecutive timesteps.
+        Uniform mode:     (B, W, N, D) → (B, W/P, N, D), one patch size.
+        Telescopic mode:  (B, W, N, D) → (B, T, N, D), per-segment patch sizes
+                          (patch_schedule; T = Σ nᵢ/pᵢ, e.g. 20 for W=72).
 
-        The temporal axis is split into (W/P, P); the P embeddings for a given
-        station are concatenated along the feature axis and projected back to
-        d_model. Station and batch axes are untouched, so station masking (which
-        runs before this) is unaffected.
+        Station and batch axes are untouched, so station masking (which runs
+        before this) is unaffected. Per-step positional/temporal embeddings
+        survive inside the concatenation rather than being averaged away.
         """
+        B, W, N, D = t.shape
+        if self.patch_schedule is not None:
+            assert W == sum(n for n, _ in self.patch_schedule), (
+                f"patch_schedule covers {sum(n for n, _ in self.patch_schedule)} "
+                f"steps but window W={W}")
+            out, i = [], 0
+            for n, p in self.patch_schedule:               # oldest → newest
+                out.append(self._merge_segment(t[:, i:i + n], p))
+                i += n
+            return torch.cat(out, dim=1)                   # (B, T, N, D)
         P = self.temporal_patch
         if P <= 1:
             return t
-        B, W, N, D = t.shape
         assert W % P == 0, (
             f"temporal_patch={P} must divide the window W={W} exactly. "
-            f"With W=72 the usable values are 1, 2, 3, 4, 6, 8, 9, 12, 18, 24, 36, 72."
-        )
+            f"With W=72 the usable values are 1, 2, 3, 4, 6, 8, 9, 12, 18, 24, 36, 72.")
         t = t.reshape(B, W // P, P, N, D)          # split the time axis
         t = t.permute(0, 1, 3, 2, 4)               # (B, W/P, N, P, D)
         t = t.reshape(B, W // P, N, P * D)         # concat the P embeddings
@@ -1038,42 +1083,18 @@ class StationMAEEncoder(nn.Module):
         # 2. Mask stations → visible_tokens: (B, W, N_vis, d_model)  [unflattened]
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
 
-        # 2b. Temporal patch merge: (B, W, N_vis, D) → (B, W/P, N_vis, D).
+        # 2b. Temporal patch merge — uniform or telescopic (v15).
         # Done AFTER masking so the station axis is already reduced — the merge
         # then costs P·d² per surviving token rather than per original station.
-        # `tokens` (full, unpatched) is kept for input_context below, which needs
-        # the true last timestep rather than the last hour-patch.
+        #
+        # v15 NOTE: the input_context side-channel has been REMOVED. Its only
+        # purpose was to smuggle raw last-step information past uniform
+        # patching; with the telescopic schedule the last hour is at native
+        # 10-min resolution INSIDE the main sequence, so the decoder reads
+        # recency through ordinary attention. (This also deletes the subsystem
+        # behind the silent-eval bug and the zero-key attention issue.)
         visible_tokens = self._patchify(visible_tokens)
         B_sz, W_sz, N_vis, D = visible_tokens.shape
-
-        # ── input_context for decoder cross-attention ──────────────────────
-        # Extract last-timestep embeddings, but ONLY for VISIBLE stations.
-        # Masked stations get zeros — no observation signal leaks to the decoder.
-        #
-        # WHY this matters:
-        #   Previously, input_context was extracted from the FULL token tensor
-        #   (all N stations, before masking).  This meant every "masked" station's
-        #   own current-step embedding was available to the decoder via
-        #   input_context cross-attention, completely bypassing the encoder mask.
-        #   The model learned to exploit this shortcut: it produced the same
-        #   output for mask_ratio=0.0 and mask_ratio=0.5 because it could always
-        #   read every station's value from input_context.
-        #
-        # Fix: build input_context as a zero tensor (B, N, D) and scatter-fill
-        #   only the visible stations' last-step embeddings into their slots.
-        #   Masked stations stay at 0 — the decoder must infer their values from
-        #   the encoded context of visible neighbours.
-        B_sz_, W_sz_, N_tot, D_ = tokens.shape
-        input_context = tokens.new_zeros(B_sz_, N_tot, D_)          # (B, N, d_model)
-        last_step      = tokens[:, -1, :, :]                         # (B, N, d_model)
-        vis_last       = last_step.gather(
-            1, visible_idx.unsqueeze(-1).expand(B_sz_, N_vis, D_)   # (B, N_vis, d_model)
-        )
-        input_context.scatter_(
-            1,
-            visible_idx.unsqueeze(-1).expand(B_sz_, N_vis, D_),
-            vis_last,
-        )                                                             # (B, N, d_model)
 
         # 3. Transformer blocks
         # ── Joint path:         keep (B, W, N_vis, d) through JointSpatioTemporalBlocks
@@ -1101,4 +1122,4 @@ class StationMAEEncoder(nn.Module):
                     h = block(h)
 
         h = self.norm(h)                                           # (B, W*N_vis, d_model)
-        return h, masked_idx, visible_idx, input_context          # 4th: (B, N, d_model)
+        return h, masked_idx, visible_idx

@@ -138,6 +138,11 @@ def parse_args() -> argparse.Namespace:
                    help="Temporal-only encoder (auto-detected from Lightning checkpoints)")
     p.add_argument("--temporal_patch", type=int, default=None,
                    help="Auto-read from the checkpoint; override only to debug.")
+    p.add_argument("--patch_schedule", type=str, default=None,
+                   help="v15 telescopic schedule; auto-read from the checkpoint "
+                        "cfg. Override only for legacy checkpoints.")
+    p.add_argument("--residual_head", action="store_true", default=None,
+                   help="v15 residual head; auto-read from the checkpoint cfg.")
     p.add_argument("--temporal_window", type=int, default=None,
                    help="Local temporal attention window (auto-detected from Lightning checkpoints)")
     p.add_argument("--cross_attn_decoder", action="store_true", default=None,
@@ -925,6 +930,9 @@ def main() -> None:
             temp_window  = _arch(args.temporal_window,   "temporal_window",    0)
             temp_patch   = _arch(args.temporal_patch,    "temporal_patch",     1)
             cross_attn   = _arch(args.cross_attn_decoder,"cross_attn_decoder", False)
+            # v15 structural settings — recorded in cfg by main.py
+            patch_sched  = saved_cfg.get("patch_schedule", "") or None
+            residual     = bool(saved_cfg.get("residual_head", False))
 
             # Strip "model." prefix (Lightning) and then "_orig_mod." prefix
             # (torch.compile wraps parameters under OptimizedModule).
@@ -952,6 +960,8 @@ def main() -> None:
             temp_window  = args.temporal_window or 0
             temp_patch   = args.temporal_patch or 1
             cross_attn   = bool(args.cross_attn_decoder)
+            patch_sched  = args.patch_schedule or None      # v15
+            residual     = bool(args.residual_head)          # v15
             state_dict   = ckpt["model_state_dict"]
 
         print(f"  Saved at epoch {ckpt_epoch}  "
@@ -961,6 +971,8 @@ def main() -> None:
         print(f"  factorised_encoder={factorised}  no_spatial_attn={no_spatial}  "
               f"temporal_window={temp_window}  temporal_patch={temp_patch}  "
               f"cross_attn_decoder={cross_attn}")
+        print(f"  [v15] patch_schedule={patch_sched or '(uniform)'}  "
+              f"residual_head={residual}")
 
         # ── Detect an NLL (heteroscedastic) checkpoint ────────────────────────
         # The cfg key "nll_loss" is unreliable (absent/None on older runs such as
@@ -980,8 +992,15 @@ def main() -> None:
         # from it. This also fixes v9/v11/v12/v13 retroactively, whose cfgs
         # predate the key.
         _has_input_ctx = any("decoder.input_cross_attn." in k for k in state_dict)
-        print(f"  input_context_cross_attn: "
-              f"{'FOUND in weights — enabling' if _has_input_ctx else 'absent'}")
+        if _has_input_ctx:
+            raise SystemExit(
+                "\n[ABORT] This checkpoint contains decoder.input_cross_attn.* "
+                "weights — it predates v15, where the input-context pathway was "
+                "removed. Evaluate pre-v15 checkpoints with the code that "
+                "trained them (git checkout main / the training-time commit). "
+                "Rebuilding it here would silently drop those trained weights — "
+                "the exact class of bug the v13 post-mortem uncovered."
+            )
 
         _use_nll = any(k.endswith("decoder.log_var_head.weight") or
                        k.endswith("decoder.log_var_head.bias")
@@ -1003,8 +1022,9 @@ def main() -> None:
             encoder_spatial_attn=not no_spatial,
             temporal_window=temp_window,
             temporal_patch=temp_patch,
+            patch_schedule=patch_sched,                  # v15 telescopic
+            residual_head=residual,                      # v15 residual head
             cross_attention_decoder=cross_attn,
-            input_context_cross_attn=_has_input_ctx,     # inferred from weights
             joint_encoder=_arch(None, "joint_encoder", False),
             masked_only_loss=_arch(None, "masked_only_loss", False),   # loss-only
             use_persist_norm=_arch(None, "use_persist_norm", False),   # loss-only

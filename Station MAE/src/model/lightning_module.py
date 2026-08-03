@@ -194,11 +194,12 @@ class StationMAELightning(pl.LightningModule):
           • dispersion      — pred std / target std per variable
                               (≪ 1 = conditional-mean collapse, v10/v13 symptom)
           • persistence     — Δ>0 RMSE vs last-observation baseline
-          • context path    — at Δ=0, VISIBLE stations must beat MASKED ones;
-                              visible ≈ masked = input_context severed or
-                              ignored (the v13 evaluation-bug signature, and
-                              the live check that the v14 key_padding_mask /
-                              absent-embedding changes behave as intended).
+          • context path    — at Δ=0, VISIBLE stations must beat MASKED ones.
+                              visible ≈ masked means the model is not using
+                              the observations it can see (the v13 signature).
+                              v15: the old input_context pathway is gone, so
+                              this now checks the telescopic tokenization +
+                              residual head are doing that job instead.
         Logged to wandb as sanity/* and printed as one line. Runs one extra
         multi-delta forward per epoch — negligible cost.
         """
