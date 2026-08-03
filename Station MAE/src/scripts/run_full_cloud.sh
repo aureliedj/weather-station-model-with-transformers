@@ -127,7 +127,7 @@
 # 4. TRUNK SLIMMED  --d_model 384 --enc_layers 8  (was: 512 / 16)
 #    The 16-layer depth was receptive-field arithmetic for WINDOWED
 #    attention, obsolete since v13 went full-attention. ~65M -> ~20M params,
-#    which also pays for the 1.7x longer telescopic sequence.
+#    which is also what makes RAW tokenization (fix 1) affordable at all.
 #    enc 8 / dec 2 preserves the MAE-style asymmetry of the original design.
 #
 # 5. EVAL GUARD  test.py now ABORTS on pre-v15 checkpoints (they carry
@@ -329,12 +329,13 @@ INDEX_MODE="--index_mode random --random_epoch_size 10000" # ~2.8× non-overlapp
 #     bash src/scripts/run_full_cloud.sh               # full run (default)
 #
 # SANITY=1 — does it RUN?  2 epochs x 200 windows, subset years, no compile.
-#            Checks: telescopic merge shapes, residual head, finite val/loss,
+#            Checks: raw-token shapes (5,616-token sequence), finite val/loss,
 #            sanity/* line printed, [cuda] preflight, checkpoint writes.
 # SANITY=2 — does it LEARN? 15 epochs x 3,600 windows on 2020-21. Expect
 #            val/overall_rmse falling and sanity/ctx_ratio dropping below 1
-#            (visible stations beating masked ones = the residual head and the
-#            raw last hour are being used — what input_context used to do).
+#            (visible stations beating masked ones at Delta=0 — with the
+#            residual head OFF this is once again a genuine test that the
+#            model uses the observations it can see, as it was in v14).
 # Both write to <SAVE_DIR>-sanity so they can never collide with the real run.
 SANITY="${SANITY:-0}"
 SANITY_ARGS=()
@@ -412,14 +413,14 @@ fi
 #     python main.py ... --epochs 1 --random_epoch_size 200        # ~2 min
 #
 # Confirm in the output:
-#   1. no shape/assert error from the telescopic merge (new code path);
+#   1. no shape/OOM error on the 5,616-token raw sequence (72 x 78);
 #   2. "[cuda] ✓ torch ... A100" appeared at the top (preflight);
 #   3. val/loss is finite and sanity/* prints one line per epoch;
 #   4. sanity ctx_ratio < 1 — VISIBLE stations beat masked ones, i.e. the
-#      residual head + telescopic tokens actually use recent observations
+#      raw 10-min tokens actually carry recent observations to the decoder
 #      (this is what the removed input_context pathway used to provide).
-# If --compile errors on the variable-length telescopic concat, drop it: it is
-# a ~1.3x speedup, not a correctness requirement.
+# --compile matters more with raw tokens (~1.3x on a much longer sequence),
+# but it is a speedup, not a correctness requirement: drop it if it errors.
 # ── Resume ───────────────────────────────────────────────────────────────────
 # If last.ckpt exists in SAVE_DIR, continue from it: full training state
 # (weights, optimiser, LR schedule, epoch counter) is restored.
