@@ -206,7 +206,7 @@ class StationLSTMLightning(pl.LightningModule):
 
     Folds the station dimension into the batch, applies a variable-weighted Huber
     loss over present sensors, and logs the SAME val metric names as the
-    transformer (val/loss, val/overall_rmse, val/{var}_rmse, …) so both models
+    transformer (val/loss, val/overall_mae, val/{var}_mae, …) so both models
     slot into the same monitor / comparison.
     """
 
@@ -286,23 +286,20 @@ class StationLSTMLightning(pl.LightningModule):
             _s = torch.tensor(_std_raw, dtype=p.dtype, device=p.device)
             obs_std = (_s.mean(dim=0) if _s.dim() == 2 else _s)[:self.num_target_vars]
 
+        # MAE only — matches the transformer and simple-MAE runs (RMSE is
+        # derived downstream from the test dumps, not logged during training).
         for v, name in enumerate(TARGET_VARIABLE_NAMES):
             mm = m[:, v]
             if mm.any():
-                pp, tt = p[mm, v], t[mm, v]
-                rmse = (pp - tt).pow(2).mean().sqrt()
-                mae  = (pp - tt).abs().mean()
-                self.log(f"val/{name}_rmse", rmse, on_epoch=True, sync_dist=True)
-                self.log(f"val/{name}_mae",  mae,  on_epoch=True, sync_dist=True)
+                mae = (p[mm, v] - t[mm, v]).abs().mean()
+                self.log(f"val/{name}_mae", mae, on_epoch=True, sync_dist=True)
                 if obs_std is not None:
-                    self.log(f"val/{name}_rmse_phys", rmse * obs_std[v], on_epoch=True, sync_dist=True)
-                    self.log(f"val/{name}_mae_phys",  mae  * obs_std[v], on_epoch=True, sync_dist=True)
+                    self.log(f"val/{name}_mae_phys", mae * obs_std[v],
+                             on_epoch=True, sync_dist=True)
 
         if m.any():
-            self.log("val/overall_rmse", (p[m] - t[m]).pow(2).mean().sqrt(),
-                     on_epoch=True, prog_bar=True, sync_dist=True)
             self.log("val/overall_mae", (p[m] - t[m]).abs().mean(),
-                     on_epoch=True, sync_dist=True)
+                     on_epoch=True, prog_bar=True, sync_dist=True)
 
     # ── optimizer + warmup-cosine schedule (AdamW or RMSprop) ────────────
     def configure_optimizers(self):

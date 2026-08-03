@@ -20,14 +20,16 @@ as "train/loss_step" and "train/loss_epoch" in WandB.  To keep names clean,
 each metric is logged with exactly one mode:
 
     train/loss          — per-step training MSE     (on_step=True, on_epoch=False)
-    train/overall_rmse  — epoch-level train RMSE    (on_step=False, on_epoch=True)
+    train/overall_mae   — epoch-level train MAE     (on_step=False, on_epoch=True)
     train/lr            — learning rate per step    (on_step=True, on_epoch=False)
     val/loss              — epoch validation MSE      (drives ModelCheckpoint / EarlyStopping)
-    val/overall_rmse      — epoch overall RMSE across all target variables
-    val/{var}_rmse        — per-variable RMSE (normalized, dimensionless)
-    val/{var}_mae         — per-variable MAE  (normalized, dimensionless)
-    val/{var}_rmse_phys   — per-variable RMSE in physical units (RMSE_norm × obs_std[v])
-    val/{var}_mae_phys    — per-variable MAE  in physical units (MAE_norm  × obs_std[v])
+    val/overall_mae       — epoch overall MAE across all target variables
+                            (measured at cfg["val_mask_ratio"], default 0.0 =
+                             ALL stations visible, matching the LSTM and
+                             simple-MAE panels; training masking is unchanged)
+    val/{var}_mae         — per-variable MAE (normalized, dimensionless)
+    val/{var}_mae_phys    — per-variable MAE in physical units (MAE_norm × obs_std[v])
+    (RMSE is deliberately NOT logged during validation — see validation_step.)
                             Physical metrics require cfg["obs_stats_std"] set by main.py.
     val/horizon_sensitivity — mean |pred(delta=36) − pred(delta=3)| on the first val batch.
                             ≈ 0 → decoder output is flat across lead times (DeltaTimeEmbedding not used);
@@ -112,10 +114,10 @@ class StationMAELightning(pl.LightningModule):
         self.log("train/loss", loss, on_step=True, on_epoch=False, prog_bar=True)
         self.log("train/lr",   lr,   on_step=True, on_epoch=False, prog_bar=False)
 
-        # ── train/overall_rmse — epoch-level, mirrors val/overall_rmse ────────
-        # Use k=1 (delta=3 = 30 min, all stations) to mirror val/overall_rmse.
+        # ── train/overall_mae — epoch-level, mirrors val/overall_mae ─────────
+        # Use k=1 (delta=3 = 30 min, all stations) to mirror val/overall_mae.
         # k=0 is delta=0 with masked-only loss — not representative of
-        # forecasting skill and would make train RMSE incomparable to val.
+        # forecasting skill and would make train MAE incomparable to val.
         with torch.no_grad():
             if is_multi:
                 _k_train = min(1, preds.shape[1] - 1)   # k=1 → delta=3 (30 min)
@@ -129,8 +131,8 @@ class StationMAELightning(pl.LightningModule):
             if m_flat.sum() > 0:
                 mask_any = m_flat.any(dim=-1)
                 self.log(
-                    "train/overall_rmse",
-                    (p_flat[mask_any] - t_flat[mask_any]).pow(2).mean().sqrt(),
+                    "train/overall_mae",
+                    (p_flat[mask_any] - t_flat[mask_any]).abs().mean(),
                     on_step=False, on_epoch=True, prog_bar=False, sync_dist=True,
                 )
 
@@ -158,6 +160,15 @@ class StationMAELightning(pl.LightningModule):
         The training RNG state is saved here and restored in on_validation_epoch_end
         so the training random stream is completely unaffected.
         """
+        # ── Validation mask ratio ────────────────────────────────────────
+        # Default 0.0: validate with ALL 155 stations visible, so val/* is the
+        # same task the LSTM and simple-MAE runs report (a 30-min forecast
+        # from the full network). Training keeps its own mask_ratio; this is
+        # restored in on_validation_epoch_end.
+        self._val_mask_ratio  = float(self.cfg.get("val_mask_ratio", 0.0))
+        self._train_mask_ratio = self.model.encoder.mask_ratio
+        self.model.encoder.mask_ratio = self._val_mask_ratio
+
         self._saved_rng_state = torch.get_rng_state()
         if torch.cuda.is_available():
             self._saved_cuda_rng_state = torch.cuda.get_rng_state_all()
@@ -207,6 +218,12 @@ class StationMAELightning(pl.LightningModule):
         if batch is None:
             return
         self._sanity_batch = None
+        # Diagnostics need masked stations (ctx_ratio compares visible vs
+        # masked), so this runs at the TRAINED mask ratio even though the
+        # logged val/* metrics above use val_mask_ratio (0 = all visible).
+        _mr_metrics = self.model.encoder.mask_ratio
+        self.model.encoder.mask_ratio = getattr(
+            self, "_train_mask_ratio", _mr_metrics)
         x, x_mask, spatial, x_hours, y, y_mask, y_hours, delta_steps = (
             self._unpack_batch(batch)
         )
@@ -271,6 +288,7 @@ class StationMAELightning(pl.LightningModule):
             + ("" if not ctx_ratio == ctx_ratio or ctx_ratio < 0.9
                else " ⚠ visible≈masked — context path?"),
         ]
+        self.model.encoder.mask_ratio = _mr_metrics   # restore
         print(f"  [sanity e{self.current_epoch}] " + " | ".join(parts))
         for k_, v_ in [("sanity/dispersion_min", disp_min),
                        ("sanity/persist_skill", skill),
@@ -283,6 +301,9 @@ class StationMAELightning(pl.LightningModule):
         on_validation_epoch_start. Order matters: the sanity forward consumes
         validation-stream RNG (mask sampling), never the training stream."""
         self._sanity_check()
+        # Restore the TRAINING mask ratio (validation ran at val_mask_ratio).
+        if hasattr(self, "_train_mask_ratio"):
+            self.model.encoder.mask_ratio = self._train_mask_ratio
         if hasattr(self, "_saved_rng_state"):
             torch.set_rng_state(self._saved_rng_state)
         if torch.cuda.is_available() and hasattr(self, "_saved_cuda_rng_state"):
@@ -303,7 +324,7 @@ class StationMAELightning(pl.LightningModule):
         #   k=0 → delta=0  (reconstruction, masked stations only — not useful as
         #                   a monitoring metric since it covers only ~50% of stations)
         #   k=1 → delta=3  (30 min ahead, all stations — the primary forecast metric)
-        # We monitor at k=1 so val/overall_rmse reflects genuine forecasting skill.
+        # We monitor at k=1 so val/overall_mae reflects genuine forecasting skill.
         _is_multi = (delta_steps.dim() == 2 and delta_steps.shape[1] > 1)
         _k = 1 if _is_multi else 0   # k=1 → delta=3 (30 min); k=0 fallback for single-delta
         ds = delta_steps[:, _k] if _is_multi else delta_steps
@@ -311,35 +332,51 @@ class StationMAELightning(pl.LightningModule):
         ym = y_mask[:, _k]  if y_mask.dim() == 4 else y_mask
         yh = y_hours[:, _k] if y_hours.dim() == 2 else y_hours
 
-        # ── Dual-seed forward passes — average to reduce mask-sampling variance ─
-        # Pass A uses stream A RNG (already active on entry to this step).
-        loss_a, preds_a, _ = self.model(
-            x, x_mask, spatial, x_hours, y_, ym, yh, ds
-        )
-        # Checkpoint stream A state, switch to stream B
-        self._val_rng_a = torch.get_rng_state()
-        if torch.cuda.is_available():
-            self._val_cuda_rng_a = torch.cuda.get_rng_state_all()
+        # ── Forward pass(es) at the VALIDATION mask ratio ─────────────────
+        # The encoder mask ratio was switched to cfg["val_mask_ratio"]
+        # (default 0.0 = ALL 155 stations visible) in
+        # on_validation_epoch_start, so val/* measures the same task as the
+        # LSTM and simple-MAE panels: a 30-min forecast with the full network
+        # as input. It is restored to the trained ratio afterwards, and the
+        # per-epoch sanity check deliberately runs at the TRAINED ratio so
+        # ctx_ratio / masked-station diagnostics keep their meaning.
+        #
+        # Dual-seed averaging only makes sense when masking is stochastic:
+        # at ratio 0 there is nothing to sample, both passes would be
+        # identical, so a single pass is used (and validation is 2x faster).
+        if self._val_mask_ratio > 0:
+            # Pass A uses stream A RNG (already active on entry to this step).
+            loss_a, preds_a, _ = self.model(
+                x, x_mask, spatial, x_hours, y_, ym, yh, ds
+            )
+            # Checkpoint stream A state, switch to stream B
+            self._val_rng_a = torch.get_rng_state()
+            if torch.cuda.is_available():
+                self._val_cuda_rng_a = torch.cuda.get_rng_state_all()
 
-        torch.set_rng_state(self._val_rng_b)
-        if torch.cuda.is_available() and self._val_cuda_rng_b is not None:
-            torch.cuda.set_rng_state_all(self._val_cuda_rng_b)
+            torch.set_rng_state(self._val_rng_b)
+            if torch.cuda.is_available() and self._val_cuda_rng_b is not None:
+                torch.cuda.set_rng_state_all(self._val_cuda_rng_b)
 
-        loss_b, preds_b, _ = self.model(
-            x, x_mask, spatial, x_hours, y_, ym, yh, ds
-        )
-        # Checkpoint stream B, restore stream A for the next batch
-        self._val_rng_b = torch.get_rng_state()
-        if torch.cuda.is_available():
-            self._val_cuda_rng_b = torch.cuda.get_rng_state_all()
+            loss_b, preds_b, _ = self.model(
+                x, x_mask, spatial, x_hours, y_, ym, yh, ds
+            )
+            # Checkpoint stream B, restore stream A for the next batch
+            self._val_rng_b = torch.get_rng_state()
+            if torch.cuda.is_available():
+                self._val_cuda_rng_b = torch.cuda.get_rng_state_all()
 
-        torch.set_rng_state(self._val_rng_a)
-        if torch.cuda.is_available() and self._val_cuda_rng_a is not None:
-            torch.cuda.set_rng_state_all(self._val_cuda_rng_a)
+            torch.set_rng_state(self._val_rng_a)
+            if torch.cuda.is_available() and self._val_cuda_rng_a is not None:
+                torch.cuda.set_rng_state_all(self._val_cuda_rng_a)
 
-        # Averaged loss and predictions
-        loss  = (loss_a  + loss_b)  * 0.5
-        preds = (preds_a + preds_b) * 0.5
+            # Averaged loss and predictions
+            loss  = (loss_a  + loss_b)  * 0.5
+            preds = (preds_a + preds_b) * 0.5
+        else:
+            loss, preds, _ = self.model(
+                x, x_mask, spatial, x_hours, y_, ym, yh, ds
+            )
 
         # Metrics over ALL N stations wherever sensors are present —
         # consistent with the training objective which also covers all stations.
@@ -374,31 +411,30 @@ class StationMAELightning(pl.LightningModule):
         else:
             obs_std = None
 
-        # ── Per-variable RMSE / MAE (all stations, present sensors only) ─
+        # ── Per-variable MAE (all stations, present sensors only) ────────
+        # MAE only: RMSE was dropped from validation logging (project
+        # decision) — it duplicates MAE's ranking on these runs while being
+        # dominated by a handful of extreme events, and the reported metric
+        # is MAE anyway. RMSE is still available downstream from the test
+        # dumps (Test_Results_Exploration.ipynb computes MAE, MSE and RMSE
+        # from predictions.pt).
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
             m = masks_all[:, v]
             if m.sum() > 0:
                 p, t = preds_all[m, v], targets_all[m, v]
-                rmse_norm = (p - t).pow(2).mean().sqrt()
-                mae_norm  = (p - t).abs().mean()
-                self.log(f"val/{var_name}_rmse", rmse_norm, on_epoch=True, sync_dist=True)
-                self.log(f"val/{var_name}_mae",  mae_norm,  on_epoch=True, sync_dist=True)
+                mae_norm = (p - t).abs().mean()
+                self.log(f"val/{var_name}_mae", mae_norm, on_epoch=True, sync_dist=True)
                 # Physical units: multiply normalized error by the training-split std
                 if obs_std is not None:
-                    std_v = obs_std[v]
-                    self.log(f"val/{var_name}_rmse_phys", rmse_norm * std_v,
-                             on_epoch=True, sync_dist=True)
-                    self.log(f"val/{var_name}_mae_phys",  mae_norm  * std_v,
+                    self.log(f"val/{var_name}_mae_phys", mae_norm * obs_std[v],
                              on_epoch=True, sync_dist=True)
 
-        # ── Overall RMSE across all variables and stations ─────────────
+        # ── Overall MAE across all variables and stations ──────────────
         if masks_all.sum() > 0:
             pf = preds_all[masks_all]
             tf = targets_all[masks_all]
-            self.log("val/overall_rmse", (pf - tf).pow(2).mean().sqrt(),
+            self.log("val/overall_mae", (pf - tf).abs().mean(),
                      on_epoch=True, prog_bar=True, sync_dist=True)
-            self.log("val/overall_mae",  (pf - tf).abs().mean(),
-                     on_epoch=True, sync_dist=True)
 
         # ── Horizon-sensitivity probe (first batch of each val epoch only) ─
         # Measures mean |pred(delta=6h) − pred(delta=30min)| to verify the

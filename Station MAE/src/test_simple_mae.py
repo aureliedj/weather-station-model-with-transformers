@@ -82,6 +82,7 @@ def main() -> None:
         station_ratio=cfg["station_ratio"], future_slots=cfg["future_slots"],
         strategy_probs=tuple(cfg["strategy_probs"]),
         fuse_layers=cfg.get("fuse_layers", 0),
+        huber_delta=cfg.get("huber_delta", 1.0),   # loss-only, but keeps cfg faithful
     )
     sd = {k.removeprefix("model."): v for k, v in ckpt["state_dict"].items()
           if k.startswith("model.")}

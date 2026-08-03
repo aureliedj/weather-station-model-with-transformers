@@ -143,6 +143,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mlp_ratio",    type=float, default=4.0)
     p.add_argument("--dropout",      type=float, default=0.1)
     p.add_argument("--mask_ratio",   type=float, default=0.5)
+    p.add_argument("--val_mask_ratio", type=float, default=0.0,
+                   help="Station mask ratio used for the VALIDATION metrics "
+                        "(default 0.0 = all stations visible). Training is "
+                        "unaffected. 0.0 makes val/* the same task the LSTM "
+                        "and simple-MAE runs report — a 30-min forecast from "
+                        "the full network — so the wandb panels are directly "
+                        "comparable. Set to --mask_ratio to validate under the "
+                        "trained masking instead. The per-epoch sanity check "
+                        "always runs at the TRAINED ratio (it needs masked "
+                        "stations for ctx_ratio).")
     p.add_argument("--max_delta",    type=int,   default=18)
     p.add_argument("--factorised_encoder",  action="store_true",
                    help="Axial attention in encoder (~100× cheaper at W=288)")
@@ -323,11 +333,11 @@ def parse_args() -> argparse.Namespace:
     # Early stopping
     p.add_argument("--patience",     type=int,   default=50)
     p.add_argument("--min_delta",    type=float, default=1e-4)
-    p.add_argument("--monitor",      type=str,   default="val/temperature_rmse",
+    p.add_argument("--monitor",      type=str,   default="val/temperature_mae",
                    help="Metric monitored by ModelCheckpoint and EarlyStopping. "
                         "Must be logged by lightning_module.py. "
-                        "Common choices: val/loss, val/temperature_rmse, val/overall_rmse. "
-                        "(default: val/temperature_rmse)")
+                        "Common choices: val/loss, val/temperature_mae, val/overall_mae. "
+                        "(default: val/temperature_mae)")
 
     # Overfitting-aware early stop
     p.add_argument("--overfit_stop", action="store_true",
@@ -897,6 +907,7 @@ def main() -> None:
         "dec_layers":          args.dec_layers,
         "mlp_ratio":           args.mlp_ratio,
         "mask_ratio":          args.mask_ratio,
+        "val_mask_ratio":     args.val_mask_ratio,
         "dropout":             args.dropout,
         "drop_path_rate":      args.drop_path_rate,
         "masked_only_loss":    args.masked_only_loss,

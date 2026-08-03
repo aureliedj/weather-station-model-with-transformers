@@ -88,7 +88,7 @@ python train_lstm.py \
     --warmup_epochs    3 \
     --grad_clip        1.0 \
     --optimizer        "$OPTIMIZER" \
-    --monitor          val/overall_rmse \
+    --monitor          val/overall_mae \
     --patience         15 \
     --overfit_stop \
     --overfit_patience 5 \

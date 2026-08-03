@@ -3,9 +3,10 @@
 #
 # One mechanism, one objective: (station × hour) tokens, mask a subset, ViT
 # encoder on the visible tokens, shallow decoder reconstructs the hidden ones.
-# Loss follows the PROJECT convention (not strict MAE): context hours
-# ("time ≤ 0") are scored on masked tokens only; the future block
-# (+10 min … +6 h) is scored on ALL tokens, masked or visible.
+# Loss: Huber(delta=1) in per-station-normalised space — the same objective
+# as the transformer (mae.py) and the LSTM baseline. Scope follows the PROJECT
+# convention (not strict MAE): context hours ("time ≤ 0") are scored on masked
+# tokens only; the future block (+10 min … +6 h) on ALL tokens.
 # The mask pattern defines the task:
 #   random tokens (75%)  → pretraining signal
 #   whole stations (50%) → gap-filling
@@ -24,7 +25,7 @@
 # Comparability vs LSTM / v14 val panels:
 #   • val/*            = the +30 MIN lead, all stations — SAME keys, SAME
 #     semantics as the v14 / LSTM panels → wandb overlays line up, and the
-#     checkpoint monitor (val/overall_rmse) matches theirs.
+#     checkpoint monitor (val/overall_mae) matches theirs.
 #   • val/block6h_*    = whole masked 6 h block (MAE-native, stricter).
 #   • val/persist_skill = block-level skill vs last-obs persistence;
 #     sanity/dispersion_min = mean-collapse detector.
@@ -58,6 +59,14 @@ STATION_RATIO=0.5   # station-strategy: fraction of stations fully hidden
 FUTURE_SLOTS=6      # future-strategy: hours hidden at the window end
 STRATEGY_PROBS="0.5 0.25 0.25"   # random / station / future per batch
 
+# ── Loss ─────────────────────────────────────────────────────────────────────
+# Huber(delta) in per-station-normalised space — same objective as the
+# transformer (mae.py) and the LSTM baseline, so all three optimise the same
+# thing and val/loss curves are on a comparable scale.
+# delta=1.0 is 1 std: L2 below it, capped-L1 above, so extreme events cannot
+# dominate. Set 0 for plain MSE (the original simple-MAE behaviour).
+HUBER_DELTA=1.0
+
 # ── Trunk forecasting (BERT-hybrid dial) ─────────────────────────────────────
 # fuse_layers 0 = MAE-classic (narrow d128 decoder computes the forecast).
 # fuse_layers>0 = mask tokens join the trunk at full width for N extra blocks:
@@ -88,6 +97,7 @@ python train_simple_mae.py \
     --station_ratio    $STATION_RATIO \
     --future_slots     $FUTURE_SLOTS \
     --strategy_probs   $STRATEGY_PROBS \
+    --huber_delta      $HUBER_DELTA \
     --batch_size       16 \
     --num_workers      3 \
     --epochs           80 \
@@ -97,7 +107,7 @@ python train_simple_mae.py \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
     --bf16 \
-    --monitor          val/overall_rmse \
+    --monitor          val/overall_mae \
     --patience         25 \
     --index_mode       random \
     --random_epoch_size 10000 \

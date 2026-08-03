@@ -332,7 +332,7 @@ INDEX_MODE="--index_mode random --random_epoch_size 10000" # ~2.8× non-overlapp
 #            Checks: raw-token shapes (5,616-token sequence), finite val/loss,
 #            sanity/* line printed, [cuda] preflight, checkpoint writes.
 # SANITY=2 — does it LEARN? 15 epochs x 3,600 windows on 2020-21. Expect
-#            val/overall_rmse falling and sanity/ctx_ratio dropping below 1
+#            val/overall_mae falling and sanity/ctx_ratio dropping below 1
 #            (visible stations beating masked ones at Delta=0 — with the
 #            residual head OFF this is once again a genuine test that the
 #            model uses the observations it can see, as it was in v14).
@@ -487,7 +487,7 @@ python main.py \
     --grad_clip        1.0 \
     --accumulate_grad_batches 4 \
     --patience         40 \
-    --monitor          val/overall_rmse \
+    --monitor          val/overall_mae \
     --overfit_stop \
     --overfit_patience 20 \
     --min_lr           5e-7 \

@@ -80,7 +80,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",         type=int,   default=42)
 
     # Early stopping
-    p.add_argument("--monitor",   type=str,   default="val/overall_rmse")
+    p.add_argument("--monitor",   type=str,   default="val/overall_mae")
     p.add_argument("--patience",  type=int,   default=15)
     p.add_argument("--min_delta", type=float, default=1e-4)
     p.add_argument("--overfit_stop", action="store_true")

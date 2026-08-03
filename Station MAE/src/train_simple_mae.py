@@ -68,6 +68,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--future_slots",  type=int,   default=6)
     p.add_argument("--strategy_probs", type=float, nargs=3, default=[0.5, 0.25, 0.25],
                    metavar=("P_RANDOM", "P_STATION", "P_FUTURE"))
+    p.add_argument("--huber_delta", type=float, default=1.0,
+                   help="Huber delta in per-station-normalised units "
+                        "(default 1.0 = 1 std, matching mae.py and the LSTM "
+                        "baseline so all three models optimise the same "
+                        "objective). 0 = plain MSE.")
 
     # Optimisation
     p.add_argument("--epochs",       type=int,   default=80)
@@ -79,7 +84,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--bf16",         action="store_true")
     p.add_argument("--seed",         type=int,   default=42)
     p.add_argument("--patience",     type=int,   default=25)
-    p.add_argument("--monitor",      type=str,   default="val/overall_rmse")
+    p.add_argument("--monitor",      type=str,   default="val/overall_mae")
 
     # Logging / checkpoints
     p.add_argument("--save_dir",        type=str, default="checkpoints/simple-mae-v1")
@@ -123,6 +128,7 @@ class SimpleMAELightning(pl.LightningModule):
             future_slots=cfg["future_slots"],
             strategy_probs=tuple(cfg["strategy_probs"]),
             fuse_layers=cfg.get("fuse_layers", 0),
+            huber_delta=cfg.get("huber_delta", 1.0),
         )
         # (V,) mean-over-stations std for phys-unit logging (monitoring only)
         self.register_buffer("obs_std", torch.as_tensor(obs_std, dtype=torch.float32))
@@ -144,10 +150,9 @@ class SimpleMAELightning(pl.LightningModule):
         granularities so wandb overlays are honest:
 
         val/*            — the +30 MIN LEAD, all stations: SAME keys and SAME
-                           semantics as the v14 / LSTM panels (their val is the
-                           30-min forecast), so cross-run charts line up.
-                           The checkpoint monitor (val/overall_rmse) therefore
-                           also matches the other models' monitor semantics.
+                           semantics as the v15 / LSTM panels, so cross-run
+                           charts line up. MAE only (no RMSE) — the checkpoint
+                           monitor is val/overall_mae, matching the others.
         val/block6h_*    — averaged over the WHOLE masked 6 h block: the
                            stricter MAE-native metric (was val/* in the subset
                            smoke run — renamed to stop the key collision).
@@ -171,40 +176,37 @@ class SimpleMAELightning(pl.LightningModule):
         # future starts at +10 min → +30 min is the 3rd hidden step (index 2).
         s30 = 2
         t30, p30, m30 = t[:, s30], p[:, s30], m[:, s30]           # (B, N, Vt)
-        sq30 = 0.0; n30 = 0
+        # MAE only (project decision — RMSE is derived downstream from the
+        # test dumps, where MAE/MSE/RMSE are all computed from predictions.pt)
+        abs30 = 0.0; n30 = 0
         for v, name in enumerate(TARGET_VARIABLE_NAMES):
             mv = m30[..., v]
             if not mv.any():
                 continue
-            e = p30[..., v][mv] - t30[..., v][mv]
-            rmse, mae = e.pow(2).mean().sqrt(), e.abs().mean()
-            self.log(f"val/{name}_rmse",      rmse, on_epoch=True, sync_dist=True)
-            self.log(f"val/{name}_mae",       mae,  on_epoch=True, sync_dist=True)
-            self.log(f"val/{name}_rmse_phys", rmse * self.obs_std[v],
+            e = (p30[..., v][mv] - t30[..., v][mv]).abs()
+            mae = e.mean()
+            self.log(f"val/{name}_mae",      mae, on_epoch=True, sync_dist=True)
+            self.log(f"val/{name}_mae_phys", mae * self.obs_std[v],
                      on_epoch=True, sync_dist=True)
-            self.log(f"val/{name}_mae_phys",  mae * self.obs_std[v],
-                     on_epoch=True, sync_dist=True)
-            sq30 = sq30 + e.pow(2).sum()
-            n30  = n30 + mv.sum()
+            abs30 = abs30 + e.sum()
+            n30   = n30 + mv.sum()
         if not isinstance(n30, int):
-            self.log("val/overall_rmse", (sq30 / n30.clamp(min=1)).sqrt(),
+            self.log("val/overall_mae", abs30 / n30.clamp(min=1),
                      on_epoch=True, prog_bar=True, sync_dist=True)
 
         # ── Whole 6 h block (MAE-native, stricter) ───────────────────────
-        sq_sum = 0.0; n_sum = 0
+        abs_sum = 0.0; n_sum = 0
         for v, name in enumerate(TARGET_VARIABLE_NAMES):
             mv = m[..., v]
             if not mv.any():
                 continue
-            e = p[..., v][mv] - t[..., v][mv]
-            self.log(f"val/block6h_{name}_rmse_phys",
-                     e.pow(2).mean().sqrt() * self.obs_std[v],
+            e = (p[..., v][mv] - t[..., v][mv]).abs()
+            self.log(f"val/block6h_{name}_mae_phys", e.mean() * self.obs_std[v],
                      on_epoch=True, sync_dist=True)
-            sq_sum = sq_sum + e.pow(2).sum()
-            n_sum  = n_sum + mv.sum()
+            abs_sum = abs_sum + e.sum()
+            n_sum   = n_sum + mv.sum()
         if not isinstance(n_sum, int):
-            self.log("val/block6h_overall_rmse",
-                     (sq_sum / n_sum.clamp(min=1)).sqrt(),
+            self.log("val/block6h_overall_mae", abs_sum / n_sum.clamp(min=1),
                      on_epoch=True, sync_dist=True)
 
         # ── Persistence skill over the block + dispersion sanity ─────────

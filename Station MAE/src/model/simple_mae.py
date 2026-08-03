@@ -3,9 +3,8 @@ simple_mae.py — the canonical Masked Autoencoder for the station grid.
 
 One mechanism, one objective: tokens are (station × hour) patches, a mask
 pattern hides some of them, the encoder sees only the visible ones, a shallow
-decoder reconstructs the hidden ones, and the loss is MSE on masked tokens
-only (He et al. 2022, strict MAE).  The mask pattern — not the architecture —
-defines the task:
+decoder reconstructs the hidden ones (He et al. 2022).  The mask pattern —
+not the architecture — defines the task:
 
     random tokens      → pretraining signal (spatio-temporal MAE,
                          Feichtenhofer et al. 2022)
@@ -33,7 +32,9 @@ Token layout for a window of W = S·P steps (default S=18 hours, P=6 steps):
 Targets: the NUM_TARGET_VARIABLES (=5) forecast variables at all P steps of
 each scored token (precipitation stays input-only, as everywhere else in the
 project).  The loss follows the PROJECT convention rather than the strict
-MAE: the window always splits into context (first S − future_slots hours,
+MAE: the loss is Huber(δ=1) by default (matching mae.py and the LSTM so all
+three models optimise the same objective), and the window always splits into
+context (first S − future_slots hours,
 "time ≤ 0") and future (last future_slots hours).  Context tokens are scored
 on MASKED positions only (reconstruction — visible copies would dilute the
 gradient, mae.py's δ=0 rule); future tokens are scored for EVERYONE, masked
@@ -74,6 +75,9 @@ class SimpleMAE(nn.Module):
         future_slots:   Hour-slots masked by the "future" strategy (default 6 = 6 h).
         strategy_probs: Sampling probabilities for (random, station, future)
                         during training (default 0.5 / 0.25 / 0.25).
+        huber_delta:    Huber δ in per-station-normalised units (default 1.0
+                        = 1 std, matching mae.py and the LSTM baseline).
+                        Set 0 for plain MSE.
     """
 
     def __init__(
@@ -93,6 +97,7 @@ class SimpleMAE(nn.Module):
         future_slots:   int   = 6,
         strategy_probs: "tuple[float, float, float]" = (0.5, 0.25, 0.25),
         fuse_layers:    int   = 0,
+        huber_delta:    float = 1.0,
     ):
         super().__init__()
         assert window_steps % patch_steps == 0, "patch_steps must divide window_steps"
@@ -106,6 +111,8 @@ class SimpleMAE(nn.Module):
         self.station_ratio  = station_ratio
         self.future_slots   = future_slots
         self.strategy_probs = strategy_probs
+        # Huber δ in normalised space (= 1 std). 0 → plain MSE.
+        self.huber_delta    = float(huber_delta)
 
         # ── Tokenizer: raw hour-patch → d_model ──────────────────────────
         # [values·mask ‖ mask] so a true zero (station mean) is distinguishable
@@ -319,8 +326,21 @@ class SimpleMAE(nn.Module):
                      .expand(B, S, P, N)
                      .reshape(B, W, N, 1))
         valid = step_mask * x_mask[..., :self.Vt]              # (B, W, N, Vt)
-        err2  = (preds - x[..., :self.Vt]).pow(2) * valid
-        loss  = err2.sum() / valid.sum().clamp(min=1.0)
+        err   = preds - x[..., :self.Vt]
+        if self.huber_delta > 0:
+            # Huber(δ) in per-station-normalised space — matches mae.py /
+            # the LSTM baseline, so all three models optimise the same
+            # objective. Below δ it is L2 (MSE gradient); above δ it is L1
+            # with a capped gradient, so extreme meteorological events cannot
+            # dominate the updates.
+            d       = self.huber_delta
+            abs_err = err.abs()
+            elem    = torch.where(abs_err <= d,
+                                  0.5 * err.pow(2),
+                                  d * (abs_err - 0.5 * d))
+        else:
+            elem = err.pow(2)                                  # plain MSE
+        loss = (elem * valid).sum() / valid.sum().clamp(min=1.0)
 
         return loss, preds, token_mask, strategy
 
