@@ -429,8 +429,10 @@ fi
 # This branch changes the encoder's tokenization and the prediction head, so
 # the very first launch should be a 2-minute smoke run, NOT the full budget:
 #
-#     python main.py ... --epochs 1 --random_epoch_size 200        # ~2 min
+#     SANITY=1 bash src/scripts/run_full_cloud.sh                  # ~5 min
+#     SANITY=2 bash src/scripts/run_full_cloud.sh                  # ~1 h
 #
+# SANITY=1 answers "does it run?", SANITY=2 answers "does it learn?".
 # Confirm in the output:
 #   1. no shape/OOM error on the 1,872-token sequence (24 x 78);
 #   2. "[cuda] ✓ torch ... A100" appeared at the top (preflight);
