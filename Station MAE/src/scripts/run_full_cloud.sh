@@ -62,7 +62,7 @@
 #   bash src/scripts/run_full_cloud.sh
 
 # ═══════════════════════════════════════════════════════════════════════════
-# v15 vs v14 — FIVE TARGETED FIXES (see report/v14-vs-v15-changes.md)
+# v15 vs v14 — FIVE TARGETED FIXES (fix 3 disabled after the sanity run) (see report/v14-vs-v15-changes.md)
 # ═══════════════════════════════════════════════════════════════════════════
 #
 # The simple-MAE detour was the controlled experiment that identified WHICH
@@ -81,11 +81,30 @@
 #    redundant once the last hour is in the main sequence. Deletes the
 #    subsystem behind the silent-eval bug AND the zero-key attention issue.
 #
-# 3. PERSISTENCE-RESIDUAL HEAD  --residual_head
-#    y_hat = y(t0) + f(.), so the model STARTS at persistence instead of
+# 3. PERSISTENCE-RESIDUAL HEAD  --residual_head   ← DISABLED, see below
+#    y_hat = y(t0) + f(.), so the model would START at persistence instead of
 #    spending epochs learning it. Masked stations keep a ZERO base — their
-#    last observation is hidden information, so gap-filling is unchanged
-#    and no leak is reintroduced.
+#    last observation is hidden information, so no leak is reintroduced.
+#
+#    TURNED OFF after the sanity2 subset run (epochs 2-7):
+#      • every val metric bottomed at epoch 4 then degraded
+#        (overall_rmse 0.667 -> 0.677, temperature 3.05 -> 3.21 C)
+#      • val/horizon_sensitivity FELL 0.397 -> 0.365, i.e. f was collapsing
+#        toward a lead-time-independent constant
+#    Diagnosis: the base differs per station (y(t0) if visible, 0 if masked)
+#    but the decoder queries carry NO maskedness signal - they are
+#    mask_token + pos + topo + delta + step for every station alike. One head
+#    therefore has to emit a small DEVIATION for visible stations and a full
+#    ABSOLUTE value for masked ones, with no way to tell which regime it is
+#    in. Bimodal target, unobservable condition.
+#
+#    It also broke comparability with the simple-MAE runs, which have no
+#    residual head.
+#
+#    To revive it, the decoder needs an explicit "this station is masked"
+#    embedding added to its queries (masked_idx is already available in
+#    mae.py; ~5 lines). That is NOT leakage - which stations are offline is
+#    known at deployment time; only their VALUES must stay hidden.
 #
 # 4. TRUNK SLIMMED  --d_model 384 --enc_layers 8  (was: 512 / 16)
 #    The 16-layer depth was receptive-field arithmetic for WINDOWED
@@ -437,7 +456,6 @@ python main.py \
     --dec_layers       2 \
     --mask_ratio       0.5 \
     --patch_schedule   48x6,18x3,6x1 \
-    --residual_head \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.0 \
