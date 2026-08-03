@@ -24,7 +24,7 @@ SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"
 cd "${SRC_DIR}"
 
-RUN_NAME="simple-mae-v2"
+RUN_NAME="simple-mae-v1"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${RUN_NAME}/best.ckpt"
 SAVE_DIR="${PROJ_DIR}/test_results"
 
