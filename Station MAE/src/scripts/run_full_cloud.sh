@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_full_cloud.sh — full training run, A100 80GB PCIe (MIG 3g.20gb)
 #
-# CURRENT CONFIG (v15): NO patching (raw 10-min), full attention, d_model=384,
+# CURRENT CONFIG (v15): uniform patch-3 (30-min tokens), full attention, d_model=384,
 # 16 layers, 100-epoch schedule, uniform variable weights.
 # Earlier settings are kept as commented alternatives.
 #
@@ -70,29 +70,26 @@
 # query decoder, exactly what the project description asks for — and repairs
 # the five defects it exposed. MAE-faithful depth split kept: enc 8 / dec 2.
 #
-# 1. NO PATCHING  --temporal_patch 1   (v14: patch 6 · telescopic: 48x6,18x3,6x1)
-#    All 72 raw 10-min steps enter the encoder: 72 x 78 = 5,616 tokens, full
-#    attention, zero information loss. The model decides what matters instead
-#    of a hand-set resolution schedule.
+# 1. UNIFORM PATCHING, FINER THAN v14  --temporal_patch 3   (v14 used 6)
+#    Three 10-min steps become one token: 24 temporal positions, 24 x 78 =
+#    1,872 encoder tokens with full attention.
 #
-#    Why this is affordable now: patching was introduced in v13 to fix v12's
-#    receptive field, but that problem came from WINDOWED attention, not from
-#    raw resolution — with full attention every token sees the whole window
-#    from layer 1 whether patched or not. And the d1024 -> d384 cut more than
-#    pays for the longer sequence:
-#        v12  (tw6 windowed, d1024, L16)   ~1,217 GFLOP/pass   (ran 100 h)
-#        raw  (full attn,    d384,  L8)      ~273 GFLOP/pass   4.5x CHEAPER
-#        telescopic(20)                       ~37 GFLOP/pass
-#    So raw costs ~7x the telescopic variant but a fifth of the run you have
-#    already completed.
+#    Why 3 and not 6: the val metric is a 30-MIN forecast. At P=6 that is half
+#    an hourly token, which is the "hourly patches starve the short lead"
+#    problem behind v14. At P=3 a token IS 30 min, so the first lead is one
+#    token ahead. Set PATCH=1 (raw, no loss of resolution) or PATCH=6 (exactly
+#    v14) to walk the tokenization ablation — it is a single variable.
 #
-#    The telescopic schedule remains available (--patch_schedule) as the
-#    middle rung of the tokenization ablation: patch-6 / telescopic / raw.
+#    Cost, per encoder pass at d384/L8:
+#        v12 (tw6 windowed, d1024, L16)  ~1,217 GFLOP   (the 100 h run)
+#        P=1 raw                           ~273 GFLOP
+#        P=3 (current)                      ~48 GFLOP
+#        P=6                                ~19 GFLOP
+#    The d1024 -> d384 cut is what makes any of these affordable.
 #
 #    NOTE for evaluation: at mask_ratio 0.00 nothing is hidden, so the encoder
-#    carries all 155 stations -> 72 x 155 = 11,160 tokens, ~4x the training
-#    cost. That dump is the memory bottleneck; keep run_test_cloud.sh's
-#    batch_size low (8, or lower if it OOMs).
+#    carries all 155 stations -> 24 x 155 = 3,720 tokens, 2x the training
+#    sequence. run_test_cloud.sh sizes its batch for that.
 #
 # 2. INPUT-CONTEXT PATHWAY REMOVED  (was: --input_context_cross_attn)
 #    Its only job was smuggling raw recency past the uniform patching —
@@ -268,6 +265,28 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 # ENCODER="--factorised_encoder"                     # default: full axial (temporal + spatial)
 # ENCODER="--factorised_encoder --no_spatial_attn"  # temporal-only (station-independent encoder)
 # ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
+# ── Temporal tokenization ────────────────────────────────────────────────────
+# Uniform patching: P consecutive 10-min steps become ONE encoder token.
+#   P=1  raw       72 positions -> 5,616 tokens  (~273 GFLOP/pass)  no loss, slow
+#   P=3  30-min    24 positions -> 1,872 tokens  (~48 GFLOP)        <- current
+#   P=6  hourly    12 positions ->   936 tokens  (~19 GFLOP)        = v14
+# P=3 keeps a 30-min token, so the +30 min forecast is one token ahead rather
+# than half a token as it was with v14's hourly patches — the "hourly patches
+# starve the short lead" diagnosis — while costing ~6x less than raw.
+# P must divide --window (72): 1, 2, 3, 4, 6, 8, 9, 12, 18, 24, 36, 72.
+#
+# WHY NOT P=1 (raw): the sanity2 run at P=1 collapsed. val/horizon_sensitivity
+# FELL 0.17 -> 0.06 (the metric's own "Delta-embedding unused" floor is 0.05)
+# and sanity/dispersion_min sat at ~0.08 — the decoder emitted one nearly
+# constant value regardless of station AND of lead time. The telescopic run at
+# the SAME learning rate did not collapse, so this is not an lr problem.
+#   Mechanism: softmax over 5,616 keys starts almost uniform (~1/5616 each),
+#   so every output is a near-average of all values — "predict the mean of
+#   everything" is the natural starting point, and a constant has no lead-time
+#   dependence. At 1,872 tokens that dilution is 3x milder.
+# If P=3 also flatlines, the next levers are lr (3e-4) and the paradigm itself.
+PATCH=3
+
 ENCODER=""                                         # flat self-attention over W·N tokens
 
 # ── Temporal window (flat or factorised encoder) ─────────────────────────────
@@ -413,14 +432,20 @@ fi
 #     python main.py ... --epochs 1 --random_epoch_size 200        # ~2 min
 #
 # Confirm in the output:
-#   1. no shape/OOM error on the 5,616-token raw sequence (72 x 78);
+#   1. no shape/OOM error on the 1,872-token sequence (24 x 78);
 #   2. "[cuda] ✓ torch ... A100" appeared at the top (preflight);
 #   3. val/loss is finite and sanity/* prints one line per epoch;
-#   4. sanity ctx_ratio < 1 — VISIBLE stations beat masked ones, i.e. the
-#      raw 10-min tokens actually carry recent observations to the decoder
-#      (this is what the removed input_context pathway used to provide).
-# --compile matters more with raw tokens (~1.3x on a much longer sequence),
-# but it is a speedup, not a correctness requirement: drop it if it errors.
+#   4. val/horizon_sensitivity RISING off the floor (>0.05, ideally toward
+#      0.2+) and sanity/dispersion_min climbing past ~0.3. Together these say
+#      the model has left the constant-output basin and is using the
+#      Delta-embedding. FALLING horizon_sensitivity is the collapse signature
+#      that killed the P=1 run — kill the job and re-tune rather than waiting.
+#   5. sanity ctx_ratio < 0.9 — VISIBLE stations beat masked ones at Delta=0,
+#      i.e. the 30-min tokens carry recent observations to the decoder (what
+#      the removed input_context pathway used to provide). NOTE this only
+#      becomes meaningful once dispersion is up: a constant predictor scores
+#      exactly 1.00 here by arithmetic, not by failure of the context path.
+# --compile gives ~1.3x; it is a speedup, not a correctness requirement.
 # ── Resume ───────────────────────────────────────────────────────────────────
 # If last.ckpt exists in SAVE_DIR, continue from it: full training state
 # (weights, optimiser, LR schedule, epoch counter) is restored.
@@ -474,7 +499,7 @@ python main.py \
     --enc_layers       8 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
-    --temporal_patch   1 \
+    --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.0 \
@@ -501,7 +526,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "raw-d384-L8-v15${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v15${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
