@@ -46,7 +46,7 @@ cd "${SRC_DIR}"
 # WandB offline on Renku (flaky egress falsely marks runs "crashed").
 source "${SCRIPT_DIR}/_wandb_preflight.sh"
 
-RUN_NAME="simple-mae-v2"
+RUN_NAME="simple-mae-v3"
 SAVE_DIR="${PROJ_DIR}/checkpoints/${RUN_NAME}"
 
 EXCLUDE="--exclude_stations PFA"   # same station dropped as everywhere else
