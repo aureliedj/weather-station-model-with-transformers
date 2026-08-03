@@ -287,7 +287,7 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 # If P=3 also flatlines, the next levers are lr (3e-4) and the paradigm itself.
 PATCH=3
 
-ENCODER=""                                         # flat self-attention over W·N tokens
+ENCODER="--factorised_encoder"            # flat self-attention over W·N tokens
 
 # ── Temporal window (flat or factorised encoder) ─────────────────────────────
 #
