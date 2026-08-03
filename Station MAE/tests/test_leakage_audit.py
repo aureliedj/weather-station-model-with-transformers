@@ -36,9 +36,23 @@ def src(rel):
         return f.read()
 
 
+def code(rel):
+    """Source with comments and docstrings stripped — for checks that must
+    reflect what RUNS, not what the comments say about it (a comment
+    mentioning a removed pathway must not fail an 'is it gone?' check)."""
+    import ast
+    tree = ast.parse(src(rel))
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                          ast.Module)) and ast.get_docstring(n):
+            n.body = n.body[1:]
+    return ast.unparse(tree)
+
+
 ds_src = src("data/dataset.py")
 mae_src = src("model/mae.py")
 enc_src = src("model/encoder.py")
+dec_src = src("model/decoder.py")
 main_src = src("main.py")
 test_src = src("test.py")
 
@@ -139,20 +153,29 @@ check("y / y_mask are never passed to the encoder or decoder",
        "which sensors are alive at target time — both are leaks."))
 
 check("delta=0 loss is restricted to MASKED stations",
-      'if k == 0 and delta_steps[0, 0].item() == 0:' in mae_src
+      "if k == 0 and delta_steps[0, 0].item() == 0" in mae_src
       and "_midx_k = masked_idx" in mae_src,
       "At delta=0 the target timestamp IS the last input step. For a VISIBLE\n"
       "station the answer is already in the input, so supervising it there\n"
       "would reward copying. Restricting to masked stations makes it genuine\n"
       "gap-filling.")
 
-check("input_context zeroes masked stations",
-      "input_context = tokens.new_zeros" in enc_src
-      and "input_context.scatter_(" in enc_src,
-      "input_context is built as zeros and only VISIBLE stations are scattered\n"
-      "in. Building it from the full token tensor would hand the decoder every\n"
-      "masked station's own current value, bypassing the mask entirely.\n"
-      "(This was a real bug once — mr0.00 and mr0.50 gave identical output.)")
+check("input_context pathway is gone (v15)",
+      "input_context" not in code("model/encoder.py")
+      and "input_cross_attn" not in code("model/decoder.py"),
+      "v15 removed the side-channel that fed the decoder raw last-step tokens.\n"
+      "It existed only to bypass uniform patching; the telescopic schedule now\n"
+      "keeps the last hour at native resolution in the main sequence. Its\n"
+      "removal also retires the leak it once caused (mr0.00 == mr0.50) and the\n"
+      "silent-rebuild bug that invalidated every v9-v13 test number.")
+
+check("residual head zeroes the base for MASKED stations",
+      "_persistence_base" in mae_src
+      and "vis.scatter_(1, masked_idx.unsqueeze(-1), 0.0)" in mae_src,
+      "The residual head predicts y(t0) + f(.). y(t0) for a MASKED station is\n"
+      "hidden information — feeding it through the base would re-create the\n"
+      "exact leak input_context used to have. The base is therefore zeroed at\n"
+      "masked stations: gap-filling still predicts the full value.")
 
 print()
 print("=" * 74)
