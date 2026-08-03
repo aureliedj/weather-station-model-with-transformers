@@ -134,11 +134,12 @@ class StationMAE(nn.Module):
         encoder_spatial_attn:    bool  = True,
         temporal_window:         int   = 0,
         temporal_patch:          int   = 1,
+        patch_schedule:          "str | None" = None,   # v15 telescopic tokenization
         cross_attention_decoder: bool  = False,
         drop_path_rate:          float = 0.0,
         masked_only_loss:         bool  = False,
         joint_encoder:            bool  = False,
-        input_context_cross_attn: bool  = False,
+        residual_head:            bool  = False,        # v15: ŷ = y(t0) + f(·)
         delta0_weight:            float = 1.0,
         var_weights:              "list | None" = None,
         use_nll_loss:             bool  = False,
@@ -277,10 +278,13 @@ class StationMAE(nn.Module):
             spatial_attn=encoder_spatial_attn,
             temporal_window=temporal_window,
             temporal_patch=temporal_patch,
+            patch_schedule=patch_schedule,
             drop_path_rate=drop_path_rate,
             joint=joint_encoder,
             step_emb=shared_step_emb,
         )
+        self.residual_head    = bool(residual_head)
+        self.num_target_vars_ = num_target_vars
 
         self.decoder = StationMAEDecoder(
             d_model=d_model,
@@ -294,34 +298,46 @@ class StationMAE(nn.Module):
             use_checkpoint=use_checkpoint,
             cross_attention=cross_attention_decoder,
             drop_path_rate=drop_path_rate,
-            input_context_cross_attn=input_context_cross_attn,
             predict_uncertainty=use_nll_loss,
             window_size=window_size,
             step_emb=shared_step_emb,
         )
 
     # ------------------------------------------------------------------
-    # Input-context key-padding mask
+    # v15: persistence-residual base
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _ctx_padding(
+    def _persistence_base(
+        self,
+        x:          torch.Tensor,            # (B, W, N, V)  normalised obs
+        x_mask:     torch.Tensor,            # (B, W, N, V)  sensor availability
         masked_idx: "torch.Tensor | None",   # (B, N_masked) long
-        n_stations: int,
-        device:     torch.device,
     ) -> "torch.Tensor | None":
         """
-        Build the (B, N) bool key-padding mask for input_context cross-attention:
-        True at MASKED stations, whose context slots are zero-filled and must
-        not be attended (a zero key still receives softmax mass otherwise).
-        Returns None when nothing is masked (mask_ratio = 0) — no-op fast path.
+        Last-observation base for the residual head:  ŷ = base + f(·).
+
+        base[b, n, v] = x[b, W-1, n, v]  if station n is VISIBLE and sensor
+                        present at the last step; 0 (the per-station mean in
+                        normalised space) otherwise.
+
+        Masked stations are zeroed EXPLICITLY: their last observation is
+        hidden information, and feeding it through the base would bypass the
+        encoder mask — the exact leak class the old input_context had. With a
+        zero base, the decoder learns the full value for hidden stations (the
+        gap-filling regime) and only the deviation-from-persistence for
+        visible ones (the forecast regime).
+        Returns None when the residual head is disabled.
         """
-        if masked_idx is None or masked_idx.numel() == 0:
+        if not self.residual_head:
             return None
-        B   = masked_idx.shape[0]
-        pad = torch.zeros(B, n_stations, dtype=torch.bool, device=device)
-        pad.scatter_(1, masked_idx, True)
-        return pad
+        Vt   = self.num_target_vars_
+        base = x[:, -1, :, :Vt] * x_mask[:, -1, :, :Vt]     # (B, N, Vt)
+        if masked_idx is not None and masked_idx.numel() > 0:
+            B, N = base.shape[:2]
+            vis = torch.ones(B, N, 1, dtype=base.dtype, device=base.device)
+            vis.scatter_(1, masked_idx.unsqueeze(-1), 0.0)
+            base = base * vis
+        return base
 
     # ------------------------------------------------------------------
     # Single-delta training forward
@@ -341,26 +357,25 @@ class StationMAE(nn.Module):
         """
         Full training forward pass for a single lead-time per sample.
 
-        Note on loss semantics (unchanged by the input-context padding mask):
-        the mask only affects which context KEYS the decoder may attend to.
-        WHERE the loss is computed is untouched — δ=0 is still scored on the
-        MASKED stations only (inpainting) and δ>0 on all stations, exactly as
-        before.
+        Loss semantics unchanged in v15: δ=0 is still scored on the MASKED
+        stations only (inpainting) and δ>0 on all stations. The residual head
+        only re-parameterises WHAT the decoder outputs (deviation from the
+        last observation for visible stations), never WHERE the loss applies.
 
         Returns:
             loss:           scalar — MSE on all N stations (present sensors only)
             preds:          (B, N, num_target_vars)
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
-        encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        ctx_pad = self._ctx_padding(masked_idx, x.shape[2], x.device)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                   input_context=input_ctx,
-                                   input_context_padding=ctx_pad)
+        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps)
         if self.use_nll_loss:
             preds, log_var = decoder_out
         else:
             preds, log_var = decoder_out, None
+        base = self._persistence_base(x, x_mask, masked_idx)
+        if base is not None:
+            preds = preds + base                       # (B, N, Vt)
 
         y_target      = y[:, :, :self.num_target_vars]
         y_mask_target = y_mask[:, :, :self.num_target_vars]
@@ -420,20 +435,23 @@ class StationMAE(nn.Module):
         K = delta_steps.shape[1]
 
         # ── Encoder: runs once ──────────────────────────────────────────
-        encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        # encoded: (B, W*N_vis, d_model)
-        ctx_pad = self._ctx_padding(masked_idx, x.shape[2], x.device)
+        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+        # encoded: (B, T*N_vis, d_model)   (T = patched sequence length)
 
         # ── Decoder: runs once for all K lead-times ──────────────────────
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                   input_context=input_ctx,
-                                   input_context_padding=ctx_pad)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps)
         if self.use_nll_loss:
             preds_all, log_var_all = decoder_out
         else:
             preds_all, log_var_all = decoder_out, None
         # preds_all: (B, K, N, num_target_vars)
         # log_var_all: (B, K, N, num_target_vars)  or  None
+
+        # v15 residual head: every horizon predicts a deviation from the last
+        # observation (zero base for masked stations — no leakage).
+        base = self._persistence_base(x, x_mask, masked_idx)
+        if base is not None:
+            preds_all = preds_all + base.unsqueeze(1)   # (B, K, N, Vt)
 
         # ── Horizon-weighted loss ─────────────────────────────────────────
         # Uniform weights across all K horizons (normalised to sum=1).
@@ -516,15 +534,14 @@ class StationMAE(nn.Module):
             preds: (B, N, num_target_vars) predictions for all stations.
         """
         self.eval()
-        encoded, masked_idx, _, input_ctx = self.encoder(x, x_mask, spatial, x_hours)
-        ctx_pad = self._ctx_padding(masked_idx, x.shape[2], x.device)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                   input_context=input_ctx,
-                                   input_context_padding=ctx_pad)
+        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps)
         # When NLL mode is active, decoder returns (mean, log_var) — return mean only.
-        if self.use_nll_loss:
-            return decoder_out[0]
-        return decoder_out
+        preds = decoder_out[0] if self.use_nll_loss else decoder_out
+        base  = self._persistence_base(x, x_mask, masked_idx)
+        if base is not None:
+            preds = preds + (base.unsqueeze(1) if preds.dim() == 4 else base)
+        return preds
 
     # ------------------------------------------------------------------
     # Loss

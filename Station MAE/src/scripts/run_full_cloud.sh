@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_full_cloud.sh — full training run, A100 80GB PCIe (MIG 3g.20gb)
 #
-# CURRENT CONFIG (v14): patched encoder — P=6, full attention, d_model=512,
+# CURRENT CONFIG (v15): telescopic tokenization, full attention, d_model=384,
 # 16 layers, 100-epoch schedule, uniform variable weights.
 # Earlier settings are kept as commented alternatives.
 #
@@ -61,6 +61,45 @@
 # Usage:
 #   bash src/scripts/run_full_cloud.sh
 
+# ═══════════════════════════════════════════════════════════════════════════
+# v15 vs v14 — FIVE TARGETED FIXES (see report/v14-vs-v15-changes.md)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# The simple-MAE detour was the controlled experiment that identified WHICH
+# parts of v14 needed fixing. v15 keeps v14's paradigm — delta-conditioned
+# query decoder, exactly what the project description asks for — and repairs
+# the five defects it exposed. MAE-faithful depth split kept: enc 8 / dec 2.
+#
+# 1. TELESCOPIC TOKENIZATION  --patch_schedule 48x6,18x3,6x1  (was: patch 6)
+#    Resolution matched to forecast-relevance: oldest 8 h hourly, middle 3 h
+#    half-hourly, LAST HOUR RAW. 20 temporal positions (vs 12), and short
+#    leads finally see 10-min structure. This is the root fix for the
+#    "hourly patches starve the 30-min forecast" diagnosis.
+#
+# 2. INPUT-CONTEXT PATHWAY REMOVED  (was: --input_context_cross_attn)
+#    Its only job was smuggling raw recency past the uniform patching —
+#    redundant once the last hour is in the main sequence. Deletes the
+#    subsystem behind the silent-eval bug AND the zero-key attention issue.
+#
+# 3. PERSISTENCE-RESIDUAL HEAD  --residual_head
+#    y_hat = y(t0) + f(.), so the model STARTS at persistence instead of
+#    spending epochs learning it. Masked stations keep a ZERO base — their
+#    last observation is hidden information, so gap-filling is unchanged
+#    and no leak is reintroduced.
+#
+# 4. TRUNK SLIMMED  --d_model 384 --enc_layers 8  (was: 512 / 16)
+#    The 16-layer depth was receptive-field arithmetic for WINDOWED
+#    attention, obsolete since v13 went full-attention. ~65M -> ~20M params,
+#    which also pays for the 1.7x longer telescopic sequence.
+#    enc 8 / dec 2 preserves the MAE-style asymmetry of the original design.
+#
+# 5. EVAL GUARD  test.py now ABORTS on pre-v15 checkpoints (they carry
+#    decoder.input_cross_attn.* weights). Evaluate those with the code that
+#    trained them — never mix.
+#
+# NOTE: --mask_ratio is back to 0.5 (v14's last run used 0 for the
+# masking-ablation). Set it to 0 again only to repeat that ablation.
+#
 # ═══════════════════════════════════════════════════════════════════════════
 # v14 vs v13 — WHY THIS IS A FRESH RUN
 # ═══════════════════════════════════════════════════════════════════════════
@@ -336,13 +375,14 @@ python main.py \
     --delta_mode       fixed_grid \
     --delta_grid_stride 3 \
     --mlp_ratio        4.0 \
-    --d_model          512 \
+    --d_model          384 \
     --enc_heads        8 \
     --dec_heads        8 \
-    --enc_layers       16 \
+    --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0 \
-    --temporal_patch   6 \
+    --mask_ratio       0.5 \
+    --patch_schedule   48x6,18x3,6x1 \
+    --residual_head \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.0 \
@@ -354,7 +394,6 @@ python main.py \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
     --accumulate_grad_batches 4 \
-    --input_context_cross_attn \
     --patience         40 \
     --monitor          val/overall_rmse \
     --overfit_stop \
@@ -370,7 +409,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   patch6-d512-L16-v14 \
+    --wandb_run_name   telescopic-d384-L8-v15 \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
 # WandB runs ONLINE (default). If Renku blocks outbound connections, add
