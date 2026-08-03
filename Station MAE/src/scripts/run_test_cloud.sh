@@ -37,7 +37,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 # previously produced a run that loaded v11 while writing into test_results/v12.
 #
 #   RUN_NAME    checkpoint directory              notes
-#   v15         checkpoints/full_run_cloud_v15    telescopic + residual head  ← current
+#   v15         checkpoints/full_run_cloud_v15    raw 10-min tokens, no residual  ← current
 #   v14         checkpoints/full_run_cloud_v14    patch-6, input-context decoder
 #   v13         checkpoints/full_run_cloud_v13    pre-audit-fix architecture
 #   v12/v11/v9  checkpoints/...                   older Huber / NLL runs
@@ -100,20 +100,21 @@ MASK_RATIOS="0.5 0.0"   # mr0.50 FIRST: it is the trained setting and gives
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
 # 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
 # batch_size: inference keeps no optimiser state and no activations, so it can
-# run far larger batches than training. 16 is the v15 default (was 32 for v14).
+# run larger batches than training — but v15 trains WITHOUT patching, so the
+# sequences are long and 8 is the safe default here (32 suited patched v14).
 #
 # Two things make mr0.00 the heaviest configuration this ever runs:
 #   • nothing is masked, so the encoder carries all 155 stations instead of
 #     the ~78 it sees during training;
-#   • v15's telescopic schedule gives 20 temporal positions instead of 12.
-# Together: 20x155 = 3,100 tokens vs v14's 12x155 = 1,860 (and vs 936 at
-# training time) — on 11,684 windows. Hence the more conservative default.
+#   • v15 uses RAW 10-min tokens (no patching): 72 temporal positions.
+# Together: 72x155 = 11,160 tokens vs 72x78 = 5,616 at training time, and vs
+# v14's patched 12x155 = 1,860 — on 11,684 windows. This is by far the
+# largest sequence the project ever runs; drop to 4 if it OOMs.
 # Predictions are bit-identical at any batch size; only speed changes.
-# Raise to 32 if there is headroom; drop to 8 if mr0.00 OOMs.
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       16 \
+    --batch_size       8 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --stride           "$STRIDE" \

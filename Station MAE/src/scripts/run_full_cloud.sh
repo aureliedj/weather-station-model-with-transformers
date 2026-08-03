@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # run_full_cloud.sh — full training run, A100 80GB PCIe (MIG 3g.20gb)
 #
-# CURRENT CONFIG (v15): telescopic tokenization, full attention, d_model=384,
+# CURRENT CONFIG (v15): NO patching (raw 10-min), full attention, d_model=384,
 # 16 layers, 100-epoch schedule, uniform variable weights.
 # Earlier settings are kept as commented alternatives.
 #
@@ -70,11 +70,29 @@
 # query decoder, exactly what the project description asks for — and repairs
 # the five defects it exposed. MAE-faithful depth split kept: enc 8 / dec 2.
 #
-# 1. TELESCOPIC TOKENIZATION  --patch_schedule 48x6,18x3,6x1  (was: patch 6)
-#    Resolution matched to forecast-relevance: oldest 8 h hourly, middle 3 h
-#    half-hourly, LAST HOUR RAW. 20 temporal positions (vs 12), and short
-#    leads finally see 10-min structure. This is the root fix for the
-#    "hourly patches starve the 30-min forecast" diagnosis.
+# 1. NO PATCHING  --temporal_patch 1   (v14: patch 6 · telescopic: 48x6,18x3,6x1)
+#    All 72 raw 10-min steps enter the encoder: 72 x 78 = 5,616 tokens, full
+#    attention, zero information loss. The model decides what matters instead
+#    of a hand-set resolution schedule.
+#
+#    Why this is affordable now: patching was introduced in v13 to fix v12's
+#    receptive field, but that problem came from WINDOWED attention, not from
+#    raw resolution — with full attention every token sees the whole window
+#    from layer 1 whether patched or not. And the d1024 -> d384 cut more than
+#    pays for the longer sequence:
+#        v12  (tw6 windowed, d1024, L16)   ~1,217 GFLOP/pass   (ran 100 h)
+#        raw  (full attn,    d384,  L8)      ~273 GFLOP/pass   4.5x CHEAPER
+#        telescopic(20)                       ~37 GFLOP/pass
+#    So raw costs ~7x the telescopic variant but a fifth of the run you have
+#    already completed.
+#
+#    The telescopic schedule remains available (--patch_schedule) as the
+#    middle rung of the tokenization ablation: patch-6 / telescopic / raw.
+#
+#    NOTE for evaluation: at mask_ratio 0.00 nothing is hidden, so the encoder
+#    carries all 155 stations -> 72 x 155 = 11,160 tokens, ~4x the training
+#    cost. That dump is the memory bottleneck; keep run_test_cloud.sh's
+#    batch_size low (8, or lower if it OOMs).
 #
 # 2. INPUT-CONTEXT PATHWAY REMOVED  (was: --input_context_cross_attn)
 #    Its only job was smuggling raw recency past the uniform patching —
@@ -455,7 +473,7 @@ python main.py \
     --enc_layers       8 \
     --dec_layers       2 \
     --mask_ratio       0.5 \
-    --patch_schedule   48x6,18x3,6x1 \
+    --temporal_patch   1 \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.0 \
@@ -482,7 +500,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "telescopic-d384-L8-v15${RUN_SUFFIX}" \
+    --wandb_run_name   "raw-d384-L8-v15${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
