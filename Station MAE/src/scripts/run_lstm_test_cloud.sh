@@ -23,9 +23,16 @@ DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
-cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
+cd "${SRC_DIR}"
 
-RUN_NAME="lstm-baseline-v1"
+# Fail fast if torch cannot use the GPU (wheel/driver mismatch on the older node).
+source "${SCRIPT_DIR}/_cuda_preflight.sh"                                              # so `python main.py` and `from data...` resolve
+
+# Keep in sync with run_lstm_cloud.sh — it trains lstm-baseline-v2 and calls
+# THIS script at the end, so a stale name here would silently re-dump the old
+# checkpoint. Set to lstm-baseline-v1 to regenerate the earlier baseline
+# (its dump already exists under test_results/lstm-baseline-v1/).
+RUN_NAME="lstm-baseline-v2"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${RUN_NAME}/best.ckpt"
 SAVE_DIR="${PROJ_DIR}/test_results"
 

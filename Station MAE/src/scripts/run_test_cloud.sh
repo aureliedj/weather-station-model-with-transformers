@@ -28,19 +28,27 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
+
+# Fail fast if torch cannot use the GPU (wheel/driver mismatch on the older node).
+source "${SCRIPT_DIR}/_cuda_preflight.sh"
 # ── Which run to evaluate ────────────────────────────────────────────────────
 # Set RUN_NAME only. The checkpoint path and the output folder are both derived
 # from it, so they cannot drift apart — editing one and forgetting the other
 # previously produced a run that loaded v11 while writing into test_results/v12.
 #
 #   RUN_NAME    checkpoint directory              notes
-#   v9          checkpoints/run_full_cloud_v9     NLL — predicts σ
-#   v11         checkpoints/full_run_cloud_v11    Huber, unweighted
-#   v12         checkpoints/full_run_cloud_v12    Huber, down-weighted vars
-RUN_NAME="v14"
-# RUN_NAME="v13"   # ← pre-audit-fix architecture; ONLY evaluable with the code
-#                    that trained it (var_proj/absent-embedding math changed in
-#                    v14 — the test.py structural guard will abort on a mix).
+#   v15         checkpoints/full_run_cloud_v15    telescopic + residual head  ← current
+#   v14         checkpoints/full_run_cloud_v14    patch-6, input-context decoder
+#   v13         checkpoints/full_run_cloud_v13    pre-audit-fix architecture
+#   v12/v11/v9  checkpoints/...                   older Huber / NLL runs
+#
+# ⚠ PRE-v15 CHECKPOINTS CANNOT BE EVALUATED WITH THIS CODE. v15 removed the
+#   decoder input-context pathway, so those checkpoints carry weights this
+#   model no longer has; test.py ABORTS rather than silently dropping them
+#   (that silent drop is what invalidated every v9–v13 test number). To
+#   evaluate an old run, check out the commit that trained it:
+#       git checkout <commit>  &&  bash src/scripts/run_test_cloud.sh
+RUN_NAME="v15"
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
@@ -92,18 +100,20 @@ MASK_RATIOS="0.5 0.0"   # mr0.50 FIRST: it is the trained setting and gives
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
 # 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
 # batch_size: inference keeps no optimiser state and no activations, so it can
-# run far larger batches than training. 32 on the 20 GB slice.
+# run far larger batches than training. 16 is the v15 default (was 32 for v14).
 #
-# Why this matters here: at mask_ratio=0.00 NOTHING is masked, so the encoder
-# carries all 155 stations instead of the ~78 it sees during training —
-# 12x155 = 1,860 tokens vs 936, i.e. 4x the attention cost of any training
-# step, on 11,684 windows. That is what made the first attempt quote ~3 h.
+# Two things make mr0.00 the heaviest configuration this ever runs:
+#   • nothing is masked, so the encoder carries all 155 stations instead of
+#     the ~78 it sees during training;
+#   • v15's telescopic schedule gives 20 temporal positions instead of 12.
+# Together: 20x155 = 3,100 tokens vs v14's 12x155 = 1,860 (and vs 936 at
+# training time) — on 11,684 windows. Hence the more conservative default.
 # Predictions are bit-identical at any batch size; only speed changes.
-# Drop to 8 if mr0.00 OOMs (it is the heaviest configuration this runs).
+# Raise to 32 if there is headroom; drop to 8 if mr0.00 OOMs.
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       32 \
+    --batch_size       16 \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --stride           "$STRIDE" \

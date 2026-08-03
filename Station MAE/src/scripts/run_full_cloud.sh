@@ -327,7 +327,23 @@ INDEX_MODE="--index_mode random --random_epoch_size 10000" # ~2.8× non-overlapp
 # Never raise the effective batch itself without revisiting the learning rate.
 #
 # Inference is different: test.py holds no activations or optimizer state, so
-# run_test_cloud.sh is safe at batch_size 8 on this slice.
+# run_test_cloud.sh runs at batch_size 16.
+#
+# ── v15 FIRST-LAUNCH CHECKLIST ───────────────────────────────────────────────
+# This branch changes the encoder's tokenization and the prediction head, so
+# the very first launch should be a 2-minute smoke run, NOT the full budget:
+#
+#     python main.py ... --epochs 1 --random_epoch_size 200        # ~2 min
+#
+# Confirm in the output:
+#   1. no shape/assert error from the telescopic merge (new code path);
+#   2. "[cuda] ✓ torch ... A100" appeared at the top (preflight);
+#   3. val/loss is finite and sanity/* prints one line per epoch;
+#   4. sanity ctx_ratio < 1 — VISIBLE stations beat masked ones, i.e. the
+#      residual head + telescopic tokens actually use recent observations
+#      (this is what the removed input_context pathway used to provide).
+# If --compile errors on the variable-length telescopic concat, drop it: it is
+# a ~1.3x speedup, not a correctness requirement.
 # ── Resume ───────────────────────────────────────────────────────────────────
 # If last.ckpt exists in SAVE_DIR, continue from it: full training state
 # (weights, optimiser, LR schedule, epoch counter) is restored.

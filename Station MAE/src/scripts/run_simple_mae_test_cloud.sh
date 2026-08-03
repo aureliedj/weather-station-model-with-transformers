@@ -24,7 +24,14 @@ SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"
 cd "${SRC_DIR}"
 
-RUN_NAME="simple-mae-v1"
+# Fail fast if torch cannot use the GPU (wheel/driver mismatch on the older node).
+source "${SCRIPT_DIR}/_cuda_preflight.sh"
+
+# Keep in sync with run_simple_mae_cloud.sh — it currently trains
+# simple-mae-v2 (the 6+4 fuse variant). Switch to simple-mae-v1 to dump the
+# MAE-classic baseline instead; test_simple_mae.py reads fuse_layers from the
+# checkpoint, so the same script evaluates either.
+RUN_NAME="simple-mae-v2"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${RUN_NAME}/best.ckpt"
 SAVE_DIR="${PROJ_DIR}/test_results"
 
