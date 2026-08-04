@@ -218,7 +218,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v19"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v20"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -314,6 +314,37 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 # recoverable from the v17 token (probe R^2 >= 0.94), so the block-1 FFN can
 # already form cross-variable functions. This makes them cheap, not possible.
 OBS_ENCODER="--value_embedding mlp"
+
+# ── Persistence residual head (v20) ──────────────────────────────────────────
+# y_hat = base + f(.)   where base = the station's own last observation if it
+# was VISIBLE to the encoder, and 0 if it was MASKED.
+#
+# WHY. Measured on v15's own validation metrics, against what a perfect copy of
+# the station's last value would score at +30 min:
+#
+#     variable      persist r   copy bound   v15 actual   ratio
+#     pressure         0.9995      0.0254       0.0528    2.08x
+#     temperature      0.9956      0.0744       0.0873    1.17x
+#     humidity         0.9722      0.1868       0.2086    1.12x
+#     wind_u           0.8472      0.4240       0.3797    0.90x
+#     wind_v           0.8355      0.4385       0.3987    0.91x
+#
+# The model BEATS a copy on wind and LOSES to it on pressure, temperature and
+# humidity — worst exactly where copying is easiest. That is a retrieval
+# failure, not a modelling one: the decoder query carries no observations, so
+# reproducing a station's own last value means attending from the query to the
+# right subset of 1,872 patched encoder tokens. The LSTM baseline gets it free,
+# because its input IS that station's history.
+#
+# This was tried in v15 and DEGRADED, for a reason recorded at the time: the
+# base differs per station (y(t0) if visible, 0 if masked) but the queries
+# carried no maskedness signal, so one head had to emit a small deviation in
+# one regime and a full absolute value in the other, blind to which. The
+# decoder now has a learned two-state station_state embedding, so the regime is
+# observable. Not leakage: which stations are offline is known at deployment
+# time; only their VALUES stay hidden.
+RESIDUAL="--residual_head"
+# RESIDUAL=""                                      # <- off (v15 through v19)
 # OBS_ENCODER=""                                   # <- exact v17 observation encoder
 
 PATCH=3
@@ -396,7 +427,7 @@ if [[ "$SANITY" == "1" ]]; then
     SAVE_DIR="${SAVE_DIR}-sanity"
     RUN_SUFFIX="-sanity1"
 elif [[ "$SANITY" == "2" ]]; then
-    SANITY_ARGS=(--epochs 15 --random_epoch_size 3600 --subset --warmup_epochs 2)
+    SANITY_ARGS=(--epochs 15 --random_epoch_size 2500 --subset --warmup_epochs 2)
     INDEX_MODE="--index_mode random"
     SAVE_DIR="${SAVE_DIR}-sanity"
     RUN_SUFFIX="-sanity2"
@@ -535,7 +566,7 @@ python main.py \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
-    --drop_path_rate   0.1 \
+    --drop_path_rate   0.0 \
     --batch_size       4 \
     --num_workers      3 \
     --epochs           100 \
@@ -555,12 +586,13 @@ python main.py \
     --grad_checkpoint \
     --cross_attn_decoder \
     $OBS_ENCODER \
+    $RESIDUAL \
     $ENCODER \
     $TEMPORAL_WINDOW \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v19${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v20${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

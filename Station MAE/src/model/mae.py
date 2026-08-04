@@ -311,6 +311,13 @@ class StationMAE(nn.Module):
     # v15: persistence-residual base
     # ------------------------------------------------------------------
 
+    def _station_masked(self, masked_idx, B, N, device):
+        """(B, N) bool — True where the encoder could not see the station."""
+        flag = torch.zeros(B, N, dtype=torch.bool, device=device)
+        if masked_idx is not None and masked_idx.numel() > 0:
+            flag.scatter_(1, masked_idx, True)
+        return flag
+
     def _persistence_base(
         self,
         x:          torch.Tensor,            # (B, W, N, V)  normalised obs
@@ -372,7 +379,9 @@ class StationMAE(nn.Module):
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
         encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                   station_masked=self._station_masked(
+                                       masked_idx, x.shape[0], x.shape[2], x.device))
         if self.use_nll_loss:
             preds, log_var = decoder_out
         else:
@@ -443,7 +452,9 @@ class StationMAE(nn.Module):
         # encoded: (B, T*N_vis, d_model)   (T = patched sequence length)
 
         # ── Decoder: runs once for all K lead-times ──────────────────────
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                   station_masked=self._station_masked(
+                                       masked_idx, x.shape[0], x.shape[2], x.device))
         if self.use_nll_loss:
             preds_all, log_var_all = decoder_out
         else:
@@ -539,7 +550,9 @@ class StationMAE(nn.Module):
         """
         self.eval()
         encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps)
+        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                   station_masked=self._station_masked(
+                                       masked_idx, x.shape[0], x.shape[2], x.device))
         # When NLL mode is active, decoder returns (mean, log_var) — return mean only.
         preds = decoder_out[0] if self.use_nll_loss else decoder_out
         base  = self._persistence_base(x, x_mask, masked_idx)

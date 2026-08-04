@@ -246,6 +246,31 @@ class StationMAEDecoder(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
         # ------------------------------------------------------------------
+        # STATION-STATE embedding — "was this station visible to the encoder?"
+        #
+        # Two learned vectors: index 0 = visible, index 1 = masked. Added to the
+        # query for station n according to whether n was hidden in THIS forward
+        # pass.
+        #
+        # Why this is needed. With the residual head the decoder predicts
+        #     y_hat = base + f(.)
+        # where base = the station's last observation if VISIBLE, and 0 if
+        # MASKED (a masked station's last value is hidden information and must
+        # not leak). So f has to emit a small deviation-from-persistence in one
+        # regime and a full absolute value in the other — and the query
+        # previously carried no signal distinguishing them:
+        #     mask_token + position + topography + time + delta + step
+        # is identical for a visible and a hidden station. One head, bimodal
+        # target, unobservable condition. That is why --residual_head degraded
+        # the v15 sanity run and was switched off.
+        #
+        # This is NOT leakage. Which stations are offline is known at
+        # deployment time; only their VALUES must stay hidden. The embedding
+        # carries one bit per station — availability — not the observation.
+        self.station_state = nn.Parameter(torch.zeros(2, d_model))
+        nn.init.trunc_normal_(self.station_state, std=0.02)
+
+        # ------------------------------------------------------------------
         # Positional / contextual embeddings for query token construction
         # Token = mask_token + p1 + p2 + t + delta
         # ------------------------------------------------------------------
@@ -375,6 +400,7 @@ class StationMAEDecoder(nn.Module):
         spatial:       torch.Tensor,           # (N, 15) or (B, N, 15)
         y_hours:       torch.Tensor,           # (B,) or (B, K)
         delta_steps:   torch.Tensor,           # (B,) or (B, K)
+        station_masked: "torch.Tensor | None" = None,   # (B, N) bool: hidden from the encoder
     ) -> torch.Tensor:
         """
         Predict variables for all N stations at one or K target times.
@@ -433,6 +459,14 @@ class StationMAEDecoder(nn.Module):
         spatial_q = self.mask_token.expand(B, N, -1).contiguous()  # (B, N, d_model)
         spatial_q = spatial_q + self.pos_emb(spatial_b[..., :2])   # (B, N, d_model)
         spatial_q = spatial_q + self.station_emb(spatial_b[..., 2:])  # (B, N, d_model)
+
+        # Station state: index 1 where the encoder could not see this station.
+        # Defaults to "all visible" when the caller passes nothing, which is
+        # what evaluation at mask_ratio 0 wants.
+        if station_masked is None:
+            spatial_q = spatial_q + self.station_state[0]
+        else:
+            spatial_q = spatial_q + self.station_state[station_masked.long()]
 
         if not is_multi:
             # ── Single-delta path ─────────────────────────────────────────
