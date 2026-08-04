@@ -262,14 +262,25 @@ def test_branch_carries_no_large_constant(mode):
         f"without information")
 
 
+def test_batched_mlp_uses_no_python_loop():
+    """
+    The per-slot loop cost ~20 min/epoch under --compile: getattr by formatted
+    string and ModuleList indexing inside a loop break the graph. The default
+    config (no wind pairing) must take the batched path.
+    """
+    vp = _vp(value_embedding="mlp")
+    assert vp.batched and hasattr(vp, "mlp_w1") and not hasattr(vp, "slot_maps")
+    paired = _vp(value_embedding="mlp", wind_pair=(3, 4))
+    assert not paired.batched, "wind pairing must fall back to the general path"
+
+
 def test_mlp_thresholds_land_inside_the_value_range():
     """
     Each hidden unit bends at x = -b/a. PyTorch's default init makes that
     Cauchy-distributed, wasting a sixth of the basis outside +-3 sigma.
     """
     vp = _vp(value_embedding="mlp")
-    lin1 = vp.slot_maps[0][0]
-    a = lin1.weight.squeeze(-1); b = lin1.bias
+    a, b = vp.mlp_w1, vp.mlp_b1
     assert torch.allclose(a.abs(), torch.ones_like(a)), "|a| should be exactly 1"
     th = (-b / a)
     assert (th.abs() < 3.0 + 1e-4).all(), "thresholds outside +-3 sigma"

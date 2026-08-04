@@ -780,10 +780,39 @@ class VariableProjection(nn.Module):
         # describe the map being computed.  Measured effect of the old init: the
         # observation branch arrived at RMS 0.027 against ~0.58 for each of the
         # four metadata branches it is summed with.
+        # Is every slot a single variable? Then the whole branch is a BATCHED
+        # per-variable map and needs no Python loop — see forward().
+        self.batched = all(len(s) == 1 for s in slots)
+
         if value_embedding == "linear" and self.wind_pair is None:
             self.var_weights = nn.Parameter(torch.empty(num_vars, d_model))
             self.var_biases  = nn.Parameter(torch.zeros(num_vars, d_model))
             nn.init.uniform_(self.var_weights, -1.0, 1.0)   # Linear(1, d) scale
+        elif value_embedding == "mlp" and self.batched:
+            # ── Batched MLP: V independent (1 -> H -> d) maps, stored as one
+            # set of tensors and applied with two fused ops.
+            #
+            # PERFORMANCE. The first implementation used an nn.ModuleList and a
+            # Python loop over slots, with getattr(self, f"_slot_{si}") to fetch
+            # the index buffer. That is ~30 kernel launches per forward instead
+            # of 2, and — worse under --compile — dynamic attribute access by
+            # formatted string and ModuleList indexing inside a loop are classic
+            # graph-break causes, so the compiled graph was repeatedly falling
+            # back to eager. Measured effect on the v18 run: ~20 min/epoch.
+            # The FLOPs are unchanged (3.3 GMAC either way, against ~48 GFLOP
+            # for the encoder); the cost was launch overhead and recompilation.
+            H = VALUE_MLP_HIDDEN
+            self.mlp_w1 = nn.Parameter(torch.empty(num_vars, H))
+            self.mlp_b1 = nn.Parameter(torch.empty(num_vars, H))
+            self.mlp_w2 = nn.Parameter(torch.empty(num_vars, H, d_model))
+            self.mlp_b2 = nn.Parameter(torch.zeros(num_vars, d_model))
+            with torch.no_grad():
+                # |a| = 1 with random sign, b ~ U(-T, T): thresholds at -b/a
+                # spread uniformly over the value range.
+                self.mlp_w1.copy_(torch.randint(0, 2, self.mlp_w1.shape).float() * 2 - 1)
+                nn.init.uniform_(self.mlp_b1, -VALUE_MLP_THRESH, VALUE_MLP_THRESH)
+                bound = VALUE_MLP_GAIN / math.sqrt(H)
+                nn.init.uniform_(self.mlp_w2, -bound, bound)
         else:
             # One map per SLOT. For "linear" the map is Linear(|slot| -> d);
             # for "fourier" it is Linear(|slot| * VALUE_FEATURE_DIM -> d) + GELU.
@@ -904,7 +933,18 @@ class VariableProjection(nn.Module):
             # std(obs) = sigma_x * sigma_w, independent of the variable count.
             return mixed.sum(dim=-2) / math.sqrt(self.num_vars)
 
-        # ── v18 path: one map per SLOT ─────────────────────────────────────
+        # ── v18 batched MLP: no Python loop, two fused ops ──────────────────
+        if self.value_embedding == "mlp" and self.batched:
+            m = mask.unsqueeze(-1)                                # (B, N, V, 1)
+            # h = GELU(a*x + b) - GELU(b), centred so e(0) = 0 exactly and the
+            # branch carries no token-independent constant.
+            h = F.gelu(x.unsqueeze(-1) * self.mlp_w1 + self.mlp_b1) \
+                - F.gelu(self.mlp_b1)                             # (B, N, V, H)
+            e = torch.einsum("...vh,vhd->...vd", h, self.mlp_w2) + self.mlp_b2
+            e = e * m + self.var_absent_embedding * (1.0 - m)
+            return e.sum(dim=-2) / math.sqrt(self.num_slots)
+
+        # ── v18 general path: one map per SLOT (used only for wind pairing) ─
         # A slot is one variable, or the wind pair. A slot counts as present
         # only when every member is present (u and v always agree in this
         # dataset, but the rule is enforced rather than assumed).
