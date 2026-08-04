@@ -31,6 +31,8 @@ DeltaTimeEmbedding — inspired by Aurora, Price et al. 2024 Section B.4):
 """
 
 import math
+import warnings
+
 import torch
 import torch.nn as nn
 import pandas as pd
@@ -571,22 +573,44 @@ class VariableProjection(nn.Module):
     """
     Projects raw meteorological measurements into d_model space.
 
-    Each variable has its own scalar-to-d_model linear projection plus a
-    learned type embedding encoding variable identity.
+    Per variable v, per station, per timestep:
+
+        sensor present :  x_v * var_weights[v] + var_biases[v]
+        sensor absent  :  var_absent_embedding[v]
+
+    the V contributions are summed and divided by sqrt(V).
 
     Present sensors contribute their projected value; ABSENT sensors contribute
     a learned per-variable "absent" embedding (BERT-mask-style) instead of being
     dropped.  The model therefore sees an explicit, learnable signal for
     "sensor missing" and cannot confuse it with a true zero measurement.
 
-    The V contributions are summed and divided by the CONSTANT num_vars — not
-    by the per-station present count.  Dividing by the count (old behaviour)
-    made the embedding magnitude of the same physical value depend on how many
-    unrelated sensors the station carries (1/6 at a full station vs 1/2 at a
-    wind-only one) — a station-dependent gain the network had to undo.  A
-    constant divisor keeps every variable's weight identical across stations;
-    the encoder's token_norm handles overall scale.  (cf. ClimaX, Nguyen et
+    The V contributions are divided by a CONSTANT (not by the per-station
+    present count).  Dividing by the count made the embedding magnitude of the
+    same physical value depend on how many unrelated sensors the station
+    carries (1/6 at a full station vs 1/2 at a wind-only one) — a
+    station-dependent gain the network had to undo.  (cf. ClimaX, Nguyen et
     al. 2023, which uses attention aggregation partly to avoid this.)
+
+    SCALE (see "Rebalance observation-token initialization")
+    -------------------------------------------------------
+    This branch is one of FIVE summed into the encoder token; the other four
+    (position, station topography, absolute time, step index) are all
+    MLP-with-LayerNorm and land at RMS ~0.58 per token.  For the token to
+    encode the weather at all, this branch has to arrive at a comparable
+    scale.  With the sqrt(V) divisor:
+
+        obs_d = (1/sqrt(V)) * sum_v x_v * w_vd
+        Var(obs_d) = (1/V) * V * sigma_x^2 * sigma_w^2 = sigma_x^2 * sigma_w^2
+        => std(obs) = sigma_x * sigma_w                    -- V CANCELS
+
+    so the branch scale is independent of the variable count: adding a seventh
+    variable needs no re-tuning.  Dividing by V instead of sqrt(V) does NOT
+    have that property and over-suppresses by sqrt(V).
+
+    With sigma_x ~ 0.92 (per-station normalised observations) and
+    var_weights ~ U(-1,1) (sigma_w = 0.577), std(obs) ~ 0.53 — parity with the
+    other four branches.
 
     Implementation note:
         Variables are projected in a single vectorised operation:
@@ -608,22 +632,58 @@ class VariableProjection(nn.Module):
         self.num_vars = num_vars
         self.d_model  = d_model
 
-        # Batched per-variable linear: var_weights[v] projects x[..., v] → d_model
-        # Equivalent to num_vars independent Linear(1, d_model) modules but vectorised.
+        # Batched per-variable linear: var_weights[v] projects x[..., v] → d_model.
+        # This tensor stores num_vars independent Linear(1, d_model) maps; it is
+        # NOT one (num_vars → d_model) layer.
+        #
+        # It used to be initialised with xavier_uniform_, which reads the tensor
+        # SHAPE (fan_in=d_model, fan_out=num_vars) and returns bound
+        # sqrt(6/(V+d)) = 0.124 → std 0.072 at d=384.  The Linear(1, d_model)
+        # modules this replaced have fan_in = 1 → bound 1.0 → std 0.577: eight
+        # times larger, for exactly the same function.  Xavier's
+        # variance-preservation argument does not apply to a shape that does not
+        # describe the map being computed.  Measured effect of the old init: the
+        # observation branch arrived at RMS 0.027 against ~0.58 for each of the
+        # four metadata branches it is summed with.
         self.var_weights = nn.Parameter(torch.empty(num_vars, d_model))
         self.var_biases  = nn.Parameter(torch.zeros(num_vars, d_model))
-        nn.init.xavier_uniform_(self.var_weights)
+        nn.init.uniform_(self.var_weights, -1.0, 1.0)      # Linear(1, d) scale
 
-        # Learned type embedding: one d_model vector per variable identity
-        self.var_type_embedding = nn.Embedding(num_vars, d_model)
+        # NOTE: ``var_type_embedding`` (one learned vector per variable, added to
+        # BOTH the present and the absent branch) has been REMOVED.  It was
+        # provably redundant: with
+        #     present = x_v*w_v + b_v + t_v      absent = a_v + t_v
+        # the substitution b'_v = b_v + t_v, a'_v = a_v + t_v gives an identical
+        # function, so b, t and a were three per-variable vectors spanning two
+        # degrees of freedom.  Variable identity is already carried by the
+        # DIRECTION of var_weights[v] in the present branch and by
+        # var_absent_embedding[v] in the absent branch.
+        #
+        # It also happened to be the only parameter in the model left at
+        # nn.Embedding's default N(0,1) — every other token-level parameter here
+        # uses trunc_normal_(std=0.02).  Summed over V=6 and divided by V, it
+        # produced a token-independent offset of RMS sqrt(V)/V = 0.41, i.e. large
+        # magnitude carrying exactly zero information.
+        #
+        # Checkpoints containing var_proj.var_type_embedding.weight are migrated
+        # automatically and exactly — see _load_from_state_dict below.
 
         # Learned per-variable ABSENT embedding, used in place of the value
-        # projection when a sensor is missing (mask == 0).  Zero-init: at the
-        # start of training an absent sensor contributes nothing (matching the
-        # old zero-weighting), and the model learns a useful "missing" signal
-        # from there.  Replaces the encoder-level sensor_mask_token, whose fill
-        # value was silently cancelled by the mask re-application here.
+        # projection when a sensor is missing (mask == 0).  Replaces the
+        # encoder-level sensor_mask_token, whose fill value was silently
+        # cancelled by the mask re-application here.
+        #
+        # Initialised at the project convention (0.02) rather than at zero.  With
+        # both var_biases and var_absent_embedding starting at zero, the two
+        # codes were bit-identical at step 0:
+        #     sensor reads zero :  0*w_v + b_v  =  0
+        #     sensor absent     :          a_v  =  0
+        # i.e. the exact confusion this parameter exists to prevent.  Because
+        # normalisation is per-station, x = 0 means "reads its own long-run
+        # mean" — the MODAL value, not an edge case — so the collision sat on
+        # the most common reading.
         self.var_absent_embedding = nn.Parameter(torch.zeros(num_vars, d_model))
+        nn.init.trunc_normal_(self.var_absent_embedding, std=0.02)
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -637,20 +697,64 @@ class VariableProjection(nn.Module):
         # Per-variable linear: (B, N, V, 1) * (V, d_model) → (B, N, V, d_model)
         proj = x.unsqueeze(-1) * self.var_weights + self.var_biases   # (B, N, V, d_model)
 
-        # Add variable-identity embedding; var_type_embedding.weight is (V, d_model)
-        proj = proj + self.var_type_embedding.weight                   # (B, N, V, d_model)
-
         # Present sensors → projected value; absent sensors → learned absent
-        # embedding (+ type embedding so "which sensor is missing" is encoded).
-        m   = mask.unsqueeze(-1)                                       # (B, N, V, 1)
-        absent = self.var_absent_embedding + self.var_type_embedding.weight
-        mixed  = proj * m + absent * (1.0 - m)                         # (B, N, V, d_model)
+        # embedding.  Variable identity is carried by the direction of
+        # var_weights[v] / var_absent_embedding[v]; no separate type vector.
+        m      = mask.unsqueeze(-1)                                    # (B, N, V, 1)
+        mixed  = proj * m + self.var_absent_embedding * (1.0 - m)      # (B, N, V, d_model)
 
-        # Constant divisor (NOT the per-station present count): every variable
-        # carries the same weight at every station; token_norm handles scale.
-        out = mixed.sum(dim=-2) / float(self.num_vars)                 # (B, N, d_model)
+        # sqrt(V), NOT V.  Summing V roughly-independent contributions scales the
+        # variance by V and the std by sqrt(V); dividing by V over-suppresses by
+        # a further sqrt(V).  sqrt(V) also makes std(obs) = sigma_x * sigma_w,
+        # independent of the variable count (see the class docstring).
+        out = mixed.sum(dim=-2) / math.sqrt(self.num_vars)             # (B, N, d_model)
 
         return out
+
+    # ------------------------------------------------------------------
+    # Checkpoint migration
+    # ------------------------------------------------------------------
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        """
+        Load pre-rebalance checkpoints EXACTLY, folding away var_type_embedding.
+
+        Old form (divisor V, with a type vector t_v):
+            out_old = (1/V)      * sum_v [ (x_v*w_v + b_v + t_v)*m + (a_v + t_v)*(1-m) ]
+        New form (divisor sqrt(V), no type vector):
+            out_new = (1/sqrt(V))* sum_v [ (x_v*w'_v + b'_v)*m + a'_v*(1-m) ]
+
+        Setting
+            w' = w / sqrt(V)      b' = (b + t) / sqrt(V)      a' = (a + t) / sqrt(V)
+        makes out_new == out_old identically, for every x and every mask.  So an
+        existing v15 checkpoint keeps its exact behaviour and stays evaluable;
+        only FRESH runs get the rebalanced initialisation.
+
+        This is deliberately loud about what it did: a silent strict=False is
+        what invalidated every test number from v9 to v13 in this project.
+        """
+        t_key = prefix + "var_type_embedding.weight"
+        if t_key in state_dict:
+            t     = state_dict.pop(t_key)
+            scale = math.sqrt(self.num_vars)
+            for name, add_t in (("var_weights", False),
+                                ("var_biases", True),
+                                ("var_absent_embedding", True)):
+                k = prefix + name
+                if k in state_dict:
+                    v = state_dict[k]
+                    state_dict[k] = ((v + t) if add_t else v) / scale
+            warnings.warn(
+                f"VariableProjection: migrated a pre-rebalance checkpoint at "
+                f"'{prefix}' — var_type_embedding folded into var_biases / "
+                f"var_absent_embedding and all three tensors scaled by "
+                f"1/sqrt({self.num_vars}). The loaded model is numerically "
+                f"IDENTICAL to the one that was trained.",
+                RuntimeWarning, stacklevel=2,
+            )
+        super()._load_from_state_dict(state_dict, prefix, local_metadata, strict,
+                                      missing_keys, unexpected_keys, error_msgs)
 
 
 # ---------------------------------------------------------------------------

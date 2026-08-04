@@ -825,6 +825,21 @@ def main() -> None:
         print("Cross-attention decoder  : ON")
     print(f"Model: {model.count_parameters():,} trainable parameters")
 
+    # ── Token balance (initialisation invariant, not a training metric) ─────
+    # The encoder token is the sum of five branches and only one of them sees
+    # an observation. Nothing downstream — not the loss, not val/*, not
+    # sanity/* — reports it if that branch arrives too small to matter, so it
+    # is checked here, once, before any gradient is taken. Costs ~1 s.
+    try:
+        from model.token_balance import token_balance, synthetic_batch, format_report
+        _tb = token_balance(model.encoder, **synthetic_batch(seed=0))
+        print(format_report(_tb))
+        if not _tb["passes"]:
+            print("  ^ the encoder is about to train on tokens that barely encode "
+                  "the weather; see tests/test_token_balance.py")
+    except Exception as _e:                                       # noqa: BLE001
+        print(f"[token-balance] skipped ({type(_e).__name__}: {_e})")
+
     # ── Persistence MSE normalisation (Fix 2) ───────────────────────────────
     # Estimate per-variable persistence MSE from the validation set and store
     # as a buffer in the model.  Must run BEFORE torch.compile so that the
