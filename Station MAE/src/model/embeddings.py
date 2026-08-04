@@ -150,9 +150,12 @@ VALUE_MLP_HIDDEN  = 32
 # (a, b ~ U(-1,1)) makes -b/a Cauchy-distributed: measured 26.9/32 thresholds
 # inside +-3 sigma versus 32/32 here, i.e. a sixth of the basis wasted.
 VALUE_MLP_THRESH  = 3.0
-# Second layer gain, /sqrt(H): calibrated on the real observations so the mean
-# per-variable std lands near 0.55, matching the v17 branch (0.53).
-VALUE_MLP_GAIN    = 0.65
+# Second layer gain, /sqrt(H). Calibrated on the real observations against the
+# SIGNAL std (the branch with its constant removed), not RMS: an earlier value
+# of 0.65 matched RMS while 91% of that RMS was the uncentred GELU constant,
+# which collapsed content fraction from 18.9% to 6.5%. Calibrate variance
+# across tokens, never RMS.
+VALUE_MLP_GAIN    = 1.47
 
 # Init scale for var_absent_embedding — the "sensor missing" code. Matched to a
 # typical PRESENT contribution (~0.5) so that "missing" is distinctive rather
@@ -616,6 +619,36 @@ class StepIndexEmbedding(nn.Module):
         return self.proj(self._fourier(steps))                  # (..., d_model)
 
 
+class _CenteredMLP(nn.Module):
+    """
+    Linear -> GELU -> Linear, with the activation CENTRED so that e(0) = 0.
+
+        h = GELU(a*x + b) - GELU(b)
+        e = W2 @ h
+
+    Why the subtraction. A plain GELU MLP is non-zero at x = 0: GELU(b) is a
+    fixed vector, so W2 @ GELU(b) is added identically to EVERY token. That is
+    magnitude without information — the same defect as the removed
+    var_type_embedding, and it is invisible in an RMS check because RMS counts
+    the constant. Measured on the real observations, uncentred:
+
+        RMS 0.543 = constant 0.493 + signal 0.293   ->  content fraction 6.5%
+        (v17 linear, for comparison: constant 0.000, signal 0.528, 18.9%)
+
+    Subtracting GELU(b) removes the constant exactly and costs nothing in
+    expressiveness: span{GELU(a_i x + b_i) - c_i} + bias = span{GELU(a_i x +
+    b_i)} + bias, so the representable set is unchanged.
+    """
+
+    def __init__(self, l1: nn.Linear, l2: nn.Linear):
+        super().__init__()
+        self.l1, self.l2 = l1, l2
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = F.gelu(self.l1(x)) - F.gelu(self.l1.bias)
+        return self.l2(h)
+
+
 class VariableProjection(nn.Module):
     """
     Projects raw meteorological measurements into d_model space.
@@ -772,7 +805,7 @@ class VariableProjection(nn.Module):
                     bound = VALUE_MLP_GAIN / math.sqrt(H)
                     nn.init.uniform_(l2.weight, -bound, bound)
                     nn.init.zeros_(l2.bias)
-                    maps.append(nn.Sequential(l1, nn.GELU(), l2))
+                    maps.append(_CenteredMLP(l1, l2))
                 else:                                     # "fourier"
                     lin   = nn.Linear(n * VALUE_FEATURE_DIM, d_model)
                     # Fourier features are bounded, so this init alone fixes the

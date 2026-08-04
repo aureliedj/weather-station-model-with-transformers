@@ -219,16 +219,47 @@ def test_v18_modes_are_nonlinear_and_beat_rank_one(mode):
     assert (lin(2 * x, m) - 2 * lin(x, m)).abs().max() < 1e-4, "v17 should be linear"
 
 
-@pytest.mark.parametrize("mode", ["mlp", "fourier"])
-def test_v18_output_scale_matches_v17(mode):
+def _signal_and_constant(vp, x, m):
     """
-    v18 must arrive at the same scale as v17, or the token balance shifts and
-    the comparison confounds 'better encoder' with 'bigger branch'.
+    Split the branch into its token-independent and data-dependent parts.
+    The constant is the branch evaluated at x = 0 with every sensor present.
+    """
+    z = torch.zeros(1, 1, V)
+    const = vp(z, torch.ones_like(z))
+    out   = vp(x, m)
+    return (out - const), const
+
+
+@pytest.mark.parametrize("mode", ["mlp", "fourier"])
+def test_v18_signal_scale_matches_v17(mode):
+    """
+    Match on the SIGNAL, not on RMS.
+
+    An earlier gain matched RMS exactly while 91% of that RMS was an uncentred
+    GELU constant — magnitude with no information — and content fraction fell
+    from 18.9% to 6.5%. RMS cannot see that; variance across tokens can.
     """
     g = torch.Generator().manual_seed(5)
     x = torch.randn(256, 64, V, generator=g); m = torch.ones_like(x)
-    r = _vp(value_embedding=mode)(x, m).std().item() / _vp()(x, m).std().item()
-    assert 0.6 < r < 1.7, f"{mode} branch std ratio {r:.2f} outside [0.6, 1.7]"
+    s_v18, _ = _signal_and_constant(_vp(value_embedding=mode), x, m)
+    s_v17, _ = _signal_and_constant(_vp(), x, m)
+    r = s_v18.std().item() / s_v17.std().item()
+    assert 0.6 < r < 1.7, f"{mode} SIGNAL std ratio {r:.2f} outside [0.6, 1.7]"
+
+
+@pytest.mark.parametrize("mode", ["linear", "mlp", "fourier"])
+def test_branch_carries_no_large_constant(mode):
+    """
+    No mode may reintroduce a token-independent offset. This is the defect
+    var_type_embedding had, and that the uncentred GELU MLP recreated.
+    """
+    g = torch.Generator().manual_seed(6)
+    x = torch.randn(128, 32, V, generator=g); m = torch.ones_like(x)
+    sig, const = _signal_and_constant(_vp(value_embedding=mode), x, m)
+    ratio = const.pow(2).mean().sqrt().item() / sig.std().item()
+    assert ratio < 0.25, (
+        f"{mode}: constant part is {ratio:.2f}x the signal — magnitude "
+        f"without information")
 
 
 def test_mlp_thresholds_land_inside_the_value_range():
