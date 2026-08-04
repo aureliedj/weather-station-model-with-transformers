@@ -218,7 +218,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v20"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v22"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -315,6 +315,30 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 # already form cross-variable functions. This makes them cheap, not possible.
 OBS_ENCODER="--value_embedding mlp"
 
+# ── Static features: separate branch, or inside the variable block? (v21) ────
+# Default (empty) keeps v18: position and topography are their own additive
+# branches, each with its own MLP whose output scale is set independently of
+# the observations — the structural origin of the token imbalance.
+#
+# --static_in_token follows Aurora, which "incorporate[s] static variables
+# (orography, land-sea mask, and soil-type mask) by treating them as extra
+# surface-level variables". Terrain then goes through the SAME per-slot
+# mechanism and the SAME /sqrt(S) divisor as the weather, so a mismatch cannot
+# arise by construction.
+#
+# The grouping matters more than the idea. Measured weather share of the token
+# at initialisation, real data:
+#
+#     one slot per static feature   21 slots    9.6%   <- WORSE than v18
+#     position + topography          8 slots   25.1%   <- what this flag does
+#     all 15 in one slot             7 slots   28.7%
+#     v18 separate branches                    18.3%
+#
+# Aurora has ~3 statics against many variables; here 15 statics against 6
+# weather variables, so slot-per-feature would drown the weather in its own block.
+STATIC="--static_in_token"
+# STATIC=""                                        # <- v18 separate branches
+
 # ── Persistence residual head (v20) ──────────────────────────────────────────
 # y_hat = base + f(.)   where base = the station's own last observation if it
 # was VISIBLE to the encoder, and 0 if it was MASKED.
@@ -343,7 +367,34 @@ OBS_ENCODER="--value_embedding mlp"
 # decoder now has a learned two-state station_state embedding, so the regime is
 # observable. Not leakage: which stations are offline is known at deployment
 # time; only their VALUES stay hidden.
-RESIDUAL="--residual_head"
+# ── v22: simple forecasting transformer, no masking, no decoder ─────────────
+# (station, timestep) tokens and the factorised encoder are unchanged; what
+# goes is the masking and the query decoder.
+#
+#   --mask_ratio 0    every station visible, in training AND validation. This
+#                     removes the train/eval mismatch (v15-v21 trained at 0.5
+#                     and validated at 0, i.e. 1,872 tokens trained against
+#                     3,720 validated) and makes the LSTM comparison exact.
+#   --direct_head     read one vector per station off the encoder, project
+#                     straight to all 13 horizons. No queries, no cross-
+#                     attention, so a station's own last observation reaches
+#                     its own prediction through the residual stream instead
+#                     of by retrieval over 1,872 tokens.
+#   --readout last    most recent temporal slot, the analogue of an LSTM's
+#                     final hidden state. --readout mean gives every temporal
+#                     token direct gradient if `last` proves unstable.
+#
+# CAUTION: model/masked_transformer.py used this same shape and diverged. That
+# run predates the observation-token rebalance and trained at a content
+# fraction of 0.04%, so the readout was never cleanly implicated — but run
+# SANITY=2 (~1 h) before committing the full budget.
+DIRECT="--direct_head --readout last"
+# DIRECT=""                                        # <- keep the query decoder
+
+RESIDUAL=""
+# RESIDUAL="--residual_head"                       # <- v20; redundant with a
+#   direct 'last' readout, which already puts the last observation one linear
+#   layer from the prediction
 # RESIDUAL=""                                      # <- off (v15 through v19)
 # OBS_ENCODER=""                                   # <- exact v17 observation encoder
 
@@ -562,7 +613,7 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0.5 \
+    --mask_ratio       0.0 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
@@ -586,13 +637,15 @@ python main.py \
     --grad_checkpoint \
     --cross_attn_decoder \
     $OBS_ENCODER \
+    $STATIC \
     $RESIDUAL \
+    $DIRECT \
     $ENCODER \
     $TEMPORAL_WINDOW \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v20${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v22${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

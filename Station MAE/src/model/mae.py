@@ -136,6 +136,10 @@ class StationMAE(nn.Module):
         temporal_patch:          int   = 1,
         value_embedding:         str   = "linear",     # v18
         wind_pair:               "tuple | None" = None,  # v18
+        static_in_token:         bool  = False,          # v21
+        direct_head:             bool  = False,          # v22: no decoder
+        readout:                 str   = "last",         # "last" | "mean"
+        num_horizons:            int   = 13,
         patch_schedule:          "str | None" = None,   # v15 telescopic tokenization
         cross_attention_decoder: bool  = False,
         drop_path_rate:          float = 0.0,
@@ -282,12 +286,46 @@ class StationMAE(nn.Module):
             temporal_patch=temporal_patch,
             value_embedding=value_embedding,
             wind_pair=wind_pair,
+            static_in_token=static_in_token,
             patch_schedule=patch_schedule,
             drop_path_rate=drop_path_rate,
             joint=joint_encoder,
             step_emb=shared_step_emb,
         )
         self.residual_head    = bool(residual_head)
+
+        # ── v22: direct head — drop the decoder entirely ──────────────────
+        # The encoder already produces one vector per (station, temporal slot).
+        # Read one vector per STATION and project straight to all K horizons.
+        # No queries, no cross-attention.
+        #
+        # Requires mask_ratio == 0: the readout uses each station's OWN tokens,
+        # so a station removed from the sequence has nothing to read. That is
+        # not a limitation here — this configuration exists for the no-masking
+        # forecasting setting.
+        #
+        # readout:
+        #   "last" — the most recent temporal slot, the attention analogue of
+        #            an LSTM's final hidden state. Shortest path from a
+        #            station's last observation to its own prediction, which is
+        #            what the copy-bound analysis says matters.
+        #   "mean" — average over slots. Every temporal token then receives
+        #            direct gradient rather than only the last one.
+        #
+        # NOTE on the earlier attempt: model/masked_transformer.py used exactly
+        # this shape and diverged. That run predates the observation-token
+        # rebalance and trained at a content fraction of 0.04%, so the readout
+        # was never cleanly implicated. Treat it as untested, not as known-bad.
+        assert readout in ("last", "mean"), readout
+        self.direct_head  = bool(direct_head)
+        self.readout      = readout
+        self.num_horizons = int(num_horizons)
+        if self.direct_head:
+            assert mask_ratio == 0.0, (
+                "direct_head reads each station's own tokens, so every station "
+                f"must be visible; got mask_ratio={mask_ratio}. Use "
+                "--mask_ratio 0, or drop --direct_head.")
+            self.direct_proj = nn.Linear(d_model, self.num_horizons * num_target_vars)
         self.num_target_vars_ = num_target_vars
 
         self.decoder = StationMAEDecoder(
@@ -310,6 +348,26 @@ class StationMAE(nn.Module):
     # ------------------------------------------------------------------
     # v15: persistence-residual base
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # v22: direct head — one vector per station, straight to all K horizons
+    # ------------------------------------------------------------------
+
+    def _direct_predict(self, encoded: torch.Tensor, n_stations: int) -> torch.Tensor:
+        """
+        encoded: (B, T*N, d_model) from the encoder, with every station visible.
+        returns: (B, K, N, num_target_vars)
+        """
+        B, TN, d = encoded.shape
+        assert TN % n_stations == 0, (
+            f"encoder returned {TN} tokens for {n_stations} stations; "
+            f"direct_head needs every station present (mask_ratio 0)")
+        T = TN // n_stations
+        h = encoded.view(B, T, n_stations, d)
+        s = h[:, -1] if self.readout == "last" else h.mean(dim=1)   # (B, N, d)
+        p = self.direct_proj(s)                                     # (B, N, K*Vt)
+        p = p.view(B, n_stations, self.num_horizons, self.num_target_vars_)
+        return p.permute(0, 2, 1, 3).contiguous()                   # (B, K, N, Vt)
 
     def _station_masked(self, masked_idx, B, N, device):
         """(B, N) bool — True where the encoder could not see the station."""
@@ -451,14 +509,17 @@ class StationMAE(nn.Module):
         encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
         # encoded: (B, T*N_vis, d_model)   (T = patched sequence length)
 
-        # ── Decoder: runs once for all K lead-times ──────────────────────
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                   station_masked=self._station_masked(
-                                       masked_idx, x.shape[0], x.shape[2], x.device))
-        if self.use_nll_loss:
-            preds_all, log_var_all = decoder_out
+        # ── Predictions: direct head, or the query decoder ───────────────
+        if self.direct_head:
+            preds_all, log_var_all = self._direct_predict(encoded, x.shape[2]), None
         else:
-            preds_all, log_var_all = decoder_out, None
+            decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
+                                       station_masked=self._station_masked(
+                                           masked_idx, x.shape[0], x.shape[2], x.device))
+            if self.use_nll_loss:
+                preds_all, log_var_all = decoder_out
+            else:
+                preds_all, log_var_all = decoder_out, None
         # preds_all: (B, K, N, num_target_vars)
         # log_var_all: (B, K, N, num_target_vars)  or  None
 

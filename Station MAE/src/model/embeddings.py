@@ -162,6 +162,26 @@ VALUE_MLP_GAIN    = 1.47
 # than merely small.
 ABSENT_INIT_STD   = 0.5
 
+# ── v21: static features INSIDE the variable block (Aurora-style) ────────────
+# Aurora "incorporate[s] static variables (orography, land-sea mask, and
+# soil-type mask) by treating them as extra surface-level variables", so terrain
+# is scaled by the same per-variable mechanism as the weather instead of forming
+# a separate additive branch whose magnitude is set independently.
+#
+# The GROUPING matters more than the idea here. Aurora has ~3 statics against
+# many variables; this project has 15 statics against 6 weather variables, so
+# one slot per static feature would give the weather only 6/21 of the block.
+# Measured weather share of the token at init:
+#
+#     one slot per static feature   21 slots    9.6%   <- WORSE than today
+#     position + topography          8 slots   25.1%   <- default
+#     all 15 in one slot             7 slots   28.7%
+#     (current v18, separate branches)         18.3%
+#
+# Column groups of the 15-D spatial vector. Mirrors the existing p1/p2 split:
+# 0:2 easting/northing, 2:15 topography.
+STATIC_SLOTS_DEFAULT = ((0, 2), (2, 15))
+
 # Fourier feature dimension for DeltaTimeEmbedding.
 # Smaller than TEMPORAL_FOURIER_DIM — lead-time range (0–6 h) is much narrower
 # than the temporal range (10 min → 1 year), so fewer basis functions suffice.
@@ -713,6 +733,8 @@ class VariableProjection(nn.Module):
         d_model:         int  = 256,
         value_embedding: str  = "linear",       # "linear" (v17) | "fourier" (v18)
         wind_pair:       "tuple | None" = None, # e.g. (3, 4) -> encode u,v jointly
+        static_slots:    "tuple | None" = None, # v21: column groups of `spatial`
+        static_dim:      int  = 15,
     ):
         """
         value_embedding
@@ -783,6 +805,37 @@ class VariableProjection(nn.Module):
         # Is every slot a single variable? Then the whole branch is a BATCHED
         # per-variable map and needs no Python loop — see forward().
         self.batched = all(len(s) == 1 for s in slots)
+
+        # ── v21: static slots — extra "variables" that never change in time ──
+        # Their contribution is computed ONCE on (N, static_dim) and broadcast
+        # over the B*W leading dimension, so they cost nothing per timestep.
+        self.static_slots = tuple(tuple(g) for g in static_slots) if static_slots else None
+        if self.static_slots:
+            per = 1 if value_embedding == "linear" else VALUE_FEATURE_DIM
+            mods = []
+            for lo, hi in self.static_slots:
+                n = hi - lo
+                if value_embedding == "mlp":
+                    H  = VALUE_MLP_HIDDEN
+                    l1 = nn.Linear(n, H)
+                    with torch.no_grad():
+                        nn.init.uniform_(l1.weight, -1.0, 1.0)
+                        nn.init.uniform_(l1.bias, -VALUE_MLP_THRESH, VALUE_MLP_THRESH)
+                    l2 = nn.Linear(H, d_model)
+                    b  = VALUE_MLP_GAIN / math.sqrt(H)
+                    nn.init.uniform_(l2.weight, -b, b); nn.init.zeros_(l2.bias)
+                    mods.append(_CenteredMLP(l1, l2))
+                else:
+                    lin = nn.Linear(n * (1 if value_embedding == "linear" else per), d_model)
+                    if value_embedding == "fourier":
+                        b = VALUE_INIT_GAIN / math.sqrt(lin.in_features)
+                        nn.init.uniform_(lin.weight, -b, b); nn.init.zeros_(lin.bias)
+                        mods.append(nn.Sequential(lin, nn.GELU()))
+                    else:
+                        nn.init.uniform_(lin.weight, -1.0, 1.0); nn.init.zeros_(lin.bias)
+                        mods.append(lin)
+            self.static_maps = nn.ModuleList(mods)
+        self.total_slots = self.num_slots + (len(self.static_slots) if self.static_slots else 0)
 
         if value_embedding == "linear" and self.wind_pair is None:
             self.var_weights = nn.Parameter(torch.empty(num_vars, d_model))
@@ -913,7 +966,8 @@ class VariableProjection(nn.Module):
         feat = torch.cat([x.unsqueeze(-1), ang.cos(), ang.sin()], dim=-1)  # (..., n, 1+2K)
         return feat.flatten(-2)                                        # (..., n*(1+2K))
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: torch.Tensor,
+                static: "torch.Tensor | None" = None) -> torch.Tensor:
         """
         Args:
             x:    (B, N, V)  Measurement values. 0.0 where sensor absent.
@@ -927,11 +981,11 @@ class VariableProjection(nn.Module):
             proj   = x.unsqueeze(-1) * self.var_weights + self.var_biases
             m      = mask.unsqueeze(-1)
             mixed  = proj * m + self.var_absent_embedding * (1.0 - m)
-            # sqrt(V), NOT V. Summing V roughly-independent contributions scales
-            # the variance by V and the std by sqrt(V); dividing by V
-            # over-suppresses by a further sqrt(V). sqrt(V) also makes
-            # std(obs) = sigma_x * sigma_w, independent of the variable count.
-            return mixed.sum(dim=-2) / math.sqrt(self.num_vars)
+            # sqrt(S), NOT S. Summing S roughly-independent contributions scales
+            # the variance by S and the std by sqrt(S); dividing by S
+            # over-suppresses by a further sqrt(S). sqrt(S) also makes
+            # std(obs) = sigma_x * sigma_w, independent of the slot count.
+            return self._finish(mixed.sum(dim=-2), static)
 
         # ── v18 batched MLP: no Python loop, two fused ops ──────────────────
         if self.value_embedding == "mlp" and self.batched:
@@ -942,7 +996,7 @@ class VariableProjection(nn.Module):
                 - F.gelu(self.mlp_b1)                             # (B, N, V, H)
             e = torch.einsum("...vh,vhd->...vd", h, self.mlp_w2) + self.mlp_b2
             e = e * m + self.var_absent_embedding * (1.0 - m)
-            return e.sum(dim=-2) / math.sqrt(self.num_slots)
+            return self._finish(e.sum(dim=-2), static)
 
         # ── v18 general path: one map per SLOT (used only for wind pairing) ─
         # A slot is one variable, or the wind pair. A slot counts as present
@@ -962,7 +1016,35 @@ class VariableProjection(nn.Module):
 
         # Divide by sqrt(number of SLOTS): the same reasoning as sqrt(V), but
         # a paired wind slot is one contribution, not two.
-        return acc / math.sqrt(self.num_slots)
+        return self._finish(acc, static)
+
+    # ------------------------------------------------------------------
+    # Static slots + the shared divisor
+    # ------------------------------------------------------------------
+
+    def _finish(self, acc: torch.Tensor,
+                static: "torch.Tensor | None") -> torch.Tensor:
+        """
+        Add the static slots (v21) and divide by sqrt(total slot count).
+
+        The static contribution depends only on the station, so it is computed
+        ONCE on (N, static_dim) and broadcast over the leading B*W dimension —
+        it costs nothing per timestep, exactly like the separate pos_emb /
+        station_emb branches it replaces.
+        """
+        if self.static_slots is not None:
+            if static is None:
+                raise ValueError(
+                    "VariableProjection was built with static_slots but forward() "
+                    "received static=None. The encoder must pass `spatial`.")
+            if static.dim() == 3:          # (B, N, S) -> statics do not vary in B
+                static = static[0]
+            for si, (lo, hi) in enumerate(self.static_slots):
+                sv = static[..., lo:hi]                          # (N, n)
+                if self.value_embedding == "fourier":
+                    sv = self._value_features(sv)
+                acc = acc + self.static_maps[si](sv)             # broadcasts over B*W
+        return acc / math.sqrt(self.total_slots)
 
     # ------------------------------------------------------------------
     # Checkpoint migration

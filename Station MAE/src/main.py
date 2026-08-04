@@ -219,6 +219,28 @@ def parse_args() -> argparse.Namespace:
                         "instead of two independent ones, so the encoder can "
                         "form speed and direction directly. Safe: the u and v "
                         "masks are identical in 100%% of station-samples.")
+    p.add_argument("--direct_head",         action="store_true",
+                   help="v22: drop the decoder. Read one vector per station "
+                        "from the encoder and project straight to all K "
+                        "horizons. Requires --mask_ratio 0, since the readout "
+                        "uses each station's own tokens.")
+    p.add_argument("--readout",             type=str, default="last",
+                   choices=["last", "mean"],
+                   help="Only with --direct_head. 'last' takes the most recent "
+                        "temporal slot (the attention analogue of an LSTM's "
+                        "final hidden state, and the shortest path from a "
+                        "station's last observation to its own prediction); "
+                        "'mean' averages the slots, so every temporal token "
+                        "gets direct gradient rather than only the last.")
+    p.add_argument("--static_in_token",     action="store_true",
+                   help="v21 (Aurora-style): put the 15 static station features "
+                        "INSIDE VariableProjection as extra slots, and drop the "
+                        "separate pos_emb / station_emb branches. Terrain is then "
+                        "scaled by the same mechanism as the weather instead of "
+                        "by an independent MLP. Grouped as position (cols 0:2) + "
+                        "topography (cols 2:15); one slot per feature would give "
+                        "the weather only 6/21 of the block and measures WORSE "
+                        "than the separate-branch default.")
     p.add_argument("--joint_encoder",       action="store_true",
                    help="Use JointSpatioTemporalBlock in the encoder: full self-attention "
                         "over all W×N tokens simultaneously with temporal RoPE on Q/K. "
@@ -788,6 +810,10 @@ def main() -> None:
         temporal_window=args.temporal_window,
         value_embedding=args.value_embedding,
         wind_pair=((3, 4) if args.wind_encoder else None),
+        static_in_token=args.static_in_token,
+        direct_head=args.direct_head,
+        readout=args.readout,
+        num_horizons=(args.max_delta // args.delta_grid_stride + 1),
         temporal_patch=args.temporal_patch,
         patch_schedule=(args.patch_schedule or None),
         cross_attention_decoder=args.cross_attn_decoder,
@@ -841,6 +867,12 @@ def main() -> None:
     if args.value_embedding != "linear" or args.wind_encoder:
         _w = "  |  shared (u,v) encoder" if args.wind_encoder else ""
         print(f"Observation encoder      : {args.value_embedding}{_w}  (v18)")
+    if args.direct_head:
+        print(f"Prediction head          : DIRECT, readout={args.readout} "
+              f"(v22 — no decoder, no queries)")
+    if args.static_in_token:
+        print("Static features          : INSIDE the variable block (v21) — "
+              "pos_emb / station_emb removed from the token")
     print(f"Model: {model.count_parameters():,} trainable parameters")
 
     # ── Token balance (initialisation invariant, not a training metric) ─────
@@ -924,6 +956,9 @@ def main() -> None:
         "temporal_window":     args.temporal_window,
         "value_embedding":     args.value_embedding,
         "wind_encoder":        args.wind_encoder,
+        "static_in_token":     args.static_in_token,
+        "direct_head":         args.direct_head,
+        "readout":             args.readout,
         "temporal_patch":      args.temporal_patch,
         # Structural (v15): MUST be recorded or evaluation rebuilds the
         # wrong tokenization / head parameterisation.

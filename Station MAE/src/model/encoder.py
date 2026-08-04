@@ -40,6 +40,8 @@ from .embeddings import (
     STATION_CHAR_DIM,
     TEMPORAL_FOURIER_DIM,
     NUM_VARIABLES,
+    SPATIAL_INPUT_DIM,
+    STATIC_SLOTS_DEFAULT,
 )
 
 
@@ -745,6 +747,7 @@ class StationMAEEncoder(nn.Module):
         temporal_patch:       int   = 1,
         value_embedding:      str   = "linear",     # v18: "linear" | "fourier"
         wind_pair:            "tuple | None" = None,  # v18: e.g. (3, 4) for u,v
+        static_in_token:      bool  = False,        # v21: Aurora-style statics
         patch_schedule:       "str | None" = None,   # v15 telescopic, e.g. "48x6,18x3,6x1"
         drop_path_rate:       float = 0.0,
         joint:                bool  = False,
@@ -773,9 +776,15 @@ class StationMAEEncoder(nn.Module):
         # NOT numerically compatible with this encoder (token math changed).
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
-        self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model,
-                                              value_embedding=value_embedding,
-                                              wind_pair=wind_pair)
+        # v21: when static_in_token, the 15 static features become extra SLOTS
+        # inside VariableProjection — scaled by the same mechanism as the
+        # weather — and pos_emb / station_emb drop out of the token sum.
+        self.static_in_token = bool(static_in_token)
+        self.var_proj     = VariableProjection(
+            num_vars=num_vars, d_model=d_model,
+            value_embedding=value_embedding, wind_pair=wind_pair,
+            static_slots=(STATIC_SLOTS_DEFAULT if static_in_token else None),
+            static_dim=SPATIAL_INPUT_DIM)
         self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
                                                 dropout=dropout)
         self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim,
@@ -980,7 +989,8 @@ class StationMAEEncoder(nn.Module):
         # zeros at absent slots and var_proj never reads them (mask-gated).
         x_flat      = x.view(B * W, N, V)
         mask_flat   = x_mask.view(B * W, N, V)
-        var_tokens  = self.var_proj(x_flat, mask_flat)             # (B*W, N, d_model)
+        _static     = spatial if self.static_in_token else None
+        var_tokens  = self.var_proj(x_flat, mask_flat, static=_static)
         var_tokens  = var_tokens.view(B, W, N, self.d_model)       # (B, W, N, d_model)
 
         # --- p1 + p2: split spatial tensor, embed each independently ---
@@ -1008,7 +1018,13 @@ class StationMAEEncoder(nn.Module):
         step_e   = step_e.view(1, W, 1, self.d_model)               # (1, W, 1, d_model)
 
         # Sum five embeddings — all broadcast cleanly over (B, W, N, d_model)
-        tokens = var_tokens + pos_e + station_e + temp_emb + step_e  # (B, W, N, d_model)
+        if self.static_in_token:
+            # position and topography are already inside var_tokens as slots;
+            # adding them again would double-count and restore the imbalance
+            # this mode exists to remove.
+            tokens = var_tokens + temp_emb + step_e
+        else:
+            tokens = var_tokens + pos_e + station_e + temp_emb + step_e
 
         # Normalise after summation: prevents any single component from
         # dominating the scale seen by the first transformer block.
