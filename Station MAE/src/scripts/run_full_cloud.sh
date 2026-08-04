@@ -613,7 +613,7 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0.5 \
+    --mask_ratio       0.0 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
