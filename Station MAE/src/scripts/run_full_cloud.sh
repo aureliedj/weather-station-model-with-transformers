@@ -218,7 +218,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v17"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v18"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -285,6 +285,37 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 #   everything" is the natural starting point, and a constant has no lead-time
 #   dependence. At 1,872 tokens that dilution is 3x milder.
 # If P=3 also flatlines, the next levers are lr (3e-4) and the paradigm itself.
+# ── Observation encoder (v18) ────────────────────────────────────────────────
+# v17 embeds each variable as  e_v = x_v * w_v + b_v : rank 1 and linear, so
+# different VALUES differ only in magnitude along a fixed direction.
+#
+#   --value_embedding mlp       1 -> 32 -> GELU -> d, per variable. Each hidden
+#       unit is a GELU threshold, so the 32 units form a piecewise basis over
+#       the value axis. Measured (held-out R^2 of a linear readout at init):
+#
+#           target             v17 linear   mlp   fourier
+#           |x|                    0.000   1.000    0.000
+#           1[x > 1] threshold     0.499   0.950    0.000
+#           x^2 / sin(3x)          0.000   1.000    1.000
+#
+#       It wins on kinks and thresholds, which is what meteorological structure
+#       looks like: saturation, freezing, calm/gust.
+#
+#   --value_embedding fourier   PLR (Gorishniy et al. 2022). Beat 'mlp' only on
+#       ANGULAR quantities, which are not represented here — u and v are
+#       z-scored per component per station, so neither sqrt(u^2+v^2) nor
+#       atan2(v,u) is physical in normalised space. Not recommended for now.
+#
+# Wind pairing (--wind_encoder) is available but OFF: a shared (u,v) map is
+# station-blind, and the per-component per-station normalisation distorts
+# speed and direction by a per-station amount it cannot undo.
+#
+# This is INDUCTIVE BIAS, not new capability: the values are linearly
+# recoverable from the v17 token (probe R^2 >= 0.94), so the block-1 FFN can
+# already form cross-variable functions. This makes them cheap, not possible.
+OBS_ENCODER="--value_embedding mlp"
+# OBS_ENCODER=""                                   # <- exact v17 observation encoder
+
 PATCH=3
 
 ENCODER="--factorised_encoder"            # flat self-attention over W·N tokens
@@ -523,12 +554,13 @@ python main.py \
     --compile \
     --grad_checkpoint \
     --cross_attn_decoder \
+    $OBS_ENCODER \
     $ENCODER \
     $TEMPORAL_WINDOW \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v17${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v18${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

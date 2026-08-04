@@ -35,6 +35,7 @@ import warnings
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import pandas as pd
 
 
@@ -111,6 +112,52 @@ POSITION_FOURIER_DIM = 16
 # Must be even: TEMPORAL_FOURIER_DIM // 2 wavelengths are used.
 # 32 → 16 wavelengths spanning ~10 min to ~1 year.
 TEMPORAL_FOURIER_DIM = 32
+
+# ── v18 value embedding (PLR — Gorishniy et al., NeurIPS 2022) ───────────────
+# Observations are per-station z-scored, so the value axis is in sigma units.
+# lambda_min 0.25 resolves an eighth of a standard deviation; lambda_max 10
+# spans the bulk of the distribution. Values outside that range do occur
+# (precipitation reaches +26 sigma, wind +-11 sigma) which is why the RAW value
+# is kept as a feature alongside the periodic code — it keeps the map monotone
+# and injective everywhere.
+VALUE_FOURIER_K   = 8                        # wavelengths
+VALUE_FEATURE_DIM = 1 + 2 * VALUE_FOURIER_K  # raw value + cos/sin = 17
+VALUE_LAMBDA_MIN  = 0.25                     # sigma
+VALUE_LAMBDA_MAX  = 10.0                     # sigma
+# Linear init gain. Fourier features are bounded, so this alone fixes the output
+# scale — it does not depend on the observation distribution. GELU roughly
+# halves the std, so a gain above 1 is needed; 2.2 was calibrated on the real
+# observations to land every variable at std ~0.46-0.55 (v17 branch: 0.53,
+# metadata branches: ~0.58).
+VALUE_INIT_GAIN   = 2.2
+
+# ── v18 value embedding, MLP variant (PLE-like — the DEFAULT v18 choice) ─────
+# scalar -> Linear(1, H) -> GELU -> Linear(H, d).  Each hidden unit is a GELU
+# threshold at x = -b_i/a_i, so the H units form a piecewise basis over the
+# value axis.  Measured against the Fourier variant on held-out targets:
+#
+#     target              v17 linear   MLP   Fourier
+#     |x|                     0.000   1.000    0.000
+#     1[x > 1] threshold      0.499   0.950    0.000
+#     x^2 / sin(3x)           0.000   1.000    1.000
+#
+# The MLP wins on KINKS and THRESHOLDS, which is what meteorological structure
+# looks like (saturation, freezing, calm/gust).  Fourier only won on angular
+# quantities — wind direction — which is not represented here.
+VALUE_MLP_HIDDEN  = 32
+# First layer: |a| = 1 exactly with random sign, b ~ U(-3, 3), so the H
+# thresholds land at -b/a, spread UNIFORMLY over +-3 sigma.  PyTorch's default
+# (a, b ~ U(-1,1)) makes -b/a Cauchy-distributed: measured 26.9/32 thresholds
+# inside +-3 sigma versus 32/32 here, i.e. a sixth of the basis wasted.
+VALUE_MLP_THRESH  = 3.0
+# Second layer gain, /sqrt(H): calibrated on the real observations so the mean
+# per-variable std lands near 0.55, matching the v17 branch (0.53).
+VALUE_MLP_GAIN    = 0.65
+
+# Init scale for var_absent_embedding — the "sensor missing" code. Matched to a
+# typical PRESENT contribution (~0.5) so that "missing" is distinctive rather
+# than merely small.
+ABSENT_INIT_STD   = 0.5
 
 # Fourier feature dimension for DeltaTimeEmbedding.
 # Smaller than TEMPORAL_FOURIER_DIM — lead-time range (0–6 h) is much narrower
@@ -627,10 +674,65 @@ class VariableProjection(nn.Module):
         d_model:   Transformer model dimension.
     """
 
-    def __init__(self, num_vars: int = NUM_VARIABLES, d_model: int = 256):
+    def __init__(
+        self,
+        num_vars:        int  = NUM_VARIABLES,
+        d_model:         int  = 256,
+        value_embedding: str  = "linear",       # "linear" (v17) | "fourier" (v18)
+        wind_pair:       "tuple | None" = None, # e.g. (3, 4) -> encode u,v jointly
+    ):
+        """
+        value_embedding
+            "linear"  — v17: e_v = x_v * var_weights[v] + var_biases[v].
+                        Rank 1 per variable, no nonlinearity. DEFAULT, unchanged.
+            "mlp"     — v18: e_v = Linear_H->d( GELU( Linear_1->H(x_v) ) ).
+                        A piecewise basis over the value axis; best on kinks
+                        and thresholds, which is what meteorological structure
+                        looks like. The recommended v18 setting.
+            "fourier" — v18: PLR (Gorishniy et al., NeurIPS 2022):
+                        e_v = GELU( Linear( [x_v, cos(2*pi*x_v/lam), sin(...)] ) ).
+                        The raw value is kept alongside the periodic code so the
+                        map stays monotone and injective outside the wavelength
+                        range — real observations reach +26 sigma (precipitation)
+                        and +-11 sigma (wind), well beyond lambda_max.
+
+        wind_pair
+            Indices of variables encoded by ONE shared map instead of two
+            independent ones. Intended for (wind_u, wind_v), which are the two
+            components of a single vector: a joint encoder can form speed and
+            direction, which no per-variable map can. Verified on the data:
+            the wind_u and wind_v masks are identical in 100.000% of
+            (sample, station) pairs, so there is no partial-availability case.
+        """
         super().__init__()
-        self.num_vars = num_vars
-        self.d_model  = d_model
+        assert value_embedding in ("linear", "mlp", "fourier"), value_embedding
+        self.num_vars        = num_vars
+        self.d_model         = d_model
+        self.value_embedding = value_embedding
+
+        # ── Slots: usually one per variable; a wind pair occupies one slot ──
+        # Order is deterministic: variables in index order, with the pair
+        # collapsed at the position of its first member.
+        self.wind_pair = tuple(wind_pair) if wind_pair else None
+        slots: "list[tuple[int, ...]]" = []
+        if self.wind_pair:
+            assert len(self.wind_pair) == 2 and all(0 <= i < num_vars for i in self.wind_pair)
+            skip = set(self.wind_pair)
+            for v in range(num_vars):
+                if v == min(self.wind_pair):
+                    slots.append(self.wind_pair)
+                elif v not in skip:
+                    slots.append((v,))
+        else:
+            slots = [(v,) for v in range(num_vars)]
+        self.slots     = slots
+        self.num_slots = len(slots)
+        # One index buffer per slot, so forward() never builds a tensor.
+        # persistent=False: derivable from the config, not model state.
+        for si, members in enumerate(slots):
+            self.register_buffer(f"_slot_{si}",
+                                 torch.tensor(members, dtype=torch.long),
+                                 persistent=False)
 
         # Batched per-variable linear: var_weights[v] projects x[..., v] → d_model.
         # This tensor stores num_vars independent Linear(1, d_model) maps; it is
@@ -645,9 +747,49 @@ class VariableProjection(nn.Module):
         # describe the map being computed.  Measured effect of the old init: the
         # observation branch arrived at RMS 0.027 against ~0.58 for each of the
         # four metadata branches it is summed with.
-        self.var_weights = nn.Parameter(torch.empty(num_vars, d_model))
-        self.var_biases  = nn.Parameter(torch.zeros(num_vars, d_model))
-        nn.init.uniform_(self.var_weights, -1.0, 1.0)      # Linear(1, d) scale
+        if value_embedding == "linear" and self.wind_pair is None:
+            self.var_weights = nn.Parameter(torch.empty(num_vars, d_model))
+            self.var_biases  = nn.Parameter(torch.zeros(num_vars, d_model))
+            nn.init.uniform_(self.var_weights, -1.0, 1.0)   # Linear(1, d) scale
+        else:
+            # One map per SLOT. For "linear" the map is Linear(|slot| -> d);
+            # for "fourier" it is Linear(|slot| * VALUE_FEATURE_DIM -> d) + GELU.
+            maps = []
+            for s in slots:
+                n = len(s)
+                if value_embedding == "linear":
+                    maps.append(nn.Linear(n, d_model))
+                elif value_embedding == "mlp":
+                    H   = VALUE_MLP_HIDDEN
+                    l1  = nn.Linear(n, H)
+                    # |a| = 1 with random sign, b ~ U(-3, 3): thresholds at
+                    # -b/a spread uniformly over the value range instead of
+                    # PyTorch's Cauchy-distributed default.
+                    with torch.no_grad():
+                        l1.weight.copy_(torch.randint(0, 2, l1.weight.shape).float() * 2 - 1)
+                        nn.init.uniform_(l1.bias, -VALUE_MLP_THRESH, VALUE_MLP_THRESH)
+                    l2 = nn.Linear(H, d_model)
+                    bound = VALUE_MLP_GAIN / math.sqrt(H)
+                    nn.init.uniform_(l2.weight, -bound, bound)
+                    nn.init.zeros_(l2.bias)
+                    maps.append(nn.Sequential(l1, nn.GELU(), l2))
+                else:                                     # "fourier"
+                    lin   = nn.Linear(n * VALUE_FEATURE_DIM, d_model)
+                    # Fourier features are bounded, so this init alone fixes the
+                    # output scale — it does not depend on the observations'
+                    # spread. GELU roughly halves the std, hence a gain above 1.
+                    bound = VALUE_INIT_GAIN / math.sqrt(lin.in_features)
+                    nn.init.uniform_(lin.weight, -bound, bound)
+                    nn.init.zeros_(lin.bias)
+                    maps.append(nn.Sequential(lin, nn.GELU()))
+            self.slot_maps = nn.ModuleList(maps)
+            if value_embedding == "fourier":
+                self.register_buffer(
+                    "value_lambdas",
+                    torch.exp(torch.linspace(math.log(VALUE_LAMBDA_MIN),
+                                             math.log(VALUE_LAMBDA_MAX),
+                                             VALUE_FOURIER_K)),
+                )
 
         # NOTE: ``var_type_embedding`` (one learned vector per variable, added to
         # BOTH the present and the absent branch) has been REMOVED.  It was
@@ -682,8 +824,32 @@ class VariableProjection(nn.Module):
         # normalisation is per-station, x = 0 means "reads its own long-run
         # mean" — the MODAL value, not an edge case — so the collision sat on
         # the most common reading.
-        self.var_absent_embedding = nn.Parameter(torch.zeros(num_vars, d_model))
-        nn.init.trunc_normal_(self.var_absent_embedding, std=0.02)
+        # SCALE (corrected): initialise at the scale of a TYPICAL PRESENT
+        # contribution (~0.5), not at 0.02. A present sensor contributes
+        # std ~0.53; at 0.02 the absent code was 26x weaker, so "missing"
+        # was a barely-visible signal rather than a distinctive one. Those
+        # are different things: the code should be DISTINCTIVE in direction
+        # at comparable magnitude, not small.
+        self.var_absent_embedding = nn.Parameter(
+            torch.zeros(self.num_slots, d_model))
+        nn.init.trunc_normal_(self.var_absent_embedding, std=ABSENT_INIT_STD)
+
+    # ------------------------------------------------------------------
+    # Value features
+    # ------------------------------------------------------------------
+
+    def _value_features(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        (..., n) values -> (..., n * VALUE_FEATURE_DIM) PLR features.
+
+        Per value: [x, cos(2*pi*x/lam_i), sin(2*pi*x/lam_i)] for the
+        VALUE_FOURIER_K log-spaced wavelengths. Keeping the raw x means the
+        map is monotone and injective for values outside [lambda_min,
+        lambda_max] — necessary here because precipitation reaches +26 sigma.
+        """
+        ang  = 2.0 * math.pi * x.unsqueeze(-1) / self.value_lambdas   # (..., n, K)
+        feat = torch.cat([x.unsqueeze(-1), ang.cos(), ang.sin()], dim=-1)  # (..., n, 1+2K)
+        return feat.flatten(-2)                                        # (..., n*(1+2K))
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
@@ -694,22 +860,36 @@ class VariableProjection(nn.Module):
         Returns:
             (B, N, d_model)
         """
-        # Per-variable linear: (B, N, V, 1) * (V, d_model) → (B, N, V, d_model)
-        proj = x.unsqueeze(-1) * self.var_weights + self.var_biases   # (B, N, V, d_model)
+        # ── v17 fast path: byte-identical to the released implementation ───
+        if self.value_embedding == "linear" and self.wind_pair is None:
+            proj   = x.unsqueeze(-1) * self.var_weights + self.var_biases
+            m      = mask.unsqueeze(-1)
+            mixed  = proj * m + self.var_absent_embedding * (1.0 - m)
+            # sqrt(V), NOT V. Summing V roughly-independent contributions scales
+            # the variance by V and the std by sqrt(V); dividing by V
+            # over-suppresses by a further sqrt(V). sqrt(V) also makes
+            # std(obs) = sigma_x * sigma_w, independent of the variable count.
+            return mixed.sum(dim=-2) / math.sqrt(self.num_vars)
 
-        # Present sensors → projected value; absent sensors → learned absent
-        # embedding.  Variable identity is carried by the direction of
-        # var_weights[v] / var_absent_embedding[v]; no separate type vector.
-        m      = mask.unsqueeze(-1)                                    # (B, N, V, 1)
-        mixed  = proj * m + self.var_absent_embedding * (1.0 - m)      # (B, N, V, d_model)
+        # ── v18 path: one map per SLOT ─────────────────────────────────────
+        # A slot is one variable, or the wind pair. A slot counts as present
+        # only when every member is present (u and v always agree in this
+        # dataset, but the rule is enforced rather than assumed).
+        acc = None
+        for si, members in enumerate(self.slots):
+            # Buffer, not new_tensor(): this is the training hot loop, and
+            # building an index tensor per call forces a host->device copy.
+            idx  = getattr(self, f"_slot_{si}")
+            xv   = x.index_select(-1, idx)                      # (B, N, |slot|)
+            mv   = mask.index_select(-1, idx).amin(-1, keepdim=True)   # (B, N, 1)
+            feat = self._value_features(xv) if self.value_embedding == "fourier" else xv
+            e    = self.slot_maps[si](feat)     # GELU lives inside the Sequential
+            e = e * mv + self.var_absent_embedding[si] * (1.0 - mv)
+            acc = e if acc is None else acc + e
 
-        # sqrt(V), NOT V.  Summing V roughly-independent contributions scales the
-        # variance by V and the std by sqrt(V); dividing by V over-suppresses by
-        # a further sqrt(V).  sqrt(V) also makes std(obs) = sigma_x * sigma_w,
-        # independent of the variable count (see the class docstring).
-        out = mixed.sum(dim=-2) / math.sqrt(self.num_vars)             # (B, N, d_model)
-
-        return out
+        # Divide by sqrt(number of SLOTS): the same reasoning as sqrt(V), but
+        # a paired wind slot is one contribution, not two.
+        return acc / math.sqrt(self.num_slots)
 
     # ------------------------------------------------------------------
     # Checkpoint migration
@@ -735,6 +915,19 @@ class VariableProjection(nn.Module):
         what invalidated every test number from v9 to v13 in this project.
         """
         t_key = prefix + "var_type_embedding.weight"
+        if t_key in state_dict and not (self.value_embedding == "linear"
+                                        and self.wind_pair is None):
+            # A pre-rebalance checkpoint cannot be folded into a v18 layout:
+            # the parameter set is different (slot_maps vs var_weights) and the
+            # value map is no longer linear, so no algebraic rewrite exists.
+            raise RuntimeError(
+                f"VariableProjection at '{prefix}': this checkpoint predates the "
+                f"observation-token rebalance (it carries var_type_embedding), "
+                f"but the model is configured with value_embedding="
+                f"'{self.value_embedding}' / wind_pair={self.wind_pair}. "
+                f"Old checkpoints can only be loaded into the v17 layout "
+                f"(value_embedding='linear', wind_pair=None). Evaluate them "
+                f"with that configuration.")
         if t_key in state_dict:
             t     = state_dict.pop(t_key)
             scale = math.sqrt(self.num_vars)

@@ -743,6 +743,8 @@ class StationMAEEncoder(nn.Module):
         spatial_attn:         bool  = True,
         temporal_window:      int   = 0,
         temporal_patch:       int   = 1,
+        value_embedding:      str   = "linear",     # v18: "linear" | "fourier"
+        wind_pair:            "tuple | None" = None,  # v18: e.g. (3, 4) for u,v
         patch_schedule:       "str | None" = None,   # v15 telescopic, e.g. "48x6,18x3,6x1"
         drop_path_rate:       float = 0.0,
         joint:                bool  = False,
@@ -771,7 +773,9 @@ class StationMAEEncoder(nn.Module):
         # NOT numerically compatible with this encoder (token math changed).
 
         # --- Embedding modules (four components: p1, p2, v, t) ---
-        self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
+        self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model,
+                                              value_embedding=value_embedding,
+                                              wind_pair=wind_pair)
         self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
                                                 dropout=dropout)
         self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim,

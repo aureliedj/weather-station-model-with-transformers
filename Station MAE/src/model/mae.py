@@ -134,6 +134,8 @@ class StationMAE(nn.Module):
         encoder_spatial_attn:    bool  = True,
         temporal_window:         int   = 0,
         temporal_patch:          int   = 1,
+        value_embedding:         str   = "linear",     # v18
+        wind_pair:               "tuple | None" = None,  # v18
         patch_schedule:          "str | None" = None,   # v15 telescopic tokenization
         cross_attention_decoder: bool  = False,
         drop_path_rate:          float = 0.0,
@@ -278,6 +280,8 @@ class StationMAE(nn.Module):
             spatial_attn=encoder_spatial_attn,
             temporal_window=temporal_window,
             temporal_patch=temporal_patch,
+            value_embedding=value_embedding,
+            wind_pair=wind_pair,
             patch_schedule=patch_schedule,
             drop_path_rate=drop_path_rate,
             joint=joint_encoder,

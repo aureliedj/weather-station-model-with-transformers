@@ -206,6 +206,19 @@ def parse_args() -> argparse.Namespace:
                         "Prevents visible stations from being used as supervision "
                         "targets — appropriate for inpainting (--max_delta 0) where "
                         "visible stations have a shortcut via their own input window.")
+    p.add_argument("--value_embedding",     type=str, default="linear",
+                   choices=["linear", "mlp", "fourier"],
+                   help="v18 observation encoder. 'linear' (default) is v17: "
+                        "e_v = x_v*w_v + b_v, rank 1, no nonlinearity. "
+                        "'mlp' (recommended) is 1 -> 32 -> GELU -> d: a "
+                        "piecewise basis over the value axis, best on kinks "
+                        "and thresholds. 'fourier' is PLR (Gorishniy et al. "
+                        "2022) and wins only on angular quantities.")
+    p.add_argument("--wind_encoder",        action="store_true",
+                   help="v18: encode (wind_u, wind_v) with ONE shared map "
+                        "instead of two independent ones, so the encoder can "
+                        "form speed and direction directly. Safe: the u and v "
+                        "masks are identical in 100%% of station-samples.")
     p.add_argument("--joint_encoder",       action="store_true",
                    help="Use JointSpatioTemporalBlock in the encoder: full self-attention "
                         "over all W×N tokens simultaneously with temporal RoPE on Q/K. "
@@ -773,6 +786,8 @@ def main() -> None:
         factorised_encoder=args.factorised_encoder,
         encoder_spatial_attn=not args.no_spatial_attn,
         temporal_window=args.temporal_window,
+        value_embedding=args.value_embedding,
+        wind_pair=((3, 4) if args.wind_encoder else None),
         temporal_patch=args.temporal_patch,
         patch_schedule=(args.patch_schedule or None),
         cross_attention_decoder=args.cross_attn_decoder,
@@ -823,6 +838,9 @@ def main() -> None:
         print(f"Factorised encoder       : ON  ({_spatial_str}{_tw_str})")
     if args.cross_attn_decoder:
         print("Cross-attention decoder  : ON")
+    if args.value_embedding != "linear" or args.wind_encoder:
+        _w = "  |  shared (u,v) encoder" if args.wind_encoder else ""
+        print(f"Observation encoder      : {args.value_embedding}{_w}  (v18)")
     print(f"Model: {model.count_parameters():,} trainable parameters")
 
     # ── Token balance (initialisation invariant, not a training metric) ─────
@@ -904,6 +922,8 @@ def main() -> None:
         "factorised_encoder":  args.factorised_encoder,
         "no_spatial_attn":     args.no_spatial_attn,
         "temporal_window":     args.temporal_window,
+        "value_embedding":     args.value_embedding,
+        "wind_encoder":        args.wind_encoder,
         "temporal_patch":      args.temporal_patch,
         # Structural (v15): MUST be recorded or evaluation rebuilds the
         # wrong tokenization / head parameterisation.
