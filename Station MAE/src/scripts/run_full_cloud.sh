@@ -1,207 +1,40 @@
 #!/usr/bin/env bash
 # run_full_cloud.sh — full training run, A100 80GB PCIe (MIG 3g.20gb)
 #
-# CURRENT CONFIG (v15): uniform patch-3 (30-min tokens), full attention, d_model=384,
-# 16 layers, 100-epoch schedule, uniform variable weights.
-# Earlier settings are kept as commented alternatives.
+# The configuration this script currently launches is set in the CONFIG block
+# below; the wandb run name records which version it is.
+#
+# Change history (v12 -> v15) lives in report/run-script-history.md.
+# Change tables:
+#   report/v12-v15-v17-changes.md    v12 -> v15 -> v17
+#   report/v17-v19-v20-changes.md    v17 -> v19 -> v20, with test results
 #
 # Hardware context
 # ----------------
-# The A100 is running in MIG mode. The allocated partition is 3g.20gb:
-#   • 19,968 MiB (~20 GB) VRAM  — NOT the full 80 GB
-#   • 28 / 108 streaming multiprocessors
-#   • No NVLink across MIG instances → single-GPU only
+# The A100 runs in MIG mode. The allocated partition is 3g.20gb:
+#   * 19,968 MiB (~20 GB) VRAM  — NOT the full 80 GB
+#   * 28 / 108 streaming multiprocessors
+#   * no NVLink across MIG instances -> single-GPU only
 #
-# Key flags:
+# Flags that exist for that constraint:
+#   --amp --bf16        native BF16 tensor cores; no loss scaling
+#   --compile           "default" mode — MIG restricts CUDA graph capture, so
+#                       "reduce-overhead" would silently fail
+#   --grad_checkpoint   ~33% extra compute for ~66% less activation memory
+#   --local_cache_dir   split-normalised tensors as numpy memmaps on tmpfs;
+#                       workers mmap from the OS page cache, no IPC for source data
 #
-#   CHANGE 1 — bfloat16 AMP  (--amp --bf16)
-#     A100 has native BF16 tensor cores. Same speed as FP16 but wider
-#     dynamic range — no loss scaling, more numerically stable.
+# Resuming:
+#   bash src/scripts/run_full_cloud.sh          auto-resumes from last.ckpt
+#   RESUME=0 bash src/scripts/run_full_cloud.sh forces a fresh run
 #
-#   CHANGE 2 — torch.compile default mode  (--compile)
-#     MIG partitions restrict CUDA graph capture, so "reduce-overhead" mode
-#     would silently fail. "default" mode still fuses ops and removes Python
-#     overhead (~1.3-1.5× speedup), no CUDA graphs needed.
-#     Warm-up cost: ~1-2 min on the first epoch.
+# Resume is explicit: main.py only resumes when --resume is passed. A plain
+# re-run used to start from random init AND write into the same SAVE_DIR, which
+# is what produced the best-v1.ckpt / last-v1.ckpt pairs in full_run_cloud_v12.
 #
-#   CHANGE 3 — fast local cache  (--local_cache_dir /tmp/station_mae_cache)
-#     Saves split-normalised tensors as numpy mmap files on /tmp (tmpfs).
-#     Workers mmap directly from OS page cache — no IPC queue overhead for
-#     source data. First run writes files; all subsequent runs are instant.
-#
-#   CHANGE 4 — gradient checkpointing  (--grad_checkpoint)
-#     With only 20 GB VRAM, grad checkpointing trades ~33% extra compute
-#     for ~66% less activation memory, preventing OOM.
-#
-# Encoder architecture options (require --factorised_encoder):
-#
-#   --no_spatial_attn
-#     Removes the spatial attention sub-layer from every encoder block.
-#     Each station is encoded independently from its own temporal window;
-#     cross-station reasoning is delegated entirely to the decoder.
-#     Saves ~27% per encoder block — the single most impactful speed flag.
-#     Recommended with --cross_attn_decoder.
-#
-#   --temporal_window N
-#     Local windowed temporal attention: splits W timesteps into chunks of N.
-#     Odd layers use a Swin-style half-window shift so tokens communicate
-#     across chunk boundaries after two layers. W must be divisible by N.
-#     At W=72, tw=6 gives 12 one-hour chunks. Score computation drops 12×
-#     (still modest savings vs FFN/QKV, but worthwhile at this window size).
-#
-# Resuming an interrupted or early-stopped run:
-#   bash src/scripts/run_full_cloud.sh          (auto-resumes from last.ckpt)
-#   RESUME=0 bash src/scripts/run_full_cloud.sh (force a fresh run)
-#
-# This is now real. It used to say Lightning resumed automatically -- it does
-# NOT. main.py only resumes when --resume is passed, so a plain re-run started
-# from random init AND wrote into the same SAVE_DIR, which is what produced the
-# best-v1.ckpt / last-v1.ckpt pairs in full_run_cloud_v12.
-#
-# Usage:
-#   bash src/scripts/run_full_cloud.sh
-
-# ═══════════════════════════════════════════════════════════════════════════
-# v15 vs v14 — FIVE TARGETED FIXES (fix 3 disabled after the sanity run) (see report/v14-vs-v15-changes.md)
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# The simple-MAE detour was the controlled experiment that identified WHICH
-# parts of v14 needed fixing. v15 keeps v14's paradigm — delta-conditioned
-# query decoder, exactly what the project description asks for — and repairs
-# the five defects it exposed. MAE-faithful depth split kept: enc 8 / dec 2.
-#
-# 1. UNIFORM PATCHING, FINER THAN v14  --temporal_patch 3   (v14 used 6)
-#    Three 10-min steps become one token: 24 temporal positions, 24 x 78 =
-#    1,872 encoder tokens with full attention.
-#
-#    Why 3 and not 6: the val metric is a 30-MIN forecast. At P=6 that is half
-#    an hourly token, which is the "hourly patches starve the short lead"
-#    problem behind v14. At P=3 a token IS 30 min, so the first lead is one
-#    token ahead. Set PATCH=1 (raw, no loss of resolution) or PATCH=6 (exactly
-#    v14) to walk the tokenization ablation — it is a single variable.
-#
-#    Cost, per encoder pass at d384/L8:
-#        v12 (tw6 windowed, d1024, L16)  ~1,217 GFLOP   (the 100 h run)
-#        P=1 raw                           ~273 GFLOP
-#        P=3 (current)                      ~48 GFLOP
-#        P=6                                ~19 GFLOP
-#    The d1024 -> d384 cut is what makes any of these affordable.
-#
-#    NOTE for evaluation: at mask_ratio 0.00 nothing is hidden, so the encoder
-#    carries all 155 stations -> 24 x 155 = 3,720 tokens, 2x the training
-#    sequence. run_test_cloud.sh sizes its batch for that.
-#
-# 2. INPUT-CONTEXT PATHWAY REMOVED  (was: --input_context_cross_attn)
-#    Its only job was smuggling raw recency past the uniform patching —
-#    redundant once the last hour is in the main sequence. Deletes the
-#    subsystem behind the silent-eval bug AND the zero-key attention issue.
-#
-# 3. PERSISTENCE-RESIDUAL HEAD  --residual_head   ← DISABLED, see below
-#    y_hat = y(t0) + f(.), so the model would START at persistence instead of
-#    spending epochs learning it. Masked stations keep a ZERO base — their
-#    last observation is hidden information, so no leak is reintroduced.
-#
-#    TURNED OFF after the sanity2 subset run (epochs 2-7):
-#      • every val metric bottomed at epoch 4 then degraded
-#        (overall_rmse 0.667 -> 0.677, temperature 3.05 -> 3.21 C)
-#      • val/horizon_sensitivity FELL 0.397 -> 0.365, i.e. f was collapsing
-#        toward a lead-time-independent constant
-#    Diagnosis: the base differs per station (y(t0) if visible, 0 if masked)
-#    but the decoder queries carry NO maskedness signal - they are
-#    mask_token + pos + topo + delta + step for every station alike. One head
-#    therefore has to emit a small DEVIATION for visible stations and a full
-#    ABSOLUTE value for masked ones, with no way to tell which regime it is
-#    in. Bimodal target, unobservable condition.
-#
-#    It also broke comparability with the simple-MAE runs, which have no
-#    residual head.
-#
-#    To revive it, the decoder needs an explicit "this station is masked"
-#    embedding added to its queries (masked_idx is already available in
-#    mae.py; ~5 lines). That is NOT leakage - which stations are offline is
-#    known at deployment time; only their VALUES must stay hidden.
-#
-# 4. TRUNK SLIMMED  --d_model 384 --enc_layers 8  (was: 512 / 16)
-#    The 16-layer depth was receptive-field arithmetic for WINDOWED
-#    attention, obsolete since v13 went full-attention. ~65M -> ~20M params,
-#    which is also what makes RAW tokenization (fix 1) affordable at all.
-#    enc 8 / dec 2 preserves the MAE-style asymmetry of the original design.
-#
-# 5. EVAL GUARD  test.py now ABORTS on pre-v15 checkpoints (they carry
-#    decoder.input_cross_attn.* weights). Evaluate those with the code that
-#    trained them — never mix.
-#
-# NOTE: --mask_ratio is back to 0.5 (v14's last run used 0 for the
-# masking-ablation). Set it to 0 again only to repeat that ablation.
-#
-# ═══════════════════════════════════════════════════════════════════════════
-# v14 vs v13 — WHY THIS IS A FRESH RUN
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# A. 100-EPOCH SCHEDULE (was 300, of which v13 completed 23).
-#    Fresh rather than resumed: v13's 23 epochs were trained against a cosine
-#    denominator of 285 epochs. Resuming into a 100-epoch schedule would leave
-#    the first quarter of training on one LR curve and the rest on another.
-#    At ~12x cheaper than v12, a clean run costs a few hours and is far easier
-#    to defend in the write-up. v13's checkpoints are untouched in
-#    checkpoints/full_run_cloud_v13 and should still be re-evaluated with the
-#    input_context fix, since that number is now meaningful.
-#
-# B. warmup 15 -> 10 epochs (10% of the schedule, the usual proportion).
-#
-# C. --var_weights 1.0 1.0 1.0 1.0 1.0   (was hardcoded [1, 1, 0.7, 0.5, 0.5])
-#    The LSTM baseline trains at 1.0 across the board, so the old defaults gave
-#    the transformer 0.7x gradient on humidity and 0.5x on wind — precisely the
-#    variables where it loses. The per-variable comparison was not like-for-like.
-#
-# D. EVALUATION BUG FIXED (test.py). Every test-set number from v9 onwards was
-#    produced by a decoder rebuilt WITHOUT its input-context cross-attention:
-#    36 trained tensors were silently dropped by strict=False, severing the path
-#    from the stations' current observations to the decoder. Validation during
-#    training was always correct, which is why val and test disagreed ~3.7x.
-#    The "model ignores its inputs" diagnosis was measured through that bug.
-#
-# ═══════════════════════════════════════════════════════════════════════════
-# WHAT CHANGED vs v12, AND WHY
-# ═══════════════════════════════════════════════════════════════════════════
-#
-# 1. TEMPORAL PATCHING  --temporal_patch 6   (was: none)
-#    Six consecutive 10-min steps become ONE token, so the encoder sees 12
-#    temporal positions instead of 72.
-#    Motivation: measured receptive field. At W=72 with tw=6 windowed attention
-#    and 8 layers, the NEWEST token could only reach 4 h of the 12 h window.
-#    Full coverage would have needed 12 layers.
-#
-# 2. WINDOWING RETIRED  --temporal_window 0  (was: 6)
-#    Windowing only existed to make 72x78 = 5,616 tokens affordable. After
-#    patching there are 12x78 = 936, and FULL attention over those costs
-#    ~0.88M score entries per layer versus ~2.63M for the windowed setup.
-#    Cheaper AND every token sees the whole window from layer 1.
-#    It also removes the unmasked circular shift (see encoder.py) that let
-#    t=71 attend to t=0 in v9/v11/v12.
-#
-# 3. d_model 1024 -> 512, enc_layers 8 -> 16
-#    Attention/FFN cost scales as d^2, so halving d buys 4x the layers at equal
-#    FLOPs. Depth is what the receptive-field analysis said was missing.
-#    No information bottleneck: each patched token carries 6 steps x 6 vars =
-#    36 numbers, so 512 is still a ~14x expansion.
-#
-# 4. REGULARISATION REMOVED  --dropout 0.0 --drop_path_rate 0.0  (was 0.1/0.1)
-#    v12 added dropout, drop-path and early stopping to a model whose problem
-#    is that it IGNORES its inputs and predicts the conditional mean. Those are
-#    all anti-overfitting measures applied to an underfitting failure — they
-#    push the model further toward the mean. Removed until it can beat
-#    persistence; re-introduce only if a genuine train/val gap appears.
-#
-# 5. OverfitEarlyStop now respects warmup (fixed in main.py).
-#    v12 ran --overfit_patience 5 against --warmup_epochs 15, so it could stop
-#    before the LR ever reached peak. v12's result should be treated as void.
-#
-# 6. Nearest-station normalisation for sparse (station,variable) pairs
-#    (data/dataset.py). GES pressure has ZERO training observations and used to
-#    borrow the altitude-blind GLOBAL mean; it now borrows from the nearest
-#    station at a comparable elevation.
-# ═══════════════════════════════════════════════════════════════════════════
+# Quick check before committing the full budget:
+#   SANITY=1 bash src/scripts/run_full_cloud.sh   ~minutes
+#   SANITY=2 bash src/scripts/run_full_cloud.sh   ~1 hour
 
 set -euo pipefail
 
@@ -244,27 +77,20 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 
 # ── Encoder architecture ──────────────────────────────────────────────────────
 #
-# Three mutually exclusive encoder modes (choose ONE):
+# Two modes:
 #
-#   JOINT encoder  (--joint_encoder)
-#     Full self-attention over all W×N tokens simultaneously.
-#     Temporal RoPE on Q/K — captures cross-station × cross-time interactions
-#     in every layer. Flash Attention keeps VRAM linear.  Slower than factorised
-#     but richer representations.  Strongly recommended with --grad_checkpoint.
-#     At W=72, N_vis≈75: L≈5400 tokens, ~2.5× slower than factorised.
-#     Disable --factorised_encoder and --no_spatial_attn when using this.
+#   FACTORISED  (--factorised_encoder)   <- what every run since v15 uses
+#     Temporal attention, then spatial, then a shared FFN. ~100x cheaper than
+#     flat. Spatial attention is FULL over the station axis; the windowing
+#     option below applies to the temporal axis only.
 #
-#   FACTORISED encoder  (--factorised_encoder, current default)
-#     Alternates temporal then spatial attention — ~100× cheaper than flat.
-#     --no_spatial_attn removes the spatial sub-layer (station-independent).
+#   FLAT  (no flag)
+#     Standard self-attention over all W*N_vis tokens. Kept so pre-v15
+#     checkpoints stay loadable.
 #
-#   FLAT encoder  (neither flag)
-#     Standard self-attention over flattened W·N_vis tokens.
-
-# Set ENCODER to one of the three options below:
-# ENCODER="--factorised_encoder"                     # default: full axial (temporal + spatial)
-# ENCODER="--factorised_encoder --no_spatial_attn"  # temporal-only (station-independent encoder)
-# ENCODER="--joint_encoder"                         # joint spatiotemporal + RoPE
+# REMOVED in the v22 cleanup: --joint_encoder (JointSpatioTemporalBlock, full
+# W*N attention with temporal RoPE) and --no_spatial_attn — ~348 lines that no
+# configuration had selected since v14. git history has them.
 # ── Temporal tokenization ────────────────────────────────────────────────────
 # Uniform patching: P consecutive 10-min steps become ONE encoder token.
 #   P=1  raw       72 positions -> 5,616 tokens  (~273 GFLOP/pass)  no loss, slow

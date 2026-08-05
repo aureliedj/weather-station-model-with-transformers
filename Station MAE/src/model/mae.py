@@ -108,13 +108,68 @@ class StationMAE(nn.Module):
                                  as context only and receive no gradient.
                                  Appropriate for inpainting (max_delta=0) where visible
                                  stations have a shortcut via their own input window.
-        joint_encoder:           If True, use JointSpatioTemporalBlock in the encoder —
-                                 full attention over all W×N tokens simultaneously, with
-                                 temporal RoPE on Q and K.  Flash Attention keeps VRAM
-                                 linear in sequence length.  Takes precedence over
-                                 factorised_encoder when both are set.
-                                 Recommended with use_checkpoint=True on ≤ 24 GB GPUs.
     """
+
+    # Every key main.py records in hyper_parameters["cfg"] that changes the
+    # ARCHITECTURE, mapped to its constructor argument. Anything not listed here
+    # is a data/optimiser setting and does not affect how the model is built.
+    #
+    # This table exists because main.py and test.py used to build the model from
+    # two independently maintained kwargs lists, and they drifted: test.py never
+    # read value_embedding, wind_encoder, static_in_token, direct_head or
+    # readout, so any v18+ checkpoint silently rebuilt itself with the pre-v18
+    # defaults. The structural guard caught it, but only after a four-minute
+    # dataset build. One table, two callers, no drift.
+    _CFG_TO_ARG = {
+        "d_model":            "d_model",
+        "enc_heads":          "enc_heads",
+        "enc_layers":         "enc_layers",
+        "dec_heads":          "dec_heads",
+        "dec_layers":         "dec_layers",
+        "mlp_ratio":          "mlp_ratio",
+        "mask_ratio":         "mask_ratio",
+        "window":             "window_size",
+        "factorised_encoder": "factorised_encoder",
+        "temporal_window":    "temporal_window",
+        "temporal_patch":     "temporal_patch",
+        "value_embedding":    "value_embedding",
+        "static_in_token":    "static_in_token",
+        "direct_head":        "direct_head",
+        "readout":            "readout",
+        "residual_head":      "residual_head",
+        "cross_attn_decoder": "cross_attention_decoder",
+        "drop_path_rate":     "drop_path_rate",
+        "masked_only_loss":   "masked_only_loss",
+        "use_persist_norm":   "use_persist_norm",
+        "delta0_weight":      "delta0_weight",
+        "var_weights":        "var_weights",
+    }
+
+    @classmethod
+    def from_cfg(cls, cfg: dict, **overrides) -> "StationMAE":
+        """
+        Build a model from a saved ``hyper_parameters["cfg"]`` dict.
+
+        Defaults are the constructor's own, so a cfg from an older run rebuilds
+        the behaviour that run had. ``overrides`` win over cfg — test.py uses
+        that for ``dropout=0.0`` and for CLI flags that override the checkpoint.
+
+        Two keys are derived rather than copied:
+          * ``wind_pair``    from the boolean ``wind_encoder``
+          * ``num_horizons`` from ``max_delta // delta_grid_stride + 1``, the
+            same arithmetic main.py uses; it must match the trained
+            ``direct_proj`` width or the head reshapes into the wrong horizons.
+        """
+        kw = {arg: cfg[key] for key, arg in cls._CFG_TO_ARG.items() if key in cfg}
+
+        if "wind_encoder" in cfg:
+            kw["wind_pair"] = (3, 4) if cfg["wind_encoder"] else None
+        if "max_delta" in cfg:
+            stride = int(cfg.get("delta_grid_stride", 3) or 3)
+            kw["num_horizons"] = int(cfg["max_delta"]) // stride + 1
+
+        kw.update(overrides)
+        return cls(**kw)
 
     def __init__(
         self,
@@ -131,7 +186,6 @@ class StationMAE(nn.Module):
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
         use_checkpoint:          bool  = False,
         factorised_encoder:      bool  = False,
-        encoder_spatial_attn:    bool  = True,
         temporal_window:         int   = 0,
         temporal_patch:          int   = 1,
         value_embedding:         str   = "linear",     # v18
@@ -140,11 +194,9 @@ class StationMAE(nn.Module):
         direct_head:             bool  = False,          # v22: no decoder
         readout:                 str   = "last",         # "last" | "mean"
         num_horizons:            int   = 13,
-        patch_schedule:          "str | None" = None,   # v15 telescopic tokenization
         cross_attention_decoder: bool  = False,
         drop_path_rate:          float = 0.0,
         masked_only_loss:         bool  = False,
-        joint_encoder:            bool  = False,
         residual_head:            bool  = False,        # v15: ŷ = y(t0) + f(·)
         delta0_weight:            float = 1.0,
         var_weights:              "list | None" = None,
@@ -281,15 +333,12 @@ class StationMAE(nn.Module):
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
             factorised=factorised_encoder,
-            spatial_attn=encoder_spatial_attn,
             temporal_window=temporal_window,
             temporal_patch=temporal_patch,
             value_embedding=value_embedding,
             wind_pair=wind_pair,
             static_in_token=static_in_token,
-            patch_schedule=patch_schedule,
             drop_path_rate=drop_path_rate,
-            joint=joint_encoder,
             step_emb=shared_step_emb,
         )
         self.residual_head    = bool(residual_head)

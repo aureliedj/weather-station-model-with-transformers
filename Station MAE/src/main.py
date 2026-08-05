@@ -163,13 +163,6 @@ def parse_args() -> argparse.Namespace:
                         "over 12*N_vis costs LESS than the windowed setup it replaces "
                         "while giving every token the whole window from layer 1. "
                         "Use with --temporal_window 0. Default 1 = no patching.")
-    p.add_argument("--patch_schedule",      type=str, default="",
-                   help="v15 TELESCOPIC tokenization, overrides --temporal_patch. "
-                        "Comma-separated 'steps x patch' segments, oldest→newest, "
-                        "summing to --window. E.g. '48x6,18x3,6x1' for W=72: "
-                        "oldest 8 h hourly, middle 3 h half-hourly, last 1 h RAW "
-                        "(20 temporal positions). Native resolution where short "
-                        "leads need it — replaces the input-context side-channel.")
     p.add_argument("--residual_head", action="store_true",
                    help="v15: predict the DEVIATION from the last observation "
                         "(ŷ = y(t0) + f). Visible stations start at persistence; "
@@ -186,12 +179,6 @@ def parse_args() -> argparse.Namespace:
                         "  Factorised encoder: windowed temporal-only attention within "
                         "each station's tw-step chunk. Spatial sub-layer unchanged.\n"
                         "Example: --window 72 --temporal_window 6")
-    p.add_argument("--no_spatial_attn",     action="store_true",
-                   help="Disable spatial attention sub-layer in factorised encoder blocks. "
-                        "Each station is encoded independently from its own temporal window; "
-                        "cross-station reasoning is delegated entirely to the decoder. "
-                        "Only applies when --factorised_encoder is set. "
-                        "Reduces encoder cost from O(N·W²+W·N²) to O(N·W²).")
     p.add_argument("--cross_attn_decoder",  action="store_true",
                    help="Cross-attention decoder (query tokens attend to encoder context)")
     p.add_argument("--grad_checkpoint",     action="store_true",
@@ -241,13 +228,6 @@ def parse_args() -> argparse.Namespace:
                         "topography (cols 2:15); one slot per feature would give "
                         "the weather only 6/21 of the block and measures WORSE "
                         "than the separate-branch default.")
-    p.add_argument("--joint_encoder",       action="store_true",
-                   help="Use JointSpatioTemporalBlock in the encoder: full self-attention "
-                        "over all W×N tokens simultaneously with temporal RoPE on Q/K. "
-                        "Captures cross-dimensional (space × time) interactions in every "
-                        "layer. Flash Attention keeps VRAM linear; use with "
-                        "--grad_checkpoint on ≤24 GB GPUs. Takes precedence over "
-                        "--factorised_encoder.")
 
     p.add_argument("--var_weights", type=float, nargs=5, default=None,
                    metavar=("TEMP","PRES","HUM","WIND_U","WIND_V"),
@@ -270,10 +250,6 @@ def parse_args() -> argparse.Namespace:
                         "input, contributing near-zero loss that dilutes forecasting gradients. "
                         "(Challu et al. 2023, N-HiTS; see REVIEW.md §5.4)")
 
-    p.add_argument("--input_context_cross_attn", action="store_true",
-                   help="REMOVED in v15 (accepted for compatibility, ignored with a "
-                        "warning). Its job is done structurally by --patch_schedule "
-                        "(raw last hour in the main sequence) + --residual_head.")
     p.add_argument("--persist_norm", action="store_true",
                    help="Normalise each variable's loss by its persistence MSE, converting "
                         "the loss to a skill-score scale (1.0 = matches persistence baseline). "
@@ -667,10 +643,6 @@ def _estimate_persist_mse(
 
 def main() -> None:
     args = parse_args()
-    if args.input_context_cross_attn:
-        print("[v15] WARNING: --input_context_cross_attn is removed and IGNORED. "
-              "Recency is handled by --patch_schedule (raw last hour) and "
-              "--residual_head instead.")
 
     # ── Seed ────────────────────────────────────────────────────────────────
     set_seed(args.seed)
@@ -806,7 +778,6 @@ def main() -> None:
         mask_ratio=args.mask_ratio,
         use_checkpoint=args.grad_checkpoint,
         factorised_encoder=args.factorised_encoder,
-        encoder_spatial_attn=not args.no_spatial_attn,
         temporal_window=args.temporal_window,
         value_embedding=args.value_embedding,
         wind_pair=((3, 4) if args.wind_encoder else None),
@@ -815,11 +786,9 @@ def main() -> None:
         readout=args.readout,
         num_horizons=(args.max_delta // args.delta_grid_stride + 1),
         temporal_patch=args.temporal_patch,
-        patch_schedule=(args.patch_schedule or None),
         cross_attention_decoder=args.cross_attn_decoder,
         drop_path_rate=args.drop_path_rate,
         masked_only_loss=args.masked_only_loss,
-        joint_encoder=args.joint_encoder,
         residual_head=args.residual_head,
         var_weights=args.var_weights,
         delta0_weight=args.delta0_weight,
@@ -853,15 +822,10 @@ def main() -> None:
               "NLL = 0.5×(err²/σ² + log σ²))")
     if args.grad_checkpoint:
         print("Gradient checkpointing   : ON  (~33% extra compute, ~66% less VRAM)")
-    if args.joint_encoder:
-        print("Joint encoder            : ON  (full W×N attention + temporal RoPE; "
-              "Flash Attention — use with --grad_checkpoint on ≤24 GB)")
-    elif args.factorised_encoder:
-        _spatial_str = "temporal-only (--no_spatial_attn)" if args.no_spatial_attn \
-                       else "temporal + spatial"
-        _tw_str = f"  |  temporal_window={args.temporal_window}" \
-                  if args.temporal_window > 0 else ""
-        print(f"Factorised encoder       : ON  ({_spatial_str}{_tw_str})")
+    if args.factorised_encoder:
+        _tw_str = (f"  |  temporal_window={args.temporal_window}"
+                   if args.temporal_window > 0 else "  |  full temporal attention")
+        print(f"Factorised encoder       : ON  (temporal + spatial{_tw_str})")
     if args.cross_attn_decoder:
         print("Cross-attention decoder  : ON")
     if args.value_embedding != "linear" or args.wind_encoder:
@@ -952,7 +916,6 @@ def main() -> None:
         "num_stations":        _obs_stats_kept["std"].shape[0],   # N_keep
         # Informational — stored in checkpoint hyper_parameters for test.py
         "factorised_encoder":  args.factorised_encoder,
-        "no_spatial_attn":     args.no_spatial_attn,
         "temporal_window":     args.temporal_window,
         "value_embedding":     args.value_embedding,
         "wind_encoder":        args.wind_encoder,
@@ -962,7 +925,6 @@ def main() -> None:
         "temporal_patch":      args.temporal_patch,
         # Structural (v15): MUST be recorded or evaluation rebuilds the
         # wrong tokenization / head parameterisation.
-        "patch_schedule":      args.patch_schedule,
         "residual_head":       args.residual_head,
         "var_weights":         args.var_weights,
         "cross_attn_decoder":  args.cross_attn_decoder,
@@ -984,7 +946,6 @@ def main() -> None:
         "delta0_weight":       args.delta0_weight,
         "use_nll_loss":        args.nll_loss,
         "use_persist_norm":    args.persist_norm,
-        "joint_encoder":       args.joint_encoder,
         "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,
         "delta_mode":          args.delta_mode,

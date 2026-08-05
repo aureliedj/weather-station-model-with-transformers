@@ -47,7 +47,6 @@ Arguments
     --dec_layers       INT   Auto-read from checkpoint
     --mlp_ratio        FLT   Auto-read from checkpoint
     --mask_ratio       FLT   Auto-read from checkpoint
-    --no_spatial_attn        Auto-read from checkpoint
     --temporal_window  INT   Auto-read from checkpoint
 
   Output
@@ -134,13 +133,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--mask_ratio",  type=float, default=None)
     p.add_argument("--factorised_encoder", action="store_true", default=None,
                    help="Axial attention encoder (auto-detected from Lightning checkpoints)")
-    p.add_argument("--no_spatial_attn", action="store_true", default=None,
-                   help="Temporal-only encoder (auto-detected from Lightning checkpoints)")
     p.add_argument("--temporal_patch", type=int, default=None,
                    help="Auto-read from the checkpoint; override only to debug.")
-    p.add_argument("--patch_schedule", type=str, default=None,
-                   help="v15 telescopic schedule; auto-read from the checkpoint "
-                        "cfg. Override only for legacy checkpoints.")
     p.add_argument("--residual_head", action="store_true", default=None,
                    help="v15 residual head; auto-read from the checkpoint cfg.")
     p.add_argument("--temporal_window", type=int, default=None,
@@ -926,12 +920,10 @@ def main() -> None:
             c_mlp_ratio  = _arch(args.mlp_ratio,  "mlp_ratio",         _mlp_ratio)
             c_mask_ratio = _arch(args.mask_ratio, "mask_ratio",        _mask_ratio)
             factorised   = _arch(args.factorised_encoder, "factorised_encoder", False)
-            no_spatial   = _arch(args.no_spatial_attn,   "no_spatial_attn",    False)
             temp_window  = _arch(args.temporal_window,   "temporal_window",    0)
             temp_patch   = _arch(args.temporal_patch,    "temporal_patch",     1)
             cross_attn   = _arch(args.cross_attn_decoder,"cross_attn_decoder", False)
             # v15 structural settings — recorded in cfg by main.py
-            patch_sched  = saved_cfg.get("patch_schedule", "") or None
             residual     = bool(saved_cfg.get("residual_head", False))
 
             # ── v18–v22 structural settings ──────────────────────────────
@@ -982,11 +974,9 @@ def main() -> None:
             c_mlp_ratio  = _mlp_ratio
             c_mask_ratio = _mask_ratio
             factorised   = bool(args.factorised_encoder)
-            no_spatial   = bool(args.no_spatial_attn)
             temp_window  = args.temporal_window or 0
             temp_patch   = args.temporal_patch or 1
             cross_attn   = bool(args.cross_attn_decoder)
-            patch_sched  = args.patch_schedule or None      # v15
             residual     = bool(args.residual_head)          # v15
             # Legacy .pt checkpoints all predate v18, so the pre-v18 defaults
             # are the correct reconstruction here.
@@ -997,16 +987,16 @@ def main() -> None:
             readout      = "last"
             num_horizons = 13
             state_dict   = ckpt["model_state_dict"]
+            saved_cfg    = {}
 
         print(f"  Saved at epoch {ckpt_epoch}  "
               + (f"val_loss={ckpt_val_loss:.5f}" if ckpt_val_loss == ckpt_val_loss else ""))
         print(f"  d_model={c_d_model}  enc_layers={c_enc_layers}  dec_layers={c_dec_layers}  "
               f"mlp_ratio={c_mlp_ratio}")
-        print(f"  factorised_encoder={factorised}  no_spatial_attn={no_spatial}  "
+        print(f"  factorised_encoder={factorised}  "
               f"temporal_window={temp_window}  temporal_patch={temp_patch}  "
               f"cross_attn_decoder={cross_attn}")
-        print(f"  [v15] patch_schedule={patch_sched or '(uniform)'}  "
-              f"residual_head={residual}")
+        print(f"  [v15] residual_head={residual}")
         print(f"  [v18+] value_embedding={value_emb}  wind_encoder={wind_enc}  "
               f"static_in_token={static_tok}")
         print(f"  [v22]  direct_head={direct_head}"
@@ -1041,6 +1031,8 @@ def main() -> None:
                 "the exact class of bug the v13 post-mortem uncovered."
             )
 
+        saved_cfg_for_build = saved_cfg
+
         _use_nll = any(k.endswith("decoder.log_var_head.weight") or
                        k.endswith("decoder.log_var_head.bias")
                        for k in state_dict)
@@ -1048,35 +1040,33 @@ def main() -> None:
 
         # Build model
         from model.mae import StationMAE
-        model = StationMAE(
-            d_model=c_d_model,
-            enc_heads=c_enc_heads,
-            enc_layers=c_enc_layers,
-            dec_heads=c_dec_heads,
-            dec_layers=c_dec_layers,
-            mlp_ratio=c_mlp_ratio,
-            dropout=0.0,               # no dropout at inference
-            mask_ratio=c_mask_ratio,
-            factorised_encoder=factorised,
-            encoder_spatial_attn=not no_spatial,
-            temporal_window=temp_window,
-            temporal_patch=temp_patch,
-            patch_schedule=patch_sched,                  # v15 telescopic
-            residual_head=residual,                      # v15 residual head
-            value_embedding=value_emb,                   # v18 per-variable map
-            wind_pair=((3, 4) if wind_enc else None),    # v18 shared (u,v)
-            static_in_token=static_tok,                  # v21 statics as slots
-            direct_head=direct_head,                     # v22 no decoder
-            readout=readout,                             # v22
-            num_horizons=num_horizons,                   # v22 head width
-            cross_attention_decoder=cross_attn,
-            joint_encoder=_arch(None, "joint_encoder", False),
-            masked_only_loss=_arch(None, "masked_only_loss", False),   # loss-only
-            use_persist_norm=_arch(None, "use_persist_norm", False),   # loss-only
-            delta0_weight=_arch(None, "delta0_weight", 1.0),           # loss-only
-            var_weights=_arch(None, "var_weights", None),              # loss-only
-            use_nll_loss=_use_nll,
-        ).to(device)
+        # ── Build from the checkpoint's own cfg ──────────────────────────
+        # StationMAE._CFG_TO_ARG is the single table mapping saved cfg keys to
+        # constructor arguments, shared with main.py. This file used to carry a
+        # second, independently maintained list; it drifted, and every v18+
+        # checkpoint silently rebuilt with pre-v18 defaults as a result.
+        #
+        # Overrides win over the checkpoint: dropout is always 0 at inference,
+        # use_nll_loss is inferred from the WEIGHTS (the cfg key is unreliable
+        # on v9-era runs), and any CLI flag the user set explicitly wins over
+        # what the checkpoint recorded.
+        _overrides = {"dropout": 0.0, "use_nll_loss": _use_nll}
+        for _cli, _arg in (
+            (args.d_model,            "d_model"),
+            (args.enc_heads,          "enc_heads"),
+            (args.enc_layers,         "enc_layers"),
+            (args.dec_heads,          "dec_heads"),
+            (args.dec_layers,         "dec_layers"),
+            (args.mlp_ratio,          "mlp_ratio"),
+            (args.mask_ratio,         "mask_ratio"),
+            (args.factorised_encoder, "factorised_encoder"),
+            (args.temporal_window,    "temporal_window"),
+            (args.temporal_patch,     "temporal_patch"),
+            (args.cross_attn_decoder, "cross_attn_decoder"),
+        ):
+            if _cli is not None:
+                _overrides[StationMAE._CFG_TO_ARG.get(_arg, _arg)] = _cli
+        model = StationMAE.from_cfg(saved_cfg_for_build, **_overrides).to(device)
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"  Missing keys (using default init): {missing}")
@@ -1121,14 +1111,15 @@ def main() -> None:
         # ── Determine which mask ratios to sweep ─────────────────────────
         # Default: use the trained mask_ratio from the checkpoint.
         # CLI --test_mask_ratios overrides, enabling e.g. 0.0 vs 0.5 comparison.
-        _test_mrs = args.test_mask_ratios if args.test_mask_ratios else [c_mask_ratio]
+        _test_mrs = (args.test_mask_ratios if args.test_mask_ratios
+                     else [model.mask_ratio])
 
         # A direct-head model reads each station's prediction from that
         # station's OWN tokens. A masked station has no tokens in the sequence,
         # so there is nothing to read from and the readout would silently take
         # a different station's row. Drop any non-zero ratio rather than dump
         # predictions that look plausible and are misaligned.
-        if direct_head:
+        if model.direct_head:
             _dropped = [mr for mr in _test_mrs if mr > 0.0]
             _test_mrs = [mr for mr in _test_mrs if mr == 0.0] or [0.0]
             if _dropped:
