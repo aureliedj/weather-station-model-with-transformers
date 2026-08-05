@@ -218,7 +218,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v22"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v20"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -336,8 +336,8 @@ OBS_ENCODER="--value_embedding mlp"
 #
 # Aurora has ~3 statics against many variables; here 15 statics against 6
 # weather variables, so slot-per-feature would drown the weather in its own block.
-STATIC="--static_in_token"
-# STATIC=""                                        # <- v18 separate branches
+# STATIC="--static_in_token"                       # <- v21 statics as slots
+STATIC=""                                          # <- v20 / v18 separate branches
 
 # ── Persistence residual head (v20) ──────────────────────────────────────────
 # y_hat = base + f(.)   where base = the station's own last observation if it
@@ -388,19 +388,45 @@ STATIC="--static_in_token"
 # run predates the observation-token rebalance and trained at a content
 # fraction of 0.04%, so the readout was never cleanly implicated — but run
 # SANITY=2 (~1 h) before committing the full budget.
-DIRECT="--direct_head --readout last"
-# DIRECT=""                                        # <- keep the query decoder
+# DIRECT="--direct_head --readout last"            # <- v22
+DIRECT=""                                          # <- v20: keep the query decoder
+#
+# WARNING before re-enabling DIRECT: at --mask_ratio 0 the encoder still
+# PERMUTES the station axis (_mask_stations takes argsort of random noise and
+# slices from index 0), and nothing un-permutes it. Harmless for the query
+# decoder — the encoder output is only a key/value set — but fatal for the
+# direct head, which reads encoded.view(B, T, n_stations, d) positionally and
+# would match station j's target to another station's tokens. Fix
+# _mask_stations to return identity order when num_masked == 0 first.
 
-RESIDUAL=""
-# RESIDUAL="--residual_head"                       # <- v20; redundant with a
-#   direct 'last' readout, which already puts the last observation one linear
-#   layer from the prediction
+RESIDUAL="--residual_head"                         # <- v20
 # RESIDUAL=""                                      # <- off (v15 through v19)
+#
+# Measured on the v20 test dump (best.ckpt, epoch 31), +30 min, all stations
+# visible, normalised — the residual head is what made pressure work:
+#
+#     run              overall   temp   pressure  humidity  wind_u  wind_v
+#     v20               0.1778  0.0536   0.0249    0.1397   0.3275  0.3433
+#     simple-mae-v2     0.1783  0.0557   0.0408    0.1397   0.3187  0.3367
+#     lstm-baseline-v1  0.1878  0.0658   0.0422    0.1452   0.3358  0.3499
+#     v15               0.2493  0.0819   0.2645    0.1827   0.3495  0.3679
+#
+# Pressure went from 11.8x the persistence bound (0.0224) to 1.11x. This is the
+# first transformer configuration in the project to beat the LSTM.
+#
+# KNOWN DEFECT, Δ=0 only: the base equals the target exactly for a visible
+# station, so the correct residual is zero and the model does not produce a
+# clean one. At Δ=0 its VISIBLE stations score 0.389 against 0.263 for its
+# MASKED ones (temperature 3.6x, pressure 4.8x) — handed the exact answer it
+# does worse than when handed nothing. Δ>0 is unaffected. Consider
+# --delta0_weight below 1: for a visible station the Δ=0 target is a copy of an
+# input and teaches nothing.
 # OBS_ENCODER=""                                   # <- exact v17 observation encoder
 
 PATCH=3
 
-ENCODER="--factorised_encoder"            # flat self-attention over W·N tokens
+ENCODER=""
+#ENCODER="--factorised_encoder"            # flat self-attention over W·N tokens
 
 # ── Temporal window (flat or factorised encoder) ─────────────────────────────
 #
@@ -613,11 +639,11 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0.0 \
+    --mask_ratio       0.5 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
-    --drop_path_rate   0.0 \
+    --drop_path_rate   0.1 \
     --batch_size       4 \
     --num_workers      3 \
     --epochs           100 \
@@ -645,7 +671,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v22${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v20${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
