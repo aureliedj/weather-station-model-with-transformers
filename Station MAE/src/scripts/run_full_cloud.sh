@@ -218,7 +218,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v20_factorized"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v22"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -388,8 +388,8 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # run predates the observation-token rebalance and trained at a content
 # fraction of 0.04%, so the readout was never cleanly implicated — but run
 # SANITY=2 (~1 h) before committing the full budget.
-# DIRECT="--direct_head --readout last"            # <- v22
-DIRECT=""                                          # <- v20: keep the query decoder
+DIRECT="--direct_head --readout last"              # <- v22
+# DIRECT=""                                        # <- v20: keep the query decoder
 #
 # NOTE: _mask_stations used to PERMUTE the station axis (argsort of random
 # noise, sliced) even at --mask_ratio 0, and nothing un-permuted it. Harmless
@@ -400,8 +400,12 @@ DIRECT=""                                          # <- v20: keep the query deco
 # deterministic while WHICH stations are masked stays random. At mask_ratio 0
 # the visible set is exactly arange(N). See tests/test_station_order.py.
 
-RESIDUAL="--residual_head"                         # <- v20
-# RESIDUAL=""                                      # <- off (v15 through v19)
+# RESIDUAL="--residual_head"                       # <- v20
+RESIDUAL=""                                        # <- v22: redundant here. A
+#   'last' readout already puts the station's own final token one linear layer
+#   from the prediction, so the base has nothing left to shortcut. Note the two
+#   are NOT mutually exclusive in code — _persistence_base is added after the
+#   direct head too — so enabling both just double-counts the shortcut.
 #
 # Measured on the v20 test dump (best.ckpt, epoch 31), +30 min, all stations
 # visible, normalised — the residual head is what made pressure work:
@@ -645,14 +649,14 @@ python main.py \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.1 \
-    --batch_size       4 \
+    --batch_size       2 \
     --num_workers      3 \
     --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    10 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --accumulate_grad_batches 4 \
+    --accumulate_grad_batches 8 \
     --patience         40 \
     --monitor          val/overall_mae \
     --overfit_stop \
@@ -672,7 +676,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v20${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v22${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

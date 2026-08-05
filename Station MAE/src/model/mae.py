@@ -511,6 +511,15 @@ class StationMAE(nn.Module):
 
         # ── Predictions: direct head, or the query decoder ───────────────
         if self.direct_head:
+            # direct_proj emits num_horizons * V in one shot, so a batch with a
+            # different K reshapes into the wrong horizons instead of failing.
+            # num_horizons comes from max_delta // delta_grid_stride + 1 in
+            # main.py; if either is changed without the other, catch it here
+            # rather than in a broadcast error three frames down.
+            assert K == self.num_horizons, (
+                f"direct_head was built for {self.num_horizons} horizons but "
+                f"this batch has K={K}. num_horizons must equal "
+                f"max_delta // delta_grid_stride + 1.")
             preds_all, log_var_all = self._direct_predict(encoded, x.shape[2]), None
         else:
             decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
