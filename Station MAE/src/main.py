@@ -206,13 +206,6 @@ def parse_args() -> argparse.Namespace:
                         "instead of two independent ones, so the encoder can "
                         "form speed and direction directly. Safe: the u and v "
                         "masks are identical in 100%% of station-samples.")
-    p.add_argument("--delta0_all_stations", action="store_true",
-                   help="Supervise VISIBLE stations at delta=0 as well as masked ones. "
-                        "Without this their delta=0 output gets zero gradient and is an "
-                        "untrained free parameter. With it the model learns to COPY at "
-                        "delta=0 — the correct answer for a station the encoder can see, "
-                        "and a free accuracy check since the target is an input. Also "
-                        "makes sanity/ctx_ratio interpretable.")
     p.add_argument("--no_spatial_attn",     action="store_true",
                    help="Remove the spatial sub-layer from every factorised encoder "
                         "block: each station is encoded from its own temporal window "
@@ -809,7 +802,6 @@ def main() -> None:
         encoder_spatial_attn=not args.no_spatial_attn,
         static_in_token=args.static_in_token,
         query_anchor=args.query_anchor,
-        delta0_all_stations=args.delta0_all_stations,
         direct_head=args.direct_head,
         readout=args.readout,
         num_horizons=(args.max_delta // args.delta_grid_stride + 1),
@@ -953,7 +945,6 @@ def main() -> None:
         "encoder_spatial_attn": not args.no_spatial_attn,
         "static_in_token":     args.static_in_token,
         "query_anchor":        args.query_anchor,
-        "delta0_all_stations": args.delta0_all_stations,
         "direct_head":         args.direct_head,
         "readout":             args.readout,
         "temporal_patch":      args.temporal_patch,

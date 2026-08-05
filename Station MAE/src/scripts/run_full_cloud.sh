@@ -217,6 +217,7 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # run predates the observation-token rebalance and trained at a content
 # fraction of 0.04%, so the readout was never cleanly implicated — but run
 # SANITY=2 (~1 h) before committing the full budget.
+
 # ── Prediction path — pick ONE ───────────────────────────────────────────────
 #
 #   v23  ANCHOR   (current) --query_anchor, mask 0.5, no residual
@@ -226,31 +227,12 @@ STATIC=""                                          # <- v20 / v18 separate branc
 #        for something an index does exactly. Masked stations keep mask_token
 #        and must still be solved from neighbours — the leak guard is structural.
 #
-#   v22  DIRECT   --direct_head --readout last, mask 0.0, no decoder
-#        The comparison arm. Same idea taken to its limit: no queries at all.
-#        Gives up gap-filling and unseen stations; use it to bound what the
-#        query decoder is worth once retrieval is no longer the bottleneck.
-#        Also set --mask_ratio 0.0 and drop batch_size to 2 (3,720 tokens).
-#
 #   v20  RESIDUAL --residual_head, mask 0.5
 #        What v23 replaces. y(t0) added outside the attention path: one scalar
 #        per variable, a single base broadcast over all 13 horizons so the
 #        shortcut fades as delta grows. Kept runnable for the A/B.
-ANCHOR="--query_anchor"                            # <- v23
+ANCHOR=""                            # <- v23
 
-# ── Delta=0 supervision ──────────────────────────────────────────────────────
-# Without this flag the loss at Delta=0 is restricted to MASKED stations, so a
-# visible station's Delta=0 output receives ZERO gradient — an untrained free
-# parameter. Measured on v20's test dump the visible rows scored 0.389 against
-# 0.263 for the masked ones, which was initially read as a residual-head defect;
-# it is simply an unsupervised output.
-#
-# Supervising it teaches the model to COPY at Delta=0 — the correct answer for a
-# station the encoder can see — and is a free accuracy check, since the target
-# is an input. It also makes sanity/ctx_ratio interpretable: as it stands that
-# metric divides an unsupervised quantity by a supervised one.
-DELTA0="--delta0_all_stations"                     # <- v23
-# DELTA0=""                                        # <- v15..v20 behaviour
 
 # ── Spatial attention — the controlled study ─────────────────────────────────
 # --no_spatial_attn removes the spatial sub-layer from every encoder block, so
@@ -554,7 +536,6 @@ python main.py \
     $STATIC \
     $RESIDUAL \
     $ANCHOR \
-    $DELTA0 \
     $SPATIAL \
     $DIRECT \
     $ENCODER \
