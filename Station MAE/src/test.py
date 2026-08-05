@@ -934,6 +934,32 @@ def main() -> None:
             patch_sched  = saved_cfg.get("patch_schedule", "") or None
             residual     = bool(saved_cfg.get("residual_head", False))
 
+            # ── v18–v22 structural settings ──────────────────────────────
+            # These were recorded by main.py from the start but never READ
+            # here, so every one of them silently reverted to its default
+            # when rebuilding the model. That is the same defect class as
+            # input_cross_attn below, and it is not survivable:
+            #
+            #   value_embedding  "mlp"/"fourier" -> "linear" swaps the whole
+            #                    per-variable map (mlp_w1/w2 vs var_weights)
+            #   static_in_token  True -> False drops var_proj.static_maps AND
+            #                    re-adds pos_emb/station_emb to the token
+            #   direct_head      True -> False rebuilds a decoder that the
+            #                    trained model does not have
+            #
+            # The defaults below are the pre-v18 behaviour, so v15 and
+            # earlier checkpoints keep loading exactly as they did.
+            value_emb    = saved_cfg.get("value_embedding", "linear") or "linear"
+            wind_enc     = bool(saved_cfg.get("wind_encoder", False))
+            static_tok   = bool(saved_cfg.get("static_in_token", False))
+            direct_head  = bool(saved_cfg.get("direct_head", False))
+            readout      = saved_cfg.get("readout", "last") or "last"
+            # num_horizons must match the trained direct_proj output width, or
+            # the head is the wrong shape. main.py derives it the same way.
+            _max_delta   = int(saved_cfg.get("max_delta", 36))
+            _grid_stride = int(saved_cfg.get("delta_grid_stride", 3) or 3)
+            num_horizons = _max_delta // _grid_stride + 1
+
             # Strip "model." prefix (Lightning) and then "_orig_mod." prefix
             # (torch.compile wraps parameters under OptimizedModule).
             state_dict = {}
@@ -962,6 +988,14 @@ def main() -> None:
             cross_attn   = bool(args.cross_attn_decoder)
             patch_sched  = args.patch_schedule or None      # v15
             residual     = bool(args.residual_head)          # v15
+            # Legacy .pt checkpoints all predate v18, so the pre-v18 defaults
+            # are the correct reconstruction here.
+            value_emb    = "linear"
+            wind_enc     = False
+            static_tok   = False
+            direct_head  = False
+            readout      = "last"
+            num_horizons = 13
             state_dict   = ckpt["model_state_dict"]
 
         print(f"  Saved at epoch {ckpt_epoch}  "
@@ -973,6 +1007,11 @@ def main() -> None:
               f"cross_attn_decoder={cross_attn}")
         print(f"  [v15] patch_schedule={patch_sched or '(uniform)'}  "
               f"residual_head={residual}")
+        print(f"  [v18+] value_embedding={value_emb}  wind_encoder={wind_enc}  "
+              f"static_in_token={static_tok}")
+        print(f"  [v22]  direct_head={direct_head}"
+              + (f"  readout={readout}  num_horizons={num_horizons}"
+                 if direct_head else ""))
 
         # ── Detect an NLL (heteroscedastic) checkpoint ────────────────────────
         # The cfg key "nll_loss" is unreliable (absent/None on older runs such as
@@ -1024,6 +1063,12 @@ def main() -> None:
             temporal_patch=temp_patch,
             patch_schedule=patch_sched,                  # v15 telescopic
             residual_head=residual,                      # v15 residual head
+            value_embedding=value_emb,                   # v18 per-variable map
+            wind_pair=((3, 4) if wind_enc else None),    # v18 shared (u,v)
+            static_in_token=static_tok,                  # v21 statics as slots
+            direct_head=direct_head,                     # v22 no decoder
+            readout=readout,                             # v22
+            num_horizons=num_horizons,                   # v22 head width
             cross_attention_decoder=cross_attn,
             joint_encoder=_arch(None, "joint_encoder", False),
             masked_only_loss=_arch(None, "masked_only_loss", False),   # loss-only
@@ -1077,6 +1122,19 @@ def main() -> None:
         # Default: use the trained mask_ratio from the checkpoint.
         # CLI --test_mask_ratios overrides, enabling e.g. 0.0 vs 0.5 comparison.
         _test_mrs = args.test_mask_ratios if args.test_mask_ratios else [c_mask_ratio]
+
+        # A direct-head model reads each station's prediction from that
+        # station's OWN tokens. A masked station has no tokens in the sequence,
+        # so there is nothing to read from and the readout would silently take
+        # a different station's row. Drop any non-zero ratio rather than dump
+        # predictions that look plausible and are misaligned.
+        if direct_head:
+            _dropped = [mr for mr in _test_mrs if mr > 0.0]
+            _test_mrs = [mr for mr in _test_mrs if mr == 0.0] or [0.0]
+            if _dropped:
+                print(f"  [direct_head] skipping mask ratios {_dropped} — the "
+                      f"readout needs every station present. Evaluating "
+                      f"{_test_mrs} only.")
 
         # Summary table across mask ratios (printed at the end of this checkpoint)
         _mr_summary: list[dict] = []

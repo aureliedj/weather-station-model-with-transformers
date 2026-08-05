@@ -37,10 +37,21 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 # previously produced a run that loaded v11 while writing into test_results/v12.
 #
 #   RUN_NAME    checkpoint directory              notes
-#   v15         checkpoints/full_run_cloud_v15    patch-3 tokens, no residual  ← current
+#   v20         checkpoints/full_run_cloud_v20    residual head + station_state  ← current
+#   v19         checkpoints/full_run_cloud_v19    v17 + MLP value embedding
+#   v17         checkpoints/full_run_cloud_v17    token rebalance (0.04% -> 22%)
+#   v15         checkpoints/full_run_cloud_v15    patch-3 tokens, no residual
 #   v14         checkpoints/full_run_cloud_v14    patch-6, input-context decoder
 #   v13         checkpoints/full_run_cloud_v13    pre-audit-fix architecture
 #   v12/v11/v9  checkpoints/...                   older Huber / NLL runs
+#
+# Everything structural is read from the checkpoint's saved cfg — including,
+# since this revision, value_embedding / static_in_token / direct_head. Those
+# three were recorded by main.py but never read here, so a v18+ checkpoint
+# rebuilt itself with the pre-v18 defaults. The load-time structural guard
+# catches it (var_proj weights land in missing/unexpected and it aborts), but
+# only after the dataset build, so check the [v18+] banner line matches the
+# training run before letting a long sweep proceed.
 #
 # ⚠ PRE-v15 CHECKPOINTS CANNOT BE EVALUATED WITH THIS CODE. v15 removed the
 #   decoder input-context pathway, so those checkpoints carry weights this
@@ -69,6 +80,28 @@ echo "[run_test_cloud.sh] RUN_NAME=${RUN_NAME}"
 echo "                    checkpoint: ${CHECKPOINT}"
 echo "                    output:     ${SAVE_DIR}"
 
+# ── Architecture preflight ───────────────────────────────────────────────────
+# Print what the checkpoint says it is BEFORE the ~4 minute dataset build, so a
+# cfg/code mismatch costs seconds instead of a build. test.py aborts on this
+# anyway (the structural guard), just much later.
+python - "$CHECKPOINT" <<'PYEOF'
+import sys, torch
+c = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
+cfg = c.get("hyper_parameters", {}).get("cfg", {})
+if not cfg:
+    print("[preflight] no cfg in checkpoint — test.py will fall back to CLI/defaults")
+    raise SystemExit(0)
+print(f"[preflight] epoch {c.get('epoch','?')}, step {c.get('global_step','?')}")
+for k in ("d_model", "enc_layers", "dec_layers", "temporal_patch",
+          "factorised_encoder", "temporal_window", "mask_ratio",
+          "value_embedding", "wind_encoder", "static_in_token",
+          "residual_head", "direct_head", "readout"):
+    if k in cfg:
+        print(f"[preflight]   {k:20s} {cfg[k]}")
+if cfg.get("direct_head"):
+    print("[preflight] direct_head — only mask ratio 0.0 will be evaluated")
+PYEOF
+
 # ── Window mode ───────────────────────────────────────────────────────────────
 # blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default
 # sliding: all overlapping windows (~105k)  — slow, most stable — for final paper metrics
@@ -90,11 +123,17 @@ STRIDE=9
 # GLOBAL_NORM="--global_norm"
 GLOBAL_NORM=""
 
-MASK_RATIOS="0.5 0.0"   # mr0.50 FIRST: it is the trained setting and gives
-                        # skill-vs-persistence + the Delta=0 number. mr0.00 is
-                        # only needed for the masking comparison in notebook S1,
-                        # so if you have to kill the run you keep what matters.
-# MASK_RATIOS="0.5"                 # single ratio (faster)
+MASK_RATIOS="0.0 0.5"   # mr0.00 FIRST for v20. The question v20 exists to
+                        # answer is whether the residual head fixes the copy
+                        # failure — v15 scored 0.1512 on pressure against a
+                        # 0.0224 persistence baseline — and that comparison is
+                        # only meaningful with every station visible, which is
+                        # also the setting the LSTM and simple-MAE numbers use.
+                        # mr0.50 is the trained setting and gives skill-vs-
+                        # persistence + gap-filling; keep it second so killing
+                        # the run still leaves the comparable number.
+                        # For pre-v20 runs the old order (0.5 first) was right.
+# MASK_RATIOS="0.0"                 # single ratio (faster)
 
 # The model is loaded ONCE; each ratio is a single forward sweep over the same
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
