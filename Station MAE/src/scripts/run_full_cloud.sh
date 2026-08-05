@@ -51,7 +51,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v22"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v23"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -214,7 +214,28 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # run predates the observation-token rebalance and trained at a content
 # fraction of 0.04%, so the readout was never cleanly implicated — but run
 # SANITY=2 (~1 h) before committing the full budget.
-DIRECT="--direct_head --readout last"              # <- v22
+# ── Prediction path — pick ONE ───────────────────────────────────────────────
+#
+#   v23  ANCHOR   (current) --query_anchor, mask 0.5, no residual
+#        A visible station's query starts from that station's OWN final encoder
+#        token, fetched by gather. The station index is known when the query is
+#        built, so attention is no longer asked to perform a soft learned lookup
+#        for something an index does exactly. Masked stations keep mask_token
+#        and must still be solved from neighbours — the leak guard is structural.
+#
+#   v22  DIRECT   --direct_head --readout last, mask 0.0, no decoder
+#        The comparison arm. Same idea taken to its limit: no queries at all.
+#        Gives up gap-filling and unseen stations; use it to bound what the
+#        query decoder is worth once retrieval is no longer the bottleneck.
+#        Also set --mask_ratio 0.0 and drop batch_size to 2 (3,720 tokens).
+#
+#   v20  RESIDUAL --residual_head, mask 0.5
+#        What v23 replaces. y(t0) added outside the attention path: one scalar
+#        per variable, a single base broadcast over all 13 horizons so the
+#        shortcut fades as delta grows. Kept runnable for the A/B.
+ANCHOR="--query_anchor"                            # <- v23
+DIRECT=""                                          # <- v23 keeps the decoder
+# ANCHOR="" ; DIRECT="--direct_head --readout last"   # <- v22 arm
 # DIRECT=""                                        # <- v20: keep the query decoder
 #
 # NOTE: _mask_stations used to PERMUTE the station axis (argsort of random
@@ -227,7 +248,11 @@ DIRECT="--direct_head --readout last"              # <- v22
 # the visible set is exactly arange(N). See tests/test_station_order.py.
 
 # RESIDUAL="--residual_head"                       # <- v20
-RESIDUAL=""                                        # <- v22: redundant here. A
+RESIDUAL=""                                        # <- v23: REMOVED. The anchor
+#   supersedes it — it hands over the station's full learned representation
+#   rather than one scalar per variable, and applies equally at every lead time
+#   instead of fading as delta grows. Re-enable only to reproduce v20.
+# RESIDUAL="--residual_head"                       # <- v20. Redundant here. A
 #   'last' readout already puts the station's own final token one linear layer
 #   from the prediction, so the base has nothing left to shortcut. Note the two
 #   are NOT mutually exclusive in code — _persistence_base is added after the
@@ -470,19 +495,19 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0.0 \
+    --mask_ratio       0.5 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \
     --drop_path_rate   0.1 \
-    --batch_size       2 \
+    --batch_size       4 \
     --num_workers      3 \
     --epochs           100 \
     --lr               1e-4 \
     --warmup_epochs    10 \
     --weight_decay     0.05 \
     --grad_clip        1.0 \
-    --accumulate_grad_batches 8 \
+    --accumulate_grad_batches 4 \
     --patience         40 \
     --monitor          val/overall_mae \
     --overfit_stop \
@@ -496,13 +521,14 @@ python main.py \
     $OBS_ENCODER \
     $STATIC \
     $RESIDUAL \
+    $ANCHOR \
     $DIRECT \
     $ENCODER \
     $TEMPORAL_WINDOW \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v22${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v23${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

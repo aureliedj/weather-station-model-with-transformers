@@ -134,6 +134,7 @@ class StationMAE(nn.Module):
         "temporal_patch":     "temporal_patch",
         "value_embedding":    "value_embedding",
         "static_in_token":    "static_in_token",
+        "query_anchor":       "query_anchor",
         "direct_head":        "direct_head",
         "readout":            "readout",
         "residual_head":      "residual_head",
@@ -191,6 +192,7 @@ class StationMAE(nn.Module):
         value_embedding:         str   = "linear",     # v18
         wind_pair:               "tuple | None" = None,  # v18
         static_in_token:         bool  = False,          # v21
+        query_anchor:            bool  = False,          # v23: anchor queries
         direct_head:             bool  = False,          # v22: no decoder
         readout:                 str   = "last",         # "last" | "mean"
         num_horizons:            int   = 13,
@@ -366,6 +368,7 @@ class StationMAE(nn.Module):
         # rebalance and trained at a content fraction of 0.04%, so the readout
         # was never cleanly implicated. Treat it as untested, not as known-bad.
         assert readout in ("last", "mean"), readout
+        self.query_anchor = bool(query_anchor)
         self.direct_head  = bool(direct_head)
         self.readout      = readout
         self.num_horizons = int(num_horizons)
@@ -417,6 +420,49 @@ class StationMAE(nn.Module):
         p = self.direct_proj(s)                                     # (B, N, K*Vt)
         p = p.view(B, n_stations, self.num_horizons, self.num_target_vars_)
         return p.permute(0, 2, 1, 3).contiguous()                   # (B, K, N, Vt)
+
+    def _query_anchor(self, encoded, visible_idx, B, N):
+        """
+        (B, N, d) — each VISIBLE station's own final encoder token, with the
+        learned mask_token standing in for stations the encoder never saw.
+
+        Why this exists
+        ---------------
+        The decoder query carries no observations, so reproducing a station's
+        own recent state was a RETRIEVAL problem: attention had to locate that
+        station among 1,872 encoder tokens, learned from scratch, starting from
+        a near-uniform softmax over 1,872 keys.
+
+        Measured on v15, the failure was ordered exactly by how copyable a
+        variable is — pressure 11.2x the persistence bound, wind 0.94x, i.e.
+        BETTER than a copy. It failed hardest where copying was the whole
+        answer, which is a lookup failure, not a modelling failure.
+
+        But the station index is known when the query is built. Attention was
+        being used to do a soft, learned lookup for something `gather` does
+        exactly. This hands the station its own representation directly — not
+        a single scalar per variable as the persistence residual did, but
+        everything the encoder built from its history and its neighbours, and
+        equally at every lead time rather than fading as delta grows.
+
+        NOT the removed input_context pathway
+        -------------------------------------
+        That one built a SEPARATE key/value set of last-step embeddings, zeros
+        for masked stations, and cross-attended to it — so at mask 0.5 half the
+        keys were zero vectors that softmax still had to spend mass on. Here
+        there is no extra attention and no extra key set: it is a gather into
+        the query, and a masked station receives a LEARNED vector, not a zero.
+
+        Masked stations keep mask_token, so nothing hidden from the encoder
+        reaches the query — the leak guard is structural, not a multiplication.
+        """
+        d      = encoded.shape[-1]
+        n_vis  = visible_idx.shape[1]
+        T      = encoded.shape[1] // n_vis
+        own    = encoded.view(B, T, n_vis, d)[:, -1]              # (B, N_vis, d)
+        anchor = self.decoder.mask_token.expand(B, N, d).clone()  # (B, N, d)
+        return anchor.scatter(
+            1, visible_idx.unsqueeze(-1).expand(B, n_vis, d), own.to(anchor.dtype))
 
     def _station_masked(self, masked_idx, B, N, device):
         """(B, N) bool — True where the encoder could not see the station."""
@@ -485,10 +531,13 @@ class StationMAE(nn.Module):
             preds:          (B, N, num_target_vars)
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
-        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                   station_masked=self._station_masked(
-                                       masked_idx, x.shape[0], x.shape[2], x.device))
+        encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
+        decoder_out = self.decoder(
+            encoded, spatial, y_hours, delta_steps,
+            station_masked=self._station_masked(
+                masked_idx, x.shape[0], x.shape[2], x.device),
+            anchor=(self._query_anchor(encoded, visible_idx, x.shape[0], x.shape[2])
+                    if self.query_anchor else None))
         if self.use_nll_loss:
             preds, log_var = decoder_out
         else:
@@ -555,7 +604,7 @@ class StationMAE(nn.Module):
         K = delta_steps.shape[1]
 
         # ── Encoder: runs once ──────────────────────────────────────────
-        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
+        encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
         # encoded: (B, T*N_vis, d_model)   (T = patched sequence length)
 
         # ── Predictions: direct head, or the query decoder ───────────────
@@ -571,9 +620,12 @@ class StationMAE(nn.Module):
                 f"max_delta // delta_grid_stride + 1.")
             preds_all, log_var_all = self._direct_predict(encoded, x.shape[2]), None
         else:
-            decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                       station_masked=self._station_masked(
-                                           masked_idx, x.shape[0], x.shape[2], x.device))
+            decoder_out = self.decoder(
+                encoded, spatial, y_hours, delta_steps,
+                station_masked=self._station_masked(
+                    masked_idx, x.shape[0], x.shape[2], x.device),
+                anchor=(self._query_anchor(encoded, visible_idx, x.shape[0], x.shape[2])
+                        if self.query_anchor else None))
             if self.use_nll_loss:
                 preds_all, log_var_all = decoder_out
             else:
@@ -668,10 +720,13 @@ class StationMAE(nn.Module):
             preds: (B, N, num_target_vars) predictions for all stations.
         """
         self.eval()
-        encoded, masked_idx, _ = self.encoder(x, x_mask, spatial, x_hours)
-        decoder_out = self.decoder(encoded, spatial, y_hours, delta_steps,
-                                   station_masked=self._station_masked(
-                                       masked_idx, x.shape[0], x.shape[2], x.device))
+        encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
+        decoder_out = self.decoder(
+            encoded, spatial, y_hours, delta_steps,
+            station_masked=self._station_masked(
+                masked_idx, x.shape[0], x.shape[2], x.device),
+            anchor=(self._query_anchor(encoded, visible_idx, x.shape[0], x.shape[2])
+                    if self.query_anchor else None))
         # When NLL mode is active, decoder returns (mean, log_var) — return mean only.
         preds = decoder_out[0] if self.use_nll_loss else decoder_out
         base  = self._persistence_base(x, x_mask, masked_idx)

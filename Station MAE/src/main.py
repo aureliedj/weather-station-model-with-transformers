@@ -206,6 +206,17 @@ def parse_args() -> argparse.Namespace:
                         "instead of two independent ones, so the encoder can "
                         "form speed and direction directly. Safe: the u and v "
                         "masks are identical in 100%% of station-samples.")
+    p.add_argument("--query_anchor",        action="store_true",
+                   help="v23. Start each VISIBLE station's decoder query from that "
+                        "station's OWN final encoder token (fetched by gather — the "
+                        "index is known when the query is built) instead of the shared "
+                        "mask_token. Masked stations keep mask_token, so nothing hidden "
+                        "from the encoder reaches the query. Removes the retrieval "
+                        "problem the persistence residual only short-circuited: it hands "
+                        "over the full learned representation rather than one scalar per "
+                        "variable, and does so equally at every lead time instead of "
+                        "fading as delta grows. Not the removed input_context pathway — "
+                        "there is no extra key/value set and no zero-vector keys.")
     p.add_argument("--direct_head",         action="store_true",
                    help="v22: drop the decoder. Read one vector per station "
                         "from the encoder and project straight to all K "
@@ -782,6 +793,7 @@ def main() -> None:
         value_embedding=args.value_embedding,
         wind_pair=((3, 4) if args.wind_encoder else None),
         static_in_token=args.static_in_token,
+        query_anchor=args.query_anchor,
         direct_head=args.direct_head,
         readout=args.readout,
         num_horizons=(args.max_delta // args.delta_grid_stride + 1),
@@ -834,6 +846,9 @@ def main() -> None:
     if args.direct_head:
         print(f"Prediction head          : DIRECT, readout={args.readout} "
               f"(v22 — no decoder, no queries)")
+    if args.query_anchor:
+        print("Query anchor             : ON  (visible queries start from their own "
+              "encoder token; masked keep mask_token)")
     if args.static_in_token:
         print("Static features          : INSIDE the variable block (v21) — "
               "pos_emb / station_emb removed from the token")
@@ -920,6 +935,7 @@ def main() -> None:
         "value_embedding":     args.value_embedding,
         "wind_encoder":        args.wind_encoder,
         "static_in_token":     args.static_in_token,
+        "query_anchor":        args.query_anchor,
         "direct_head":         args.direct_head,
         "readout":             args.readout,
         "temporal_patch":      args.temporal_patch,
