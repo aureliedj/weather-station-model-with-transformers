@@ -218,7 +218,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v20"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v20_factorized"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -425,8 +425,8 @@ RESIDUAL="--residual_head"                         # <- v20
 
 PATCH=3
 
-ENCODER=""
-#ENCODER="--factorised_encoder"            # flat self-attention over W·N tokens
+#ENCODER=""
+ENCODER="--factorised_encoder"            # flat self-attention over W·N tokens
 
 # ── Temporal window (flat or factorised encoder) ─────────────────────────────
 #
