@@ -1053,11 +1053,34 @@ class StationMAEEncoder(nn.Module):
         num_masked  = int(N * self.mask_ratio)
         num_visible = N - num_masked
 
-        # Sample a different random mask per batch item
+        # Sample a different random mask per batch item.
+        # WHICH stations are hidden is redrawn every forward pass — that is the
+        # masking objective and it stays random.
         noise           = torch.rand(B, N, device=tokens.device)
         shuffle_idx     = torch.argsort(noise, dim=1)              # (B, N)
         visible_indices = shuffle_idx[:, num_masked:]              # (B, N_vis)
         masked_indices  = shuffle_idx[:, :num_masked]              # (B, N_masked)
+
+        # ── Restore canonical station ORDER within each group ────────────────
+        # argsort returns a permutation, so the two slices above came out in
+        # random order — the sequence handed to the encoder was shuffled even
+        # at mask_ratio 0, where nothing is dropped at all.
+        #
+        # Harmless for the query decoder (the encoder output is only a key/value
+        # set, and attention over the station axis is permutation-equivariant —
+        # spatial attention here is FULL over N, windowing applies to the
+        # temporal axis only). But fatal for any positional readout: the v22
+        # direct head does encoded.view(B, T, n_stations, d) and treats axis 2
+        # as station index, so a shuffled sequence would train station j's
+        # target against another station's tokens, redrawn every step. The only
+        # learnable solution is a station-independent one — mean collapse, for a
+        # reason that has nothing to do with the architecture.
+        #
+        # Sorting keeps the mask random while making the ORDER deterministic:
+        # at mask_ratio 0 visible_indices is exactly arange(N), and at
+        # mask_ratio > 0 it is a monotone subsequence of it.
+        masked_indices,  _ = torch.sort(masked_indices,  dim=1)    # (B, N_masked)
+        visible_indices, _ = torch.sort(visible_indices, dim=1)    # (B, N_vis)
 
         # Gather visible tokens across station dimension
         # visible_indices: (B, N_vis) → expand to (B, W, N_vis, D)

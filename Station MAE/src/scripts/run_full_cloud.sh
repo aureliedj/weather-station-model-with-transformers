@@ -391,13 +391,14 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # DIRECT="--direct_head --readout last"            # <- v22
 DIRECT=""                                          # <- v20: keep the query decoder
 #
-# WARNING before re-enabling DIRECT: at --mask_ratio 0 the encoder still
-# PERMUTES the station axis (_mask_stations takes argsort of random noise and
-# slices from index 0), and nothing un-permutes it. Harmless for the query
-# decoder — the encoder output is only a key/value set — but fatal for the
-# direct head, which reads encoded.view(B, T, n_stations, d) positionally and
-# would match station j's target to another station's tokens. Fix
-# _mask_stations to return identity order when num_masked == 0 first.
+# NOTE: _mask_stations used to PERMUTE the station axis (argsort of random
+# noise, sliced) even at --mask_ratio 0, and nothing un-permuted it. Harmless
+# for the query decoder — the encoder output is only a key/value set — but
+# fatal for the direct head, which reads encoded.view(B, T, n_stations, d)
+# positionally and would have matched station j's target to another station's
+# tokens, redrawn every step. Both index groups are now sorted, so the ORDER is
+# deterministic while WHICH stations are masked stays random. At mask_ratio 0
+# the visible set is exactly arange(N). See tests/test_station_order.py.
 
 RESIDUAL="--residual_head"                         # <- v20
 # RESIDUAL=""                                      # <- off (v15 through v19)
@@ -639,7 +640,7 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0.5 \
+    --mask_ratio       0.0 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.0 \

@@ -495,9 +495,28 @@ def _fast_split_paths(fast_dir: str, split: str, train_years: list,
                               completely different values. Sharing one file
                               between the two silently mixes them, which is how
                               tw6 and tw12 ended up incomparable earlier.
-      * exclude_stations    — changes N, so the arrays have a different shape
 
     _FAST_CACHE_VERSION covers changes to the normalisation ALGORITHM itself.
+
+    exclude_stations is ALSO in the key, but not for the reason this docstring
+    used to give ("changes N, so the arrays have a different shape"). That is
+    not true: the cached arrays are written at FULL N. fast_cache_save() is
+    called before _apply_station_exclusion(), and on the load path exclusion is
+    likewise applied after the arrays come back — so the cached bytes are
+    identical whether or not stations are excluded, and the key only produces
+    duplicate copies of the same data under different names.
+
+    It is kept anyway, deliberately: it is cheap, and a filename that records
+    the run's exclusion list is easier to audit than one that does not. Do not
+    "optimise" it away expecting a behaviour change — there is none to gain, and
+    removing it invalidates every cache already on disk.
+
+    What this means for the station axis, which is the part that actually
+    matters: every split holds the same N_full stations in the same order,
+    spatial.pt is one shared file across splits, and exclusion is a sorted
+    index-select applied identically everywhere. obs_stats stays at (N_full, V)
+    on purpose (see _apply_station_exclusion) so val/test can compare against
+    train_ds.obs_stats without re-deriving it; slice it through _keep_indices.
     """
     years_key = "_".join(str(y) for y in sorted(train_years))
     norm_key  = "ps" if per_station else "gl"
