@@ -51,7 +51,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v23"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v24"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -228,10 +228,34 @@ STATIC=""                                          # <- v20 / v18 separate branc
 #        and must still be solved from neighbours — the leak guard is structural.
 #
 #   v20  RESIDUAL --residual_head, mask 0.5
-#        What v23 replaces. y(t0) added outside the attention path: one scalar
-#        per variable, a single base broadcast over all 13 horizons so the
-#        shortcut fades as delta grows. Kept runnable for the A/B.
-ANCHOR=""                            # <- v23
+#        y(t0) added outside the attention path: one scalar per variable, a
+#        single base broadcast over all 13 horizons so the shortcut fades as
+#        delta grows. Retired — it teaches the model nothing and hides whether
+#        retrieval was ever learned. Kept runnable for the A/B.
+#
+# WHY v23 RUNS NEITHER
+# The Delta=0 supervision fix (now unconditional, see model/mae.py) and the
+# query anchor target the SAME failure: the decoder query carries no
+# observations, so a station's own last value had to be located by attention
+# over 1,872 encoder tokens. Enabling both would confound them.
+#
+# v23 is the Delta=0 fix ALONE — the cheaper change (zero parameters, no
+# architecture change) and the more informative result. If it works, the
+# retrieval failure was a SUPERVISION gap rather than a capacity limit: the
+# model could always do the lookup, it was simply never asked. Delta=0 is the
+# cleanest possible training signal for "attend to your own station's last
+# token", and the pattern it teaches transfers to every other horizon, since
+# the station-identity part of the query is identical across leads.
+#
+# Expect pressure to move first: persistence correlation at +30 min is 0.9995
+# for pressure, so "copy your own last value" and "forecast +30 min" are nearly
+# the same function for the variable v15 failed 11.2x on.
+#
+# If it does NOT recover v20's pressure result (0.0249 against a 0.0237 copy
+# bound), try --delta0_weight 2 first — Delta=0 carries 1/13 of the loss and may
+# simply be under-weighted. Only then promote the anchor to v24.
+#ANCHOR=""                                          # <- v23: Delta=0 fix alone
+ANCHOR="--query_anchor"                          # <- v24 arm
 
 
 # ── Spatial attention — the controlled study ─────────────────────────────────
@@ -543,7 +567,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v23${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v24-anchor${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
