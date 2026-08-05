@@ -88,9 +88,12 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 #     Standard self-attention over all W*N_vis tokens. Kept so pre-v15
 #     checkpoints stay loadable.
 #
+#     --no_spatial_attn drops the spatial sub-layer entirely — the
+#     station-independent controlled study. See the SPATIAL block below.
+#
 # REMOVED in the v22 cleanup: --joint_encoder (JointSpatioTemporalBlock, full
-# W*N attention with temporal RoPE) and --no_spatial_attn — ~348 lines that no
-# configuration had selected since v14. git history has them.
+# W*N attention with temporal RoPE) — ~317 lines no configuration had selected
+# since v14. git history has it.
 # ── Temporal tokenization ────────────────────────────────────────────────────
 # Uniform patching: P consecutive 10-min steps become ONE encoder token.
 #   P=1  raw       72 positions -> 5,616 tokens  (~273 GFLOP/pass)  no loss, slow
@@ -234,6 +237,35 @@ STATIC=""                                          # <- v20 / v18 separate branc
 #        per variable, a single base broadcast over all 13 horizons so the
 #        shortcut fades as delta grows. Kept runnable for the A/B.
 ANCHOR="--query_anchor"                            # <- v23
+
+# ── Delta=0 supervision ──────────────────────────────────────────────────────
+# Without this flag the loss at Delta=0 is restricted to MASKED stations, so a
+# visible station's Delta=0 output receives ZERO gradient — an untrained free
+# parameter. Measured on v20's test dump the visible rows scored 0.389 against
+# 0.263 for the masked ones, which was initially read as a residual-head defect;
+# it is simply an unsupervised output.
+#
+# Supervising it teaches the model to COPY at Delta=0 — the correct answer for a
+# station the encoder can see — and is a free accuracy check, since the target
+# is an input. It also makes sanity/ctx_ratio interpretable: as it stands that
+# metric divides an unsupervised quantity by a supervised one.
+DELTA0="--delta0_all_stations"                     # <- v23
+# DELTA0=""                                        # <- v15..v20 behaviour
+
+# ── Spatial attention — the controlled study ─────────────────────────────────
+# --no_spatial_attn removes the spatial sub-layer from every encoder block, so
+# each station is encoded from its OWN temporal window with no cross-station
+# mixing. The transformer then has the same information as the LSTM baseline
+# and differs only in mechanism.
+#
+# Why run it: the LSTM reaches 0.1878 on test while being spatially BLIND,
+# against v20's 0.1778 and simple-MAE's 0.1783. If the station-independent arm
+# lands close to full v20, neighbouring stations are contributing almost
+# nothing and the spatial machinery is not earning its cost — which is the
+# take-home message either way. Compare the per-lead curves and the error
+# TAILS, not just the means.
+SPATIAL=""                                         # <- full axial (default)
+# SPATIAL="--no_spatial_attn"                      # <- station-independent arm
 DIRECT=""                                          # <- v23 keeps the decoder
 # ANCHOR="" ; DIRECT="--direct_head --readout last"   # <- v22 arm
 # DIRECT=""                                        # <- v20: keep the query decoder
@@ -522,6 +554,8 @@ python main.py \
     $STATIC \
     $RESIDUAL \
     $ANCHOR \
+    $DELTA0 \
+    $SPATIAL \
     $DIRECT \
     $ENCODER \
     $TEMPORAL_WINDOW \

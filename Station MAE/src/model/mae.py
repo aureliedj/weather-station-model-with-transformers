@@ -130,6 +130,7 @@ class StationMAE(nn.Module):
         "mask_ratio":         "mask_ratio",
         "window":             "window_size",
         "factorised_encoder": "factorised_encoder",
+        "encoder_spatial_attn": "encoder_spatial_attn",
         "temporal_window":    "temporal_window",
         "temporal_patch":     "temporal_patch",
         "value_embedding":    "value_embedding",
@@ -142,6 +143,7 @@ class StationMAE(nn.Module):
         "drop_path_rate":     "drop_path_rate",
         "masked_only_loss":   "masked_only_loss",
         "use_persist_norm":   "use_persist_norm",
+        "delta0_all_stations": "delta0_all_stations",
         "delta0_weight":      "delta0_weight",
         "var_weights":        "var_weights",
     }
@@ -187,6 +189,7 @@ class StationMAE(nn.Module):
         fourier_dim:      int   = TEMPORAL_FOURIER_DIM,
         use_checkpoint:          bool  = False,
         factorised_encoder:      bool  = False,
+        encoder_spatial_attn:    bool  = True,
         temporal_window:         int   = 0,
         temporal_patch:          int   = 1,
         value_embedding:         str   = "linear",     # v18
@@ -200,6 +203,7 @@ class StationMAE(nn.Module):
         drop_path_rate:          float = 0.0,
         masked_only_loss:         bool  = False,
         residual_head:            bool  = False,        # v15: ŷ = y(t0) + f(·)
+        delta0_all_stations:      bool  = False,   # supervise visible at delta=0
         delta0_weight:            float = 1.0,
         var_weights:              "list | None" = None,
         use_nll_loss:             bool  = False,
@@ -335,6 +339,7 @@ class StationMAE(nn.Module):
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
             factorised=factorised_encoder,
+            spatial_attn=encoder_spatial_attn,
             temporal_window=temporal_window,
             temporal_patch=temporal_patch,
             value_embedding=value_embedding,
@@ -368,6 +373,7 @@ class StationMAE(nn.Module):
         # rebalance and trained at a content fraction of 0.04%, so the readout
         # was never cleanly implicated. Treat it as untested, not as known-bad.
         assert readout in ("last", "mean"), readout
+        self.delta0_all_stations = bool(delta0_all_stations)
         self.query_anchor = bool(query_anchor)
         self.direct_head  = bool(direct_head)
         self.readout      = readout
@@ -680,8 +686,24 @@ class StationMAE(nn.Module):
             # (the "trivial copy" concern only applies when some stations are
             # visible and others hidden), so supervise all stations, exactly as
             # the LSTM does.
+            # delta0_all_stations: supervise VISIBLE stations at delta=0 too.
+            #
+            # Without it a visible station's delta=0 output receives ZERO
+            # gradient — it is a free parameter nothing constrains, so measuring
+            # it says nothing about the model. On v20's test dump the visible
+            # rows scored 0.389 against 0.263 for the masked ones, which was
+            # read as a residual-head defect; it is simply an untrained output.
+            #
+            # Supervising it teaches the model to COPY at delta=0, which is the
+            # correct answer for a station the encoder can see, and is a free
+            # accuracy check: the target is an input. It also makes
+            # sanity/ctx_ratio meaningful — as it stands that metric divides an
+            # unsupervised quantity by a supervised one.
+            #
+            # Leave False to reproduce v15-v20 exactly.
             _has_masked = masked_idx is not None and masked_idx.shape[1] > 0
-            if k == 0 and delta_steps[0, 0].item() == 0 and _has_masked:
+            if (k == 0 and delta_steps[0, 0].item() == 0 and _has_masked
+                    and not self.delta0_all_stations):
                 _midx_k = masked_idx
             else:
                 _midx_k = (masked_idx if (self.masked_only_loss and _has_masked)

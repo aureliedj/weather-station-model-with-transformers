@@ -203,12 +203,14 @@ class FactorisedTransformerBlock(nn.Module):
         num_heads:        int,
         mlp_ratio:        float = 4.0,
         dropout:          float = 0.1,
+        spatial_attn:     bool  = True,
         temporal_window:  int   = 0,
         shift:            bool  = False,
         drop_path:        float = 0.0,
     ):
         super().__init__()
 
+        self.spatial_attn    = spatial_attn
         self.temporal_window = temporal_window
         # shift only makes sense when windowing is active
         self.shift           = shift and (temporal_window > 0)
@@ -220,10 +222,15 @@ class FactorisedTransformerBlock(nn.Module):
         )
 
         # ── Spatial sub-layer (all N stations at each timestep) ──────────
-        self.norm_s = nn.LayerNorm(d_model)
-        self.attn_s = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True
-        )
+        # spatial_attn=False makes the encoder STATION-INDEPENDENT: each station
+        # is encoded from its own temporal window with no cross-station mixing.
+        # That is the controlled study against the LSTM — if the error curves
+        # coincide, neighbouring stations are not contributing.
+        if spatial_attn:
+            self.norm_s = nn.LayerNorm(d_model)
+            self.attn_s = nn.MultiheadAttention(
+                d_model, num_heads, dropout=dropout, batch_first=True
+            )
 
         # ── Shared FFN ────────────────────────────────────────────────────
         self.norm_ff = nn.LayerNorm(d_model)
@@ -304,11 +311,12 @@ class FactorisedTransformerBlock(nn.Module):
         # Attention here is FULL over the station axis — the windowing options
         # apply to the temporal axis only. That is what makes the station axis
         # permutation-equivariant, and why sorting the mask indices is free.
-        xs     = x.reshape(B * W, N, D)                        # (B·W, N, D)
-        xs_n   = self.norm_s(xs)
-        as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
-        xs     = xs + self.drop_path(as_)
-        x      = xs.reshape(B, W, N, D)                        # (B, W, N, D)
+        if self.spatial_attn:
+            xs     = x.reshape(B * W, N, D)                    # (B·W, N, D)
+            xs_n   = self.norm_s(xs)
+            as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
+            xs     = xs + self.drop_path(as_)
+            x      = xs.reshape(B, W, N, D)                    # (B, W, N, D)
 
         # ── 3. FFN (applied over last dim, works on any leading shape) ────
         x = x + self.drop_path(self.ffn(self.norm_ff(x)))
@@ -377,6 +385,7 @@ class StationMAEEncoder(nn.Module):
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
         use_checkpoint:       bool  = False,
         factorised:           bool  = False,
+        spatial_attn:         bool  = True,
         temporal_window:      int   = 0,
         temporal_patch:       int   = 1,
         value_embedding:      str   = "linear",     # v18: "linear" | "fourier"
@@ -471,6 +480,7 @@ class StationMAEEncoder(nn.Module):
             self.blocks = nn.ModuleList([
                 FactorisedTransformerBlock(
                     d_model, num_heads, mlp_ratio, dropout,
+                    spatial_attn=spatial_attn,
                     temporal_window=temporal_window,
                     shift=(i % 2 == 1),
                     drop_path=dp_rates[i],

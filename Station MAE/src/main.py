@@ -206,6 +206,20 @@ def parse_args() -> argparse.Namespace:
                         "instead of two independent ones, so the encoder can "
                         "form speed and direction directly. Safe: the u and v "
                         "masks are identical in 100%% of station-samples.")
+    p.add_argument("--delta0_all_stations", action="store_true",
+                   help="Supervise VISIBLE stations at delta=0 as well as masked ones. "
+                        "Without this their delta=0 output gets zero gradient and is an "
+                        "untrained free parameter. With it the model learns to COPY at "
+                        "delta=0 — the correct answer for a station the encoder can see, "
+                        "and a free accuracy check since the target is an input. Also "
+                        "makes sanity/ctx_ratio interpretable.")
+    p.add_argument("--no_spatial_attn",     action="store_true",
+                   help="Remove the spatial sub-layer from every factorised encoder "
+                        "block: each station is encoded from its own temporal window "
+                        "with no cross-station mixing. This is the CONTROLLED STUDY "
+                        "against the LSTM — if the error curves coincide, neighbouring "
+                        "stations are contributing nothing and the spatial machinery is "
+                        "not earning its cost.")
     p.add_argument("--query_anchor",        action="store_true",
                    help="v23. Start each VISIBLE station's decoder query from that "
                         "station's OWN final encoder token (fetched by gather — the "
@@ -792,8 +806,10 @@ def main() -> None:
         temporal_window=args.temporal_window,
         value_embedding=args.value_embedding,
         wind_pair=((3, 4) if args.wind_encoder else None),
+        encoder_spatial_attn=not args.no_spatial_attn,
         static_in_token=args.static_in_token,
         query_anchor=args.query_anchor,
+        delta0_all_stations=args.delta0_all_stations,
         direct_head=args.direct_head,
         readout=args.readout,
         num_horizons=(args.max_delta // args.delta_grid_stride + 1),
@@ -934,8 +950,10 @@ def main() -> None:
         "temporal_window":     args.temporal_window,
         "value_embedding":     args.value_embedding,
         "wind_encoder":        args.wind_encoder,
+        "encoder_spatial_attn": not args.no_spatial_attn,
         "static_in_token":     args.static_in_token,
         "query_anchor":        args.query_anchor,
+        "delta0_all_stations": args.delta0_all_stations,
         "direct_head":         args.direct_head,
         "readout":             args.readout,
         "temporal_patch":      args.temporal_patch,
