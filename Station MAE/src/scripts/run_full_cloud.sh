@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v26-res"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v26.1"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -600,7 +600,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v26-res${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v26-res-fixed${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
