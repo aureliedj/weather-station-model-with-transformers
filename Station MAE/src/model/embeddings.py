@@ -110,8 +110,61 @@ POSITION_FOURIER_DIM = 16
 
 # Fourier feature dimension for TemporalEmbedding.
 # Must be even: TEMPORAL_FOURIER_DIM // 2 wavelengths are used.
-# 32 → 16 wavelengths spanning ~10 min to ~1 year.
+# 32 → 16 wavelengths (see TEMPORAL_WAVELENGTHS_H).
 TEMPORAL_FOURIER_DIM = 32
+
+# ── Temporal wavelengths, in hours ───────────────────────────────────────────
+# EXPLICIT, not log-spaced. The previous version drew 16 wavelengths
+# log-spaced from 1/6 h to 8766 h, which placed them at
+#
+#     0.167  0.344  0.710  1.466  3.025  6.245  12.889  26.605
+#     54.9   113.4  234.0  482.9  996.8  2057.5 4246.9  8766.0
+#
+# The annual cycle landed EXACTLY on lambda_max, but the DIURNAL cycle — the
+# dominant periodicity in surface weather, and the strongest predictable
+# signal in temperature and humidity at the 0-6 h horizons this project
+# forecasts — had no basis function. The nearest were 26.605 h (+10.9%) and
+# 12.889 h (+7.4%), both incommensurate with 24 h, so no combination of the
+# 32 features could express a 24-hour-periodic function. Measured by least
+# squares against a pure diurnal signal:
+#
+#     fit of a  24 h cycle from the old basis:   R^2 = 0.005
+#     fit of an annual cycle from the old basis: R^2 = 1.000
+#
+# The downstream MLP cannot rescue this: a 24 h-periodic embedding would
+# require mapping f(t) and f(t+24h) — genuinely distinct points — to the same
+# output across the whole domain. The model was therefore forced to
+# re-derive time-of-day from the 12 h observation window on every forward
+# pass, while being handed the annual cycle for free.
+#
+# Below, the periods are chosen for what surface weather actually does, in
+# the spirit of ClimaX / GraphCast (which encode the physically meaningful
+# cycles rather than a blind geometric sweep):
+#
+#   diurnal harmonics 24/k (k=1..6) — the diurnal curve is near-sinusoidal
+#       with asymmetry (fast morning rise, slow evening fall); harmonics 1-3
+#       carry most of the shape, 4-6 sharpen it. 12 h additionally captures
+#       the semi-diurnal atmospheric pressure tide, which is a real signal
+#       in the pressure channel.
+#   synoptic -> monthly — weather systems are aperiodic, so these are a
+#       log-spaced basis for slow drift rather than true cycles.
+#   annual harmonics 8766/k (k=3,2,1) — seasonality, with the 2nd and 3rd
+#       harmonics carrying the spring/autumn asymmetry a pure sinusoid misses.
+#
+# NOTE: nothing below ~4 h. Absolute sub-hourly phase ("22 minutes past the
+# hour, measured from 1970") carries no meteorological signal. Relative
+# position inside the input window is StepIndexEmbedding's job and is encoded
+# exactly there; lead time is DeltaTimeEmbedding's. This module supplies
+# absolute WHEN — time of day and time of year — and nothing else.
+TEMPORAL_WAVELENGTHS_H = (
+    # diurnal family: 24 / k for k = 1..6
+    24.0, 12.0, 8.0, 6.0, 4.8, 4.0,
+    # synoptic -> monthly drift (2 d, 3 d, 5 d, 8 d, 14 d, 30 d, 60 d)
+    48.0, 72.0, 120.0, 192.0, 336.0, 720.0, 1440.0,
+    # annual family: 8766 / k for k = 3, 2, 1
+    2922.0, 4383.0, 8766.0,
+)
+assert 2 * len(TEMPORAL_WAVELENGTHS_H) == TEMPORAL_FOURIER_DIM
 
 # ── v18 value embedding (PLR — Gorishniy et al., NeurIPS 2022) ───────────────
 # Observations are per-station z-scored, so the value axis is in sigma units.
@@ -398,46 +451,55 @@ class StationEmbedding(nn.Module):
 
 class TemporalEmbedding(nn.Module):
     """
-    Multi-scale Fourier temporal embedding (inspired by Aurora, Price et al. 2024).
+    Multi-scale Fourier temporal embedding (Aurora, Price et al. 2024 §B.4),
+    over an EXPLICIT set of physically meaningful periods.
 
-    Encodes time as *hours since the Unix epoch* using log-spaced sinusoidal
-    features, then projects to d_model via a 2-layer MLP.
+    Encodes absolute time as *hours since the Unix epoch*, then projects to
+    d_model via a 2-layer MLP:
 
-    Using `fourier_dim // 2` wavelengths log-spaced between λ_min and λ_max,
-    the model can jointly learn sub-daily, weekly, monthly, and seasonal
-    patterns without any hard-coded time cycles.
-
-    Reference (Supplementary B.4):
-        Emb(x) = [cos(2πx/λ_i), sin(2πx/λ_i)]  for i = 0..D/2-1
-        λ_i log-spaced in [λ_min, λ_max]
+        Emb(x) = [cos(2πx/λ_i), sin(2πx/λ_i)]  for i = 0 … D/2−1
         x = hours since 1970-01-01 00:00 UTC
+
+    The λ_i are TEMPORAL_WAVELENGTHS_H — diurnal harmonics, a synoptic band,
+    and annual harmonics — not a log-spaced sweep. See the constant for the
+    measurement that motivated it: a geometric spacing from 1/6 h to 1 year
+    placed wavelengths at 12.889 h and 26.605 h and therefore could not
+    represent the 24 h cycle at all (R² = 0.005), while landing exactly on
+    the annual one.
+
+    This module carries ABSOLUTE time only — time of day and time of year.
+    Relative position inside the input window is StepIndexEmbedding's job and
+    forecast lead time is DeltaTimeEmbedding's; neither is duplicated here.
 
     Args:
         d_model:     Transformer model dimension.
         fourier_dim: Total Fourier feature dimension (must be even; default 32).
-                     Gives fourier_dim // 2 distinct wavelengths.
-        lambda_min:  Shortest wavelength in hours (default 1/6 ≈ 10 min).
-        lambda_max:  Longest  wavelength in hours (default 365.25 × 24 ≈ 1 year).
+                     Must equal 2 × len(wavelengths).
+        wavelengths: Tuple of periods in hours. Defaults to
+                     TEMPORAL_WAVELENGTHS_H.
     """
 
     def __init__(
         self,
         d_model:     int   = 128,
         fourier_dim: int   = TEMPORAL_FOURIER_DIM,
-        lambda_min:  float = 1.0 / 6.0,          # 10 minutes in hours
-        lambda_max:  float = 365.25 * 24.0,       # 1 year in hours
+        wavelengths: "tuple | None" = None,
         dropout:     float = 0.0,
     ):
         super().__init__()
         assert fourier_dim % 2 == 0, "fourier_dim must be even"
         self.fourier_dim = fourier_dim
 
-        # Non-trainable log-spaced wavelengths: (fourier_dim // 2,)
-        n_wl = fourier_dim // 2
-        lambdas = torch.exp(
-            torch.linspace(math.log(lambda_min), math.log(lambda_max), n_wl)
-        )
-        self.register_buffer("lambdas", lambdas)
+        # EXPLICIT wavelengths (hours), not a log-spaced sweep — see
+        # TEMPORAL_WAVELENGTHS_H for why. The old geometric spacing had no
+        # 24 h component, so the diurnal cycle was unrepresentable (R^2=0.005
+        # for a least-squares fit of a pure diurnal signal from the basis).
+        wl = tuple(wavelengths) if wavelengths is not None else TEMPORAL_WAVELENGTHS_H
+        assert 2 * len(wl) == fourier_dim, (
+            f"fourier_dim={fourier_dim} needs {fourier_dim // 2} wavelengths, "
+            f"got {len(wl)}")
+        # float64: these are divisors of an ~4.9e5 input, see _fourier().
+        self.register_buffer("lambdas", torch.tensor(wl, dtype=torch.float64))
 
         # MLP: fourier_dim → d_model → d_model
         self.proj = nn.Sequential(
@@ -452,31 +514,18 @@ class TemporalEmbedding(nn.Module):
         """
         Compute Fourier features for arbitrary-shape input.
 
-        Computed in float64. This is NOT defensive over-engineering — in
-        float32 the short-wavelength half of this bank is numerically
-        meaningless, because the input is hours since 1970 (~4.9e5 in 2026)
-        while lambda_min is 1/6 h:
+        Computed in float64. This is NOT defensive over-engineering — the
+        input is hours since 1970 (~4.9e5 in 2026), so even the 4 h wavelength
+        gives an angle of 2*pi*4.9e5/4 ~= 7.7e5 radians. float32 carries a
+        24-bit mantissa, so the absolute rounding error there is
+        ~7.7e5 * 6e-8 ~= 0.046 rad, and it grows as lambda shrinks.
 
-            angle = 2*pi*x/lambda = 2*pi*4.9e5*6 ~= 1.85e7 radians
-
-        float32 carries a 24-bit mantissa, so the absolute rounding error at
-        that magnitude is ~1.85e7 * 6e-8 ~= 2.2 radians — larger than a full
-        cycle is fine-grained. Measured phase error against float64 across the
-        16 log-spaced wavelengths at a 2026 timestamp:
-
-            lambda      phase error
-            10 min        126 deg     <- pure noise
-            21 min         61 deg     <- pure noise
-            43 min         30 deg
-             1.5 h         14 deg
-             3.0 h          7 deg
-             6.2 h          3 deg
-            12.9 h        1.6 deg     <- usable from here down
-             1 year      ~0 deg
-
-        cos() at lambda=10 min differed from the exact value by 0.64 (on a
-        [-1, 1] range). The features meant to resolve the data's native 10-min
-        step were the LEAST trustworthy in the bank.
+        With the OLD log-spaced bank (lambda_min = 1/6 h) the angle reached
+        1.85e7 rad and the error 2.2 rad — a phase error of 126 degrees at
+        the shortest wavelength, i.e. pure noise, with cos() off by 0.64 on a
+        [-1, 1] range. Roughly a third of that bank was degraded. Those
+        wavelengths are gone now (see TEMPORAL_WAVELENGTHS_H), but the input
+        magnitude is unchanged, so the float64 computation is still required.
 
         float64 puts the error at ~1e-5 rad everywhere. cos/sin outputs are
         bounded in [-1, 1], so casting back afterwards is lossless in the
@@ -539,7 +588,15 @@ class DeltaTimeEmbedding(nn.Module):
         self,
         d_model:      int   = 128,
         fourier_dim:  int   = DELTA_FOURIER_DIM,
-        lambda_min:   float = 1.0 / 6.0,    # 10 minutes in hours
+        # lambda_min was 1/6 h and produced a PROVABLY CONSTANT feature pair.
+        # The fixed_grid horizons are multiples of delta_grid_stride = 3 steps
+        # = 0.5 h, so at lambda = 1/6 h every lead time is an exact integer
+        # number of wavelengths: cos(2*pi*k) = 1, sin(2*pi*k) = 0 for all k.
+        # Two of sixteen features carried zero information for every input the
+        # model will ever see. 1.0 h is the Nyquist wavelength of a 0.5 h grid
+        # — the shortest that still varies across horizons.
+        # Keep lambda_min >= 2 * (delta_grid_stride * 10 min) if that changes.
+        lambda_min:   float = 1.0,           # Nyquist for the 0.5 h delta grid
         lambda_max:   float = 8.0,           # 8 hours — buffer beyond 6 h max horizon
         step_size_h:  float = 1.0 / 6.0,    # each step = 10 minutes = 1/6 h
         dropout:      float = 0.0,
@@ -630,9 +687,17 @@ class StepIndexEmbedding(nn.Module):
         super().__init__()
         assert fourier_dim % 2 == 0, "fourier_dim must be even"
         n_wl = fourier_dim // 2
-        # Log-spaced wavelengths in step counts: 1 step (finest) → max_steps (coarsest)
+        # Log-spaced wavelengths in step counts: 2 steps (Nyquist) → max_steps.
+        #
+        # The lower bound was 1.0 and produced a PROVABLY CONSTANT feature
+        # pair: the input is an INTEGER step index k, so at lambda = 1 every
+        # input gives cos(2*pi*k) = 1 and sin(2*pi*k) = 0. Two of thirty-two
+        # features were a fixed (1, 0) for every token the model has ever
+        # seen — dead parameters plus a constant offset, the same defect class
+        # as the removed var_type_embedding. 2 steps is the Nyquist wavelength
+        # of an integer grid: the shortest that can vary at all.
         lambdas = torch.exp(
-            torch.linspace(math.log(1.0), math.log(float(max_steps)), n_wl)
+            torch.linspace(math.log(2.0), math.log(float(max_steps)), n_wl)
         )
         self.register_buffer("lambdas", lambdas)   # (n_wl,)
 
