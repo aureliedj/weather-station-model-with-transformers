@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v23_delta0w2"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v26"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -256,7 +256,24 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # If it does NOT recover v20's pressure result (0.0249 against a 0.0237 copy
 # bound), try --delta0_weight 2 first — Delta=0 carries 1/13 of the loss and may
 # simply be under-weighted. Only then promote the anchor to v24.
-ANCHOR=""                                          # <- v23: Delta=0 fix alone
+#
+# v26 BELOW runs neither anchor nor the delta0_weight bump. It exists to
+# answer a different question than v23 did: not "does the Delta=0 fix alone
+# replace the residual", but "what do the three structural fixes made after
+# v20 do to v20's OWN configuration, holding architecture and the residual
+# head fixed?" Those fixes:
+#   1. Delta=0 loss-scope fix (now unconditional, model/mae.py) — visible
+#      stations used to get zero gradient at Delta=0; caused the
+#      val/horizon_sensitivity instability seen in v20's own wandb curves.
+#   2. Station-order fix in _mask_stations (tests/test_station_order.py).
+#   3. Shared pos_emb/station_emb/temporal_emb between encoder and decoder
+#      (tests/test_shared_embeddings.py) — a station's query and its matching
+#      key now carry a bit-identical positional fingerprint instead of two
+#      separately-learned approximations of it.
+# v20's checkpoint predates all three. This is the direct like-for-like
+# re-run — same everything else — so any difference against the original
+# v20 numbers (0.1778 overall, pressure 0.0249) is attributable to the fixes.
+ANCHOR=""                                          # <- v20 / v23 / v26: off
 #ANCHOR="--query_anchor"                          # <- v24 arm
 
 # ── Delta=0 loss weight ───────────────────────────────────────────────────────
@@ -270,8 +287,7 @@ ANCHOR=""                                          # <- v23: Delta=0 fix alone
 #
 #   delta0_weight=1.0 : uniform (v23 above)
 #   delta0_weight=2.0 : Delta=0 gets 2x a normal horizon's weight — this run
-DELTA0="--delta0_weight 2"                         # <- v23 + up-weighted Delta=0
-# DELTA0=""                                        # <- v23: uniform (default)
+DELTA0=""                                        # <- v23: uniform (default)
 
 
 # ── Spatial attention — the controlled study ─────────────────────────────────
@@ -301,8 +317,8 @@ DIRECT=""                                          # <- v23 keeps the decoder
 # deterministic while WHICH stations are masked stays random. At mask_ratio 0
 # the visible set is exactly arange(N). See tests/test_station_order.py.
 
-RESIDUAL=""                                        # <- v23: Delta=0 fix (+ delta0_weight 2) alone, no residual
-# RESIDUAL="--residual_head"                       # <- v20
+RESIDUAL="--residual_head"                       # <- v20/v26: y(t0) added outside attention
+# RESIDUAL=""                                        # <- v23 / v23_delta0w2: removed
 # RESIDUAL=""                                        # <- v23: REMOVED. The anchor
 #   supersedes it — it hands over the station's full learned representation
 #   rather than one scalar per variable, and applies equally at every lead time
@@ -585,7 +601,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v23-delta0w2${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v26-v20fixed${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
