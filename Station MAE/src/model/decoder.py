@@ -226,6 +226,9 @@ class StationMAEDecoder(nn.Module):
         predict_uncertainty:      bool = False,
         window_size:              int  = 72,
         step_emb:                 "nn.Module | None" = None,
+        pos_emb:                  "nn.Module | None" = None,
+        station_emb:              "nn.Module | None" = None,
+        temporal_emb:             "nn.Module | None" = None,
     ):
         super().__init__()
 
@@ -287,16 +290,31 @@ class StationMAEDecoder(nn.Module):
         # Positional / contextual embeddings for query token construction
         # Token = mask_token + p1 + p2 + t + delta
         # ------------------------------------------------------------------
+        # p1/p2/t — shared with the encoder (see mae.py) rather than built as
+        # separate copies. A station's position, topography and a given
+        # absolute time are the same fact whether the encoder is embedding a
+        # key for that station or the decoder is embedding a query for it —
+        # two independently-constructed modules would only share their fixed
+        # Fourier frequencies, not their trained MLP weights, so the query's
+        # positional fingerprint and the matching key's would drift apart
+        # during training instead of being provably identical. Same rationale
+        # as step_emb below. Falls back to its own instance when used
+        # standalone (e.g. tests, notebooks). NOT applied to the observation
+        # value embedding — the decoder has no observed value to share.
+        #
         # p1 — WHERE (position): Fourier encoding of easting/northing
-        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
-                                                dropout=dropout)
+        self.pos_emb      = pos_emb if pos_emb is not None else \
+            PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
+                                dropout=dropout)
 
         # p2 — WHERE (characteristics): MLP over topographic features
-        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim,
-                                             dropout=dropout)
+        self.station_emb  = station_emb if station_emb is not None else \
+            StationEmbedding(d_model=d_model, input_dim=station_char_dim,
+                             dropout=dropout)
 
         # t  — WHEN: Aurora Fourier temporal encoding for the TARGET timestep
-        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
+        self.temporal_emb = temporal_emb if temporal_emb is not None else \
+            TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
                                               dropout=dropout)
 
         # Δt — LEAD: Fourier encoding over continuous lead-time hours

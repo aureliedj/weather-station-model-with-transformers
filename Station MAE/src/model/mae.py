@@ -55,7 +55,12 @@ from .embeddings import (
     NUM_VARIABLES,
     NUM_TARGET_VARIABLES,
     TEMPORAL_FOURIER_DIM,
+    STATION_CHAR_DIM,
+    POSITION_FOURIER_DIM,
     StepIndexEmbedding,
+    PositionalEmbedding,
+    StationEmbedding,
+    TemporalEmbedding,
 )
 
 
@@ -326,6 +331,22 @@ class StationMAE(nn.Module):
         # matching Fourier-basis formula.
         shared_step_emb = StepIndexEmbedding(d_model=d_model, dropout=dropout)
 
+        # Shared position / topography / absolute-time embeddings — same
+        # reasoning as shared_step_emb, extended to the rest of the "WHERE"
+        # and "WHEN" signals a query and its matching key both carry. Without
+        # this, the encoder's pos_emb(station n) and the decoder's
+        # pos_emb(station n) are two separately-initialised MLPs over the
+        # same input; cross-attention then has to LEARN an approximate
+        # alignment between them rather than starting from an exact one.
+        # Deliberately NOT extended to var_proj — the encoder embeds an
+        # observed VALUE that has no decoder-side counterpart to share.
+        shared_pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=POSITION_FOURIER_DIM,
+                                                   dropout=dropout)
+        shared_station_emb  = StationEmbedding(d_model=d_model, input_dim=STATION_CHAR_DIM,
+                                                dropout=dropout)
+        shared_temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
+                                                 dropout=dropout)
+
         self.encoder = StationMAEEncoder(
             d_model=d_model,
             num_heads=enc_heads,
@@ -345,6 +366,9 @@ class StationMAE(nn.Module):
             static_in_token=static_in_token,
             drop_path_rate=drop_path_rate,
             step_emb=shared_step_emb,
+            pos_emb=shared_pos_emb,
+            station_emb=shared_station_emb,
+            temporal_emb=shared_temporal_emb,
         )
         self.residual_head    = bool(residual_head)
 
@@ -398,6 +422,9 @@ class StationMAE(nn.Module):
             predict_uncertainty=use_nll_loss,
             window_size=window_size,
             step_emb=shared_step_emb,
+            pos_emb=shared_pos_emb,
+            station_emb=shared_station_emb,
+            temporal_emb=shared_temporal_emb,
         )
 
     # ------------------------------------------------------------------

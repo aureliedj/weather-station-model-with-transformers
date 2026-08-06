@@ -38,6 +38,8 @@
 
 set -euo pipefail
 
+export WANDB_API_KEY="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"
+
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 
 # Checkpoints saved inside the project directory — guaranteed writable on Renku.
@@ -51,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v25"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v23_delta0w2"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -257,6 +259,20 @@ STATIC=""                                          # <- v20 / v18 separate branc
 ANCHOR=""                                          # <- v23: Delta=0 fix alone
 #ANCHOR="--query_anchor"                          # <- v24 arm
 
+# ── Delta=0 loss weight ───────────────────────────────────────────────────────
+# The full-budget v20-vs-v23 run (100 epochs, not the 15-epoch sanity check)
+# showed v23 converging to within a few percent of v20 on pressure, humidity,
+# wind_u and wind_v — but temperature stayed persistently ~20% behind and did
+# not look like it was still closing at the tail. Before reaching for the
+# anchor (v24), try the cheaper lever this comment predicted: Delta=0 is 1 of
+# 13 horizons in the loss average, so it may simply be under-weighted relative
+# to how much signal it carries.
+#
+#   delta0_weight=1.0 : uniform (v23 above)
+#   delta0_weight=2.0 : Delta=0 gets 2x a normal horizon's weight — this run
+DELTA0="--delta0_weight 2"                         # <- v23 + up-weighted Delta=0
+# DELTA0=""                                        # <- v23: uniform (default)
+
 
 # ── Spatial attention — the controlled study ─────────────────────────────────
 # --no_spatial_attn removes the spatial sub-layer from every encoder block, so
@@ -285,7 +301,8 @@ DIRECT=""                                          # <- v23 keeps the decoder
 # deterministic while WHICH stations are masked stays random. At mask_ratio 0
 # the visible set is exactly arange(N). See tests/test_station_order.py.
 
-RESIDUAL="--residual_head"                       # <- v20
+RESIDUAL=""                                        # <- v23: Delta=0 fix (+ delta0_weight 2) alone, no residual
+# RESIDUAL="--residual_head"                       # <- v20
 # RESIDUAL=""                                        # <- v23: REMOVED. The anchor
 #   supersedes it — it hands over the station's full learned representation
 #   rather than one scalar per variable, and applies equally at every lead time
@@ -562,12 +579,13 @@ python main.py \
     $ANCHOR \
     $SPATIAL \
     $DIRECT \
+    $DELTA0 \
     $ENCODER \
     $TEMPORAL_WINDOW \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v25-res${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v23-delta0w2${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

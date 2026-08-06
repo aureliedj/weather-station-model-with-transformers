@@ -393,6 +393,9 @@ class StationMAEEncoder(nn.Module):
         static_in_token:      bool  = False,        # v21: Aurora-style statics
         drop_path_rate:       float = 0.0,
         step_emb:             "nn.Module | None" = None,
+        pos_emb:              "nn.Module | None" = None,
+        station_emb:          "nn.Module | None" = None,
+        temporal_emb:         "nn.Module | None" = None,
     ):
         super().__init__()
 
@@ -422,12 +425,25 @@ class StationMAEEncoder(nn.Module):
             value_embedding=value_embedding, wind_pair=wind_pair,
             static_slots=(STATIC_SLOTS_DEFAULT if static_in_token else None),
             static_dim=SPATIAL_INPUT_DIM)
-        self.pos_emb      = PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
-                                                dropout=dropout)
-        self.station_emb  = StationEmbedding(d_model=d_model, input_dim=station_char_dim,
-                                             dropout=dropout)
-        self.temporal_emb = TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
-                                              dropout=dropout)
+        # p1/p2/t — shared with the decoder (see mae.py), same rationale as
+        # step_emb below: a station's position, topography and a given
+        # absolute time are the same fact on both sides of cross-attention.
+        # Two independently-constructed modules would only share their fixed
+        # Fourier frequencies, not their trained MLP weights, so "this
+        # station" on the encoder side and "this station" on the decoder side
+        # would drift apart during training instead of being provably the
+        # same vector. Falls back to its own instance when used standalone
+        # (e.g. tests, notebooks). NOT applied to var_proj — the actual
+        # observed VALUE has no decoder-side counterpart to share with.
+        self.pos_emb      = pos_emb if pos_emb is not None else \
+            PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
+                                dropout=dropout)
+        self.station_emb  = station_emb if station_emb is not None else \
+            StationEmbedding(d_model=d_model, input_dim=station_char_dim,
+                             dropout=dropout)
+        self.temporal_emb = temporal_emb if temporal_emb is not None else \
+            TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
+                              dropout=dropout)
 
         # s — Step-index positional embedding (within-window relative order).
         # Encodes the INTEGER step index 0..W-1 so the model knows WHERE each
