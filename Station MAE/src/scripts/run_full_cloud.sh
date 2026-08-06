@@ -51,7 +51,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v24"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v25"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -254,8 +254,8 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # If it does NOT recover v20's pressure result (0.0249 against a 0.0237 copy
 # bound), try --delta0_weight 2 first — Delta=0 carries 1/13 of the loss and may
 # simply be under-weighted. Only then promote the anchor to v24.
-#ANCHOR=""                                          # <- v23: Delta=0 fix alone
-ANCHOR="--query_anchor"                          # <- v24 arm
+ANCHOR=""                                          # <- v23: Delta=0 fix alone
+#ANCHOR="--query_anchor"                          # <- v24 arm
 
 
 # ── Spatial attention — the controlled study ─────────────────────────────────
@@ -567,7 +567,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v24-anchor${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v25-res${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
