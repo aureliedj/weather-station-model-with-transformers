@@ -285,8 +285,8 @@ DIRECT=""                                          # <- v23 keeps the decoder
 # deterministic while WHICH stations are masked stays random. At mask_ratio 0
 # the visible set is exactly arange(N). See tests/test_station_order.py.
 
-# RESIDUAL="--residual_head"                       # <- v20
-RESIDUAL=""                                        # <- v23: REMOVED. The anchor
+RESIDUAL="--residual_head"                       # <- v20
+# RESIDUAL=""                                        # <- v23: REMOVED. The anchor
 #   supersedes it — it hands over the station's full learned representation
 #   rather than one scalar per variable, and applies equally at every lead time
 #   instead of fading as delta grows. Re-enable only to reproduce v20.
