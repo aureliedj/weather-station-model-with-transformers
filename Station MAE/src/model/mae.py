@@ -674,9 +674,17 @@ class StationMAE(nn.Module):
         # delta0_weight is applied to k=0 when delta=0 is the first grid entry,
         # though with masked-only supervision at k=0 the gradient is already
         # naturally smaller (~50% of stations), so delta0_weight=1.0 is preferred.
+        # Built WITHOUT a host sync. `delta_steps[0, 0].item()` forced a
+        # GPU->CPU transfer on every training step and, under --compile, a
+        # graph break at the same point every iteration. torch.where keeps the
+        # decision on-device; the numerics are identical.
         h_weights = encoded.new_ones(K)
-        if delta_steps[0, 0].item() == 0:
-            h_weights[0] = self.delta0_weight
+        _is_delta0 = (delta_steps[0, 0] == 0)
+        h_weights[0] = torch.where(
+            _is_delta0,
+            h_weights.new_tensor(self.delta0_weight),
+            h_weights.new_tensor(1.0),
+        )
         h_weights = h_weights / h_weights.sum()   # normalise → sums to 1
 
         # ── Per-horizon masking strategy ──────────────────────────────────
@@ -842,9 +850,14 @@ class StationMAE(nn.Module):
         loss_per_var = []
         for v in range(V):
             ok  = sensor_ok[..., v]                                 # (B, N)
-            if ok.sum() == 0:
-                loss_per_var.append(preds.new_zeros(()))
-                continue
+            # NOTE: there used to be an `if ok.sum() == 0: continue` guard here.
+            # It forced a GPU->CPU sync per variable per horizon — K*V = 65 per
+            # training step — and broke the compiled graph at the same point
+            # every iteration. It was also redundant: the denominator below is
+            # already clamped to >= 1, so an all-absent variable yields
+            # 0 / 1 = 0, exactly what the guard returned. Safe because absent
+            # sensors carry 0.0 (dataset.py nan_to_num), never NaN, so the
+            # masked-out elements cannot poison the sum.
             err = preds[..., v] - y[..., v]                        # (B, N)
 
             if log_var is not None:

@@ -76,10 +76,17 @@ class DropPath(nn.Module):
         keep_prob    = 1.0 - self.drop_prob
         # Shape: (B, 1, 1, …) — broadcasts over all token/feature dimensions
         shape        = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = torch.rand(shape, dtype=x.dtype, device=x.device)
+        # float32, NOT x.dtype. Under --amp --bf16 x is bfloat16, which carries
+        # an 8-bit mantissa: near 1.0 the representable values are spaced ~1/256.
+        # `rand + keep_prob` then ROUNDS before the floor, so with drop_prob=0.1
+        # a sample at rand=0.0999 becomes 0.9999 -> 1.0 -> kept, when it should
+        # have been dropped. The realised drop rate drifts below the nominal one
+        # by roughly half the bf16 spacing, i.e. the regulariser is quietly
+        # weaker than configured. Draw in float32 and cast after the threshold.
+        random_tensor = torch.rand(shape, dtype=torch.float32, device=x.device)
         # Floor to 0/1; divide by keep_prob to maintain expected value = 1
         random_tensor = torch.floor(random_tensor + keep_prob) / keep_prob
-        return x * random_tensor
+        return x * random_tensor.to(x.dtype)
 
 
 # ---------------------------------------------------------------------------

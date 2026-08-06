@@ -452,15 +452,47 @@ class TemporalEmbedding(nn.Module):
         """
         Compute Fourier features for arbitrary-shape input.
 
+        Computed in float64. This is NOT defensive over-engineering — in
+        float32 the short-wavelength half of this bank is numerically
+        meaningless, because the input is hours since 1970 (~4.9e5 in 2026)
+        while lambda_min is 1/6 h:
+
+            angle = 2*pi*x/lambda = 2*pi*4.9e5*6 ~= 1.85e7 radians
+
+        float32 carries a 24-bit mantissa, so the absolute rounding error at
+        that magnitude is ~1.85e7 * 6e-8 ~= 2.2 radians — larger than a full
+        cycle is fine-grained. Measured phase error against float64 across the
+        16 log-spaced wavelengths at a 2026 timestamp:
+
+            lambda      phase error
+            10 min        126 deg     <- pure noise
+            21 min         61 deg     <- pure noise
+            43 min         30 deg
+             1.5 h         14 deg
+             3.0 h          7 deg
+             6.2 h          3 deg
+            12.9 h        1.6 deg     <- usable from here down
+             1 year      ~0 deg
+
+        cos() at lambda=10 min differed from the exact value by 0.64 (on a
+        [-1, 1] range). The features meant to resolve the data's native 10-min
+        step were the LEAST trustworthy in the bank.
+
+        float64 puts the error at ~1e-5 rad everywhere. cos/sin outputs are
+        bounded in [-1, 1], so casting back afterwards is lossless in the
+        relevant sense, and the tensor is tiny ((B, W) -> (B, W, 32)) so the
+        cost is negligible against a ~48 GFLOP encoder pass.
+
         Args:
             hours: (...) float tensor of hours-since-epoch.
         Returns:
-            (..., fourier_dim) float tensor.
+            (..., fourier_dim) float tensor, in the input's dtype.
         """
-        x      = hours.unsqueeze(-1)                        # (..., 1)
-        angles = 2.0 * math.pi * x / self.lambdas           # (..., n_wl)
-        return torch.cat([torch.cos(angles),
-                          torch.sin(angles)], dim=-1)       # (..., fourier_dim)
+        x      = hours.double().unsqueeze(-1)               # (..., 1)  float64
+        angles = 2.0 * math.pi * x / self.lambdas.double()  # (..., n_wl)
+        feats  = torch.cat([torch.cos(angles),
+                            torch.sin(angles)], dim=-1)     # (..., fourier_dim)
+        return feats.to(hours.dtype)
 
     def forward(self, hours: torch.Tensor) -> torch.Tensor:
         """

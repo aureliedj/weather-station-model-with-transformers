@@ -466,15 +466,52 @@ class StationMAELightning(pl.LightningModule):
         warmup_epochs = self.cfg.get("warmup_epochs", 5)
 
         # ── Parameter groups: standard transformer recipe ──────────────────
-        # Biases, LayerNorm params, embeddings, and mask_token are excluded
-        # from weight decay.  Decaying embeddings or norms can harm training.
+        # Biases, LayerNorm params, and token-like learned vectors are excluded
+        # from weight decay. Decaying norms or token embeddings harms training.
+        #
+        # This used to match on NAME SUBSTRINGS — ("bias", "norm", "embedding",
+        # "mask_token", "lambdas") — which silently missed three classes,
+        # because a parameter's qualified name does not always contain the word
+        # describing what it is:
+        #
+        #   *_emb.proj.2.{weight,bias}  the LayerNorm INSIDE every embedding
+        #                               MLP (PositionalEmbedding, StationEmbedding,
+        #                               TemporalEmbedding, DeltaTimeEmbedding,
+        #                               StepIndexEmbedding). It sits at index 2 of
+        #                               an nn.Sequential, so its name is
+        #                               "...proj.2.weight" — no "norm" anywhere.
+        #                               Ten LayerNorm gains were being decayed.
+        #   decoder.station_state       learned 2-vector "visible/masked" code,
+        #                               exactly the same class of object as
+        #                               mask_token, but without the substring.
+        #   var_proj.mlp_b1 / mlp_b2    biases of the batched per-variable MLP,
+        #                               named "b1"/"b2" rather than "bias".
+        #
+        # Classify by MODULE TYPE and role instead, which cannot drift as
+        # parameters are renamed (the recipe used by timm / nanoGPT / the MAE
+        # reference implementation).
+        _norm_param_ids = {
+            id(p)
+            for m in self.model.modules()
+            if isinstance(m, (torch.nn.LayerNorm, torch.nn.GroupNorm,
+                              torch.nn.BatchNorm1d, torch.nn.BatchNorm2d))
+            for p in m.parameters(recurse=False)
+        }
+        # Learned token / code vectors: no decay, same rationale as mask_token.
+        _token_like = ("mask_token", "station_state", "var_absent_embedding",
+                       "slot_emb", "var_biases", "mlp_b1", "mlp_b2")
+
         decay_params, nodecay_params = [], []
-        no_decay_kw = ("bias", "norm", "embedding", "mask_token", "lambdas")
         for name, param in self.model.named_parameters():
             if not param.requires_grad:
                 continue
-            bucket = nodecay_params if any(kw in name for kw in no_decay_kw) else decay_params
-            bucket.append(param)
+            no_decay = (
+                id(param) in _norm_param_ids            # any normalisation gain/bias
+                or name.endswith(".bias")               # every nn.Linear / MHA bias
+                or name.split(".")[-1] in _token_like   # learned token/code vectors
+                or param.ndim <= 1                      # catch-all for 1-D params
+            )
+            (nodecay_params if no_decay else decay_params).append(param)
 
         # ── Optimizer: AdamW with MAE-tuned betas ─────────────────────────
         # betas=(0.9, 0.95): higher β₂ dampens the squared-gradient running

@@ -59,7 +59,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   (that silent drop is what invalidated every v9–v13 test number). To
 #   evaluate an old run, check out the commit that trained it:
 #       git checkout <commit>  &&  bash src/scripts/run_test_cloud.sh
-RUN_NAME="v20"
+RUN_NAME="v26"
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
