@@ -536,7 +536,7 @@ python main.py \
     --mask_ratio       0.5 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
-    --dropout          0.0 \
+    --dropout          0.1 \
     --drop_path_rate   0.1 \
     --batch_size       4 \
     --num_workers      3 \
