@@ -81,7 +81,13 @@ def main() -> None:
                           else "mps" if torch.backends.mps.is_available() else "cpu")
     print("Device:", device)
 
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    # map_location="cpu", NOT `device` — see test.py for why: torch.load's
+    # deserializer restores each tensor directly on `map_location` during
+    # unpickling, a different path from an ordinary `.to(device)` call, and
+    # some virtualised CUDA profiles (e.g. NVIDIA vGPU/GRID slices) reject it
+    # with "CUDA driver error: operation not supported" even though normal
+    # CUDA ops work. The model is moved to `device` after construction below.
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg  = ckpt.get("hyper_parameters", {}).get("cfg", {})
     def g(k, d): return cfg.get(k, d)
 

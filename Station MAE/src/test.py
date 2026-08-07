@@ -897,7 +897,17 @@ def main() -> None:
         print(f"Checkpoint: {ckpt_path}")
 
         # ── Load checkpoint (Lightning .ckpt or legacy .pt) ─────────────
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        # map_location="cpu", NOT `device`. torch.load's deserializer restores
+        # each tensor's storage on `map_location` DIRECTLY during unpickling
+        # (serialization.py: default_restore_location -> obj.to(device=...)),
+        # which is a different code path from an ordinary `.to(device)` call
+        # on an already-constructed tensor. On some virtualised CUDA profiles
+        # (observed here: NVIDIA A10-8Q, a GRID vGPU slice) that direct-to-CUDA
+        # storage path raises "CUDA driver error: operation not supported"
+        # even though CUDA otherwise works fine in the same process — the model
+        # is moved to `device` two lines below via `.to(device)`, an ordinary
+        # tensor op, which does not hit this restriction.
+        ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
 
         if "state_dict" in ckpt:
             # Lightning format — weights stored under "state_dict" with "model." prefix
@@ -1029,6 +1039,55 @@ def main() -> None:
                 "trained them (git checkout main / the training-time commit). "
                 "Rebuilding it here would silently drop those trained weights — "
                 "the exact class of bug the v13 post-mortem uncovered."
+            )
+
+        # ── Shared pos_emb / station_emb / temporal_emb guard ───────────────
+        # mae.py now builds ONE PositionalEmbedding/StationEmbedding/
+        # TemporalEmbedding instance and registers it under BOTH
+        # `encoder.<name>` and `decoder.<name>`, so a station's query and its
+        # matching key carry a bit-identical positional fingerprint (see
+        # tests/test_shared_embeddings.py). A checkpoint trained BEFORE that
+        # change has two INDEPENDENTLY-trained modules at those two paths,
+        # with different weight values.
+        #
+        # This is silent, unlike a missing/unexpected key: both key names
+        # exist in the checkpoint AND in the current model, so
+        # load_state_dict(strict=False) reports nothing wrong. What actually
+        # happens is a double write to the SAME underlying nn.Parameter:
+        # Module.load_state_dict recurses through the model's OWN module tree
+        # in registration order (`self.encoder` is assigned before
+        # `self.decoder` in StationMAE.__init__), so `encoder.<name>.*` is
+        # copied in first and `decoder.<name>.*` is copied in second,
+        # SILENTLY OVERWRITING it. The encoder's trained position/topography/
+        # time understanding is discarded and replaced with the decoder's —
+        # for every window, at every station — with no error, no warning, and
+        # shapes that match perfectly.
+        #
+        # Detected by comparing the CHECKPOINT's own two copies: a
+        # current-code checkpoint has bit-identical values at both paths (one
+        # shared tensor was saved via two attribute names); a pre-fix
+        # checkpoint does not, to the precision of two independently
+        # optimised parameter sets.
+        _shared_mismatch = []
+        for _name in ("pos_emb", "station_emb", "temporal_emb"):
+            _enc_keys = sorted(k for k in state_dict if k.startswith(f"encoder.{_name}."))
+            for _ek in _enc_keys:
+                _dk = "decoder." + _ek[len("encoder."):]
+                if _dk in state_dict and not torch.equal(state_dict[_ek], state_dict[_dk]):
+                    _shared_mismatch.append(_name)
+                    break
+        if _shared_mismatch:
+            raise SystemExit(
+                f"\n[ABORT] This checkpoint predates the shared-embedding "
+                f"architecture — {sorted(set(_shared_mismatch))} differ between "
+                f"encoder.* and decoder.* in the saved weights, but the current "
+                f"model registers ONE shared instance at both paths. Loading it "
+                f"here would silently overwrite the encoder's trained weights "
+                f"with the decoder's (module registration order, not an error "
+                f"strict=False can catch — both key names exist and match "
+                f"shape). Evaluate this checkpoint with the code that trained "
+                f"it (git checkout the training-time commit), the same rule "
+                f"applied to pre-v15 input_context checkpoints above."
             )
 
         saved_cfg_for_build = saved_cfg
