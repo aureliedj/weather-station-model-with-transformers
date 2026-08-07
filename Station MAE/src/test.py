@@ -1068,27 +1068,14 @@ def main() -> None:
         # shared tensor was saved via two attribute names); a pre-fix
         # checkpoint does not, to the precision of two independently
         # optimised parameter sets.
-        _shared_mismatch = []
-        for _name in ("pos_emb", "station_emb", "temporal_emb"):
-            _enc_keys = sorted(k for k in state_dict if k.startswith(f"encoder.{_name}."))
-            for _ek in _enc_keys:
-                _dk = "decoder." + _ek[len("encoder."):]
-                if _dk in state_dict and not torch.equal(state_dict[_ek], state_dict[_dk]):
-                    _shared_mismatch.append(_name)
-                    break
-        if _shared_mismatch:
-            raise SystemExit(
-                f"\n[ABORT] This checkpoint predates the shared-embedding "
-                f"architecture — {sorted(set(_shared_mismatch))} differ between "
-                f"encoder.* and decoder.* in the saved weights, but the current "
-                f"model registers ONE shared instance at both paths. Loading it "
-                f"here would silently overwrite the encoder's trained weights "
-                f"with the decoder's (module registration order, not an error "
-                f"strict=False can catch — both key names exist and match "
-                f"shape). Evaluate this checkpoint with the code that trained "
-                f"it (git checkout the training-time commit), the same rule "
-                f"applied to pre-v15 input_context checkpoints above."
-            )
+        _shared_mismatch = sorted({
+            _name
+            for _name in ("pos_emb", "station_emb", "temporal_emb")
+            for _ek in state_dict
+            if _ek.startswith(f"encoder.{_name}.")
+            and (_dk := "decoder." + _ek[len("encoder."):]) in state_dict
+            and not torch.equal(state_dict[_ek], state_dict[_dk])
+        })
 
         saved_cfg_for_build = saved_cfg
 
@@ -1126,6 +1113,40 @@ def main() -> None:
             if _cli is not None:
                 _overrides[StationMAE._CFG_TO_ARG.get(_arg, _arg)] = _cli
         model = StationMAE.from_cfg(saved_cfg_for_build, **_overrides).to(device)
+
+        # ── Legacy-checkpoint compatibility: un-share what this checkpoint
+        # never shared ────────────────────────────────────────────────────
+        # Rather than refusing to load a pre-shared-embedding checkpoint,
+        # give the DECODER its own fresh, separate copy of each mismatched
+        # module. Both `encoder.<name>.*` and `decoder.<name>.*` keys then
+        # map to genuinely distinct nn.Parameters, so load_state_dict below
+        # populates each from the checkpoint's own two independently-trained
+        # copies instead of colliding. Exact shapes are guaranteed to match:
+        # d_model comes from this same checkpoint's cfg, and the Fourier
+        # dims (position/station/temporal) are architecture constants that
+        # have not changed — only TemporalEmbedding's WAVELENGTH VALUES have,
+        # and those live in its `lambdas` buffer, which load_state_dict
+        # overwrites from the checkpoint just like any other tensor, so the
+        # freshly-built instance ends up with the checkpoint's original
+        # wavelengths, not today's defaults.
+        if _shared_mismatch:
+            from model.embeddings import (
+                PositionalEmbedding, StationEmbedding, TemporalEmbedding,
+                POSITION_FOURIER_DIM, STATION_CHAR_DIM, TEMPORAL_FOURIER_DIM,
+            )
+            print(f"  [compat] legacy checkpoint predates shared embeddings "
+                  f"{_shared_mismatch} — rebuilding the decoder's copies as "
+                  f"UNSHARED so both trained versions load intact.")
+            if "pos_emb" in _shared_mismatch:
+                model.decoder.pos_emb = PositionalEmbedding(
+                    d_model=c_d_model, fourier_dim=POSITION_FOURIER_DIM).to(device)
+            if "station_emb" in _shared_mismatch:
+                model.decoder.station_emb = StationEmbedding(
+                    d_model=c_d_model, input_dim=STATION_CHAR_DIM).to(device)
+            if "temporal_emb" in _shared_mismatch:
+                model.decoder.temporal_emb = TemporalEmbedding(
+                    d_model=c_d_model, fourier_dim=TEMPORAL_FOURIER_DIM).to(device)
+
         missing, unexpected = model.load_state_dict(state_dict, strict=False)
         if missing:
             print(f"  Missing keys (using default init): {missing}")
