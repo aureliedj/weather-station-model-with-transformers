@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v26.1"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v27"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -273,6 +273,24 @@ STATIC=""                                          # <- v20 / v18 separate branc
 # v20's checkpoint predates all three. This is the direct like-for-like
 # re-run — same everything else — so any difference against the original
 # v20 numbers (0.1778 overall, pressure 0.0249) is attributable to the fixes.
+#
+# v27 (this run): SAME config as v26-res/v26.1, but on a CLEAN embeddings.py.
+# v26-res predated every embedding fix below except the sharing itself; v26.1
+# had the TemporalEmbedding wavelength fix but was trained between the first
+# (half-wrong, exact-Nyquist) and final Nyquist correction for
+# StepIndexEmbedding/DeltaTimeEmbedding — verified directly against the saved
+# checkpoint buffers (temporal_emb.lambdas matched TEMPORAL_WAVELENGTHS_H, but
+# step_emb.lambdas min=2.0 and delta_emb.lambdas min=1.0, not the current
+# 2.5 / 1.25). v27 is the first run to start from code with ALL of:
+#   - shared pos_emb/station_emb/temporal_emb/step_emb, encoder <-> decoder
+#   - TemporalEmbedding: float64 internals + TEMPORAL_WAVELENGTHS_H placement
+#   - StepIndexEmbedding lambda_min=2.5, DeltaTimeEmbedding lambda_min=1.25
+#     (both strictly above their respective Nyquist limits)
+#   - weight-decay grouping by module-type/role (catches embedding-internal
+#     LayerNorms, station_state, mlp_b1/mlp_b2 that name-substring matching missed)
+#   - DropPath bf16 threshold fix, GPU-sync removal in the loss
+# No architecture/config difference from v26-res/v26.1 otherwise, so any delta
+# against those is attributable to the embedding fixes above, not the config.
 ANCHOR=""                                          # <- v20 / v23 / v26: off
 #ANCHOR="--query_anchor"                          # <- v24 arm
 
@@ -600,7 +618,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v26-res-fixed${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v27-clean-embeddings${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
