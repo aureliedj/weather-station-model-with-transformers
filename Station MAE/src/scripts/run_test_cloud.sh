@@ -139,18 +139,32 @@ MASK_RATIOS="0.0 0.5"   # mr0.00 FIRST for v20. The question v20 exists to
 # sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
 # 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
 # batch_size: inference keeps no optimiser state and no activations, so it can
-# run larger batches than training. 16 suits v15's patch-3 tokenization.
+# run larger batches than training — ON THE HARDWARE THIS WAS TUNED FOR.
 #
 # mr0.00 is the heaviest configuration this runs: nothing is masked, so the
 # encoder carries all 155 stations instead of the ~78 it sees during training.
 # At --temporal_patch 3 that is 24x155 = 3,720 tokens vs 24x78 = 1,872 at
-# training time — on 11,684 windows. Drop to 8 if it OOMs, and to 4 if you
-# ever evaluate a PATCH=1 (raw) checkpoint, where mr0.00 is 72x155 = 11,160.
+# training time — on 11,684 windows. 4x, not 8x, if you ever evaluate a
+# PATCH=1 (raw) checkpoint, where mr0.00 is 72x155 = 11,160.
 # Predictions are bit-identical at any batch size; only speed changes.
+#
+# BATCH_SIZE WAS 16, TUNED FOR THE A100 MIG 3g.20gb (~20 GB) — HARDCODED
+# ---------------------------------------------------------------------------
+# OOM observed 2026-08 at mr0.00 on a smaller allocation: total capacity
+# 7.82 GiB (not the ~20 GB the comment above assumed — check `nvidia-smi` /
+# the OOM message's "GPU 0 has a total capacity of ..." line before assuming
+# which node you have; Renku hands out different slices across sessions).
+# 16 does not fit a GPU ~2.5x smaller. Dropped to 4 here as a safe default;
+# if it STILL OOMs, drop further (2, then 1) — correctness is unaffected,
+# only wall-clock. expandable_segments reduces the allocator fragmentation
+# PyTorch's own OOM message flagged (1.43 GiB reserved-but-unallocated).
+export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
-    --batch_size       16 \
+    --batch_size       "$BATCH_SIZE" \
     --num_workers      4 \
     --index_mode       "$INDEX_MODE" \
     --stride           "$STRIDE" \
