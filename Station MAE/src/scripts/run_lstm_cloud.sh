@@ -36,10 +36,18 @@ SAVE_DIR="${PROJ_DIR}/checkpoints/${RUN_NAME}"
 EXCLUDE="--exclude_stations PFA"   # same station dropped as the transformer
 
 # ── Model size ────────────────────────────────────────────────────────────────
-# hidden ≥ transformer d_model (=1024) per the meeting note ("embedding space use
-# similar or higher than transformer").  3 LSTM layers.  Even at hidden=1024 this is
-# only a few M params — orders of magnitude smaller than the ~130M transformer and
-# far faster to train (expect << 1 day, not 3).
+# hidden ≥ transformer d_model per the meeting note ("embedding space use
+# similar or higher than transformer").  3 LSTM layers.
+#
+# STALE-COMMENT FIX (2026-08): this used to claim "a few M params — orders of
+# magnitude smaller than the ~130M transformer". Both numbers referred to the
+# old d1024 era. Actual counts for the CURRENT configs:
+#   LSTM  h=1024 x3 + mask feature : ~21.1M params
+#   transformer d384 (v26)         : ~24M core + embeddings
+# i.e. the two are the SAME order of magnitude in parameters. Nominal FLOPs
+# per window are actually HIGHER for the LSTM (~470 GFLOP: 155 stations x 72
+# steps x ~21M MAC) than the patched transformer (~48 GFLOP encoder); the
+# LSTM is only faster in wall-clock because cuDNN fuses the recurrence.
 HIDDEN=1024
 LAYERS=3
 DROPOUT=0.1

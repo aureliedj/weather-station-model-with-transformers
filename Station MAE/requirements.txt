@@ -56,3 +56,10 @@ matplotlib>=3.7
 
 # ── Notebooks ────────────────────────────────────────────────────────────────
 jupyterlab>=4.0
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+# The suite under tests/ (shape/gradient audit, cfg roundtrip, leak guards,
+# embedding numerics, station order, query anchor, shared embeddings) is
+# pytest-based. Run from the project root:
+#     python -m pytest tests/ -v
+pytest>=8.0

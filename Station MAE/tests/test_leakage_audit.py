@@ -152,13 +152,20 @@ check("y / y_mask are never passed to the encoder or decoder",
        "Passing y would be the values themselves; passing y_mask would reveal\n"
        "which sensors are alive at target time — both are leaks."))
 
-check("delta=0 loss is restricted to MASKED stations",
-      "if k == 0 and delta_steps[0, 0].item() == 0" in mae_src
-      and "_midx_k = masked_idx" in mae_src,
-      "At delta=0 the target timestamp IS the last input step. For a VISIBLE\n"
-      "station the answer is already in the input, so supervising it there\n"
-      "would reward copying. Restricting to masked stations makes it genuine\n"
-      "gap-filling.")
+# POLICY REVERSED (v23): delta=0 is now supervised on ALL stations, and that
+# is deliberate, not a leak. The old restriction meant a visible station's
+# delta=0 output received ZERO gradient — an untrained free parameter that
+# produced the horizon_sensitivity instability and made ctx_ratio meaningless.
+# Supervising the copy is not leakage: the target is one of the model's own
+# INPUTS for that station, not hidden information. (Leakage means the model
+# sees data it would not have at inference; a visible station's last
+# observation is precisely what it does have.)
+check("delta=0 supervision is uniform across stations (v23 policy)",
+      "if k == 0 and delta_steps[0, 0].item() == 0" not in mae_src
+      and "_has_masked" in mae_src,
+      "The old gate `if k == 0 and delta_steps[0,0].item() == 0` must stay\n"
+      "gone. If it reappears, visible stations lose their delta=0 gradient\n"
+      "again — see report/meeting-update.md for the v20 post-mortem.")
 
 check("input_context pathway is gone (v15)",
       "input_context" not in code("model/encoder.py")
@@ -233,6 +240,20 @@ for n, d in WARN:
 for n, d in FAIL:
     print(f"  FAIL  {n}")
     print(f"        {d.strip().splitlines()[0] if d else ''}")
-if FAIL:
-    raise SystemExit(1)
-print("\nNo leakage found in the audited paths.")
+if not FAIL:
+    print("\nNo leakage found in the audited paths.")
+
+
+# ── pytest entry point ──────────────────────────────────────────────────────
+# The checks above run at import time (they are cheap, torch-free static
+# analysis). pytest collects this function; a plain `python` run takes the
+# __main__ branch. SystemExit must NOT be raised at module level — pytest
+# imports this file during collection, and an import-time exit aborts the
+# ENTIRE session as INTERNALERROR instead of reporting one failed test.
+
+def test_no_leakage_in_audited_paths():
+    assert not FAIL, "leakage-audit failures: " + "; ".join(n for n, _ in FAIL)
+
+
+if __name__ == "__main__":
+    raise SystemExit(1 if FAIL else 0)

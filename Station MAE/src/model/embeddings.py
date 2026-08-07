@@ -588,15 +588,21 @@ class DeltaTimeEmbedding(nn.Module):
         self,
         d_model:      int   = 128,
         fourier_dim:  int   = DELTA_FOURIER_DIM,
-        # lambda_min was 1/6 h and produced a PROVABLY CONSTANT feature pair.
-        # The fixed_grid horizons are multiples of delta_grid_stride = 3 steps
-        # = 0.5 h, so at lambda = 1/6 h every lead time is an exact integer
-        # number of wavelengths: cos(2*pi*k) = 1, sin(2*pi*k) = 0 for all k.
-        # Two of sixteen features carried zero information for every input the
-        # model will ever see. 1.0 h is the Nyquist wavelength of a 0.5 h grid
-        # — the shortest that still varies across horizons.
-        # Keep lambda_min >= 2 * (delta_grid_stride * 10 min) if that changes.
-        lambda_min:   float = 1.0,           # Nyquist for the 0.5 h delta grid
+        # lambda_min was 1/6 h and produced a PROVABLY CONSTANT feature pair:
+        # fixed_grid horizons are multiples of 0.5 h, so every lead time was an
+        # exact integer number of wavelengths (cos = 1, sin = 0 always).
+        #
+        # The first correction moved it to 1.0 h — the Nyquist wavelength of
+        # the 0.5 h grid — which was HALF wrong: at exactly Nyquist the cosine
+        # alternates +-1 but the SINE is identically zero (sin(pi*k) = 0 for
+        # every integer k), so one of the two channels stayed dead. Caught by
+        # tests/test_embedding_numerics.py on the first torch run.
+        #
+        # lambda_min must sit STRICTLY ABOVE Nyquist. 1.25 h gives phase steps
+        # of 144 degrees on the 0.5 h grid — a 5-point cycle where both cos and
+        # sin vary — and is verified alive on the 10-min grid too (random-delta
+        # mode). Keep lambda_min > 2 * (delta_grid_stride * 10 min), never =.
+        lambda_min:   float = 1.25,          # strictly above the 0.5 h-grid Nyquist
         lambda_max:   float = 8.0,           # 8 hours — buffer beyond 6 h max horizon
         step_size_h:  float = 1.0 / 6.0,    # each step = 10 minutes = 1/6 h
         dropout:      float = 0.0,
@@ -687,17 +693,23 @@ class StepIndexEmbedding(nn.Module):
         super().__init__()
         assert fourier_dim % 2 == 0, "fourier_dim must be even"
         n_wl = fourier_dim // 2
-        # Log-spaced wavelengths in step counts: 2 steps (Nyquist) → max_steps.
+        # Log-spaced wavelengths in step counts: 2.5 steps → max_steps.
         #
         # The lower bound was 1.0 and produced a PROVABLY CONSTANT feature
         # pair: the input is an INTEGER step index k, so at lambda = 1 every
-        # input gives cos(2*pi*k) = 1 and sin(2*pi*k) = 0. Two of thirty-two
-        # features were a fixed (1, 0) for every token the model has ever
-        # seen — dead parameters plus a constant offset, the same defect class
-        # as the removed var_type_embedding. 2 steps is the Nyquist wavelength
-        # of an integer grid: the shortest that can vary at all.
+        # input gives cos(2*pi*k) = 1 and sin(2*pi*k) = 0 — the same defect
+        # class as the removed var_type_embedding.
+        #
+        # The first correction moved it to 2.0 (Nyquist), which was HALF
+        # wrong: at exactly Nyquist cos(pi*k) alternates +-1 but sin(pi*k) is
+        # identically ZERO — the sine channel stayed dead. Caught by
+        # tests/test_embedding_numerics.py on the first torch run.
+        #
+        # lambda_min must sit STRICTLY ABOVE Nyquist: 2.5 steps gives phase
+        # increments of 144 degrees — a 5-point cycle where both channels
+        # vary. Verified: all 32 features alive over the used range 0..107.
         lambdas = torch.exp(
-            torch.linspace(math.log(2.0), math.log(float(max_steps)), n_wl)
+            torch.linspace(math.log(2.5), math.log(float(max_steps)), n_wl)
         )
         self.register_buffer("lambdas", lambdas)   # (n_wl,)
 
@@ -764,6 +776,35 @@ class _CenteredMLP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = F.gelu(self.l1(x)) - F.gelu(self.l1.bias)
         return self.l2(h)
+
+
+class _CenteredPLR(nn.Module):
+    """
+    GELU(lin(feat)) − GELU(lin(feat₀)): centres the PLR/fourier value
+    embedding so that e(0) = 0 exactly — the same treatment _CenteredMLP
+    gives the MLP mode, for the same reason.
+
+    Without it the fourier branch carried a token-independent constant of
+    1.11x the signal std (measured at init, tests/test_token_balance.py):
+    at x = 0 the PLR features are [x=0, cos(0)=1 ... , sin(0)=0 ...], so
+    GELU(lin(·)) of that fixed vector was added identically to EVERY token —
+    the third instance of the uncentred-constant defect in this project,
+    after var_type_embedding and the uncentred v18 MLP.
+
+    feat₀ is independent of the wavelengths (cos(0) = 1 for any λ), so it is
+    a fixed non-persistent buffer. Subtracting a constant does not change the
+    variance across tokens, so VALUE_INIT_GAIN's calibration is unaffected,
+    and the representable set is unchanged (a bias absorbs the shift).
+    """
+
+    def __init__(self, lin: nn.Linear, n_values: int, k: int = VALUE_FOURIER_K):
+        super().__init__()
+        self.lin = lin
+        f0 = torch.tensor([0.0] + [1.0] * k + [0.0] * k).repeat(n_values)
+        self.register_buffer("feat0", f0, persistent=False)
+
+    def forward(self, feat: torch.Tensor) -> torch.Tensor:
+        return F.gelu(self.lin(feat)) - F.gelu(self.lin(self.feat0))
 
 
 class VariableProjection(nn.Module):
@@ -927,7 +968,8 @@ class VariableProjection(nn.Module):
                     if value_embedding == "fourier":
                         b = VALUE_INIT_GAIN / math.sqrt(lin.in_features)
                         nn.init.uniform_(lin.weight, -b, b); nn.init.zeros_(lin.bias)
-                        mods.append(nn.Sequential(lin, nn.GELU()))
+                        # centred like the slot maps — same uncentred-GELU defect
+                        mods.append(_CenteredPLR(lin, n))
                     else:
                         nn.init.uniform_(lin.weight, -1.0, 1.0); nn.init.zeros_(lin.bias)
                         mods.append(lin)
@@ -993,7 +1035,8 @@ class VariableProjection(nn.Module):
                     bound = VALUE_INIT_GAIN / math.sqrt(lin.in_features)
                     nn.init.uniform_(lin.weight, -bound, bound)
                     nn.init.zeros_(lin.bias)
-                    maps.append(nn.Sequential(lin, nn.GELU()))
+                    # centred: e(0) = 0 exactly, see _CenteredPLR
+                    maps.append(_CenteredPLR(lin, n))
             self.slot_maps = nn.ModuleList(maps)
             if value_embedding == "fourier":
                 self.register_buffer(
