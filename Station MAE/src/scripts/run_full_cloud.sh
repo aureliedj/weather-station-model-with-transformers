@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v27"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v28"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -100,7 +100,6 @@ EXCLUDE="--exclude_stations PFA"   # station 110 (PFA) — insufficient historic
 # Uniform patching: P consecutive 10-min steps become ONE encoder token.
 #   P=1  raw       72 positions -> 5,616 tokens  (~273 GFLOP/pass)  no loss, slow
 #   P=3  30-min    24 positions -> 1,872 tokens  (~48 GFLOP)        <- current
-#   P=6  hourly    12 positions ->   936 tokens  (~19 GFLOP)        = v14
 # P=3 keeps a 30-min token, so the +30 min forecast is one token ahead rather
 # than half a token as it was with v14's hourly patches — the "hourly patches
 # starve the short lead" diagnosis — while costing ~6x less than raw.
@@ -320,8 +319,8 @@ DELTA0=""                                        # <- v23: uniform (default)
 # nothing and the spatial machinery is not earning its cost — which is the
 # take-home message either way. Compare the per-lead curves and the error
 # TAILS, not just the means.
-SPATIAL=""                                         # <- full axial (default)
-# SPATIAL="--no_spatial_attn"                      # <- station-independent arm
+#SPATIAL=""                                         # <- full axial (default)
+SPATIAL="--no_spatial_attn"                      # <- station-independent arm
 DIRECT=""                                          # <- v23 keeps the decoder
 # ANCHOR="" ; DIRECT="--direct_head --readout last"   # <- v22 arm
 # DIRECT=""                                        # <- v20: keep the query decoder
@@ -618,7 +617,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v27-clean-embeddings${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v28${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
