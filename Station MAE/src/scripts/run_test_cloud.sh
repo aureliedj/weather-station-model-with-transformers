@@ -36,14 +36,33 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 # from it, so they cannot drift apart — editing one and forgetting the other
 # previously produced a run that loaded v11 while writing into test_results/v12.
 #
-#   RUN_NAME    checkpoint directory              notes
-#   v20         checkpoints/full_run_cloud_v20    residual head + station_state  ← current
-#   v19         checkpoints/full_run_cloud_v19    v17 + MLP value embedding
-#   v17         checkpoints/full_run_cloud_v17    token rebalance (0.04% -> 22%)
-#   v15         checkpoints/full_run_cloud_v15    patch-3 tokens, no residual
-#   v14         checkpoints/full_run_cloud_v14    patch-6, input-context decoder
-#   v13         checkpoints/full_run_cloud_v13    pre-audit-fix architecture
-#   v12/v11/v9  checkpoints/...                   older Huber / NLL runs
+#   RUN_NAME    checkpoint directory                notes
+#   v27         checkpoints/full_run_cloud_v27      v26 config, CLEAN embeddings.py
+#                                                    (final Nyquist fixes + wavelength
+#                                                    placement + sharing, all landed) ← current
+#   v26.1       test_results/full_run_cloud_v26.1   shared emb + temporal wavelength
+#                                                    fix, but step/delta_emb still at
+#                                                    the half-wrong intermediate Nyquist
+#                                                    value (2.0/1.0, not 2.5/1.25) —
+#                                                    saved OUTSIDE checkpoints/, see below
+#   v26-res     test_results/full_run_cloud_v26-res shared-embedding fix only; predates
+#                                                    every wavelength/Nyquist fix —
+#                                                    saved OUTSIDE checkpoints/, see below
+#   v20         checkpoints/full_run_cloud_v20      residual head + station_state
+#   v19         checkpoints/full_run_cloud_v19      v17 + MLP value embedding
+#   v17         checkpoints/full_run_cloud_v17      token rebalance (0.04% -> 22%)
+#   v15         checkpoints/full_run_cloud_v15      patch-3 tokens, no residual
+#   v14         checkpoints/full_run_cloud_v14      patch-6, input-context decoder
+#   v13         checkpoints/full_run_cloud_v13      pre-audit-fix architecture
+#   v12/v11/v9  checkpoints/...                     older Huber / NLL runs
+#
+# v26-res and v26.1 were saved into test_results/full_run_cloud_<name>/ instead
+# of checkpoints/full_run_cloud_<name>/ (that's where run_full_cloud.sh's
+# SAVE_DIR actually writes). CHECKPOINT below is always derived from RUN_NAME
+# via checkpoints/full_run_cloud_${RUN_NAME}/best.ckpt, so evaluating either of
+# those two needs the .ckpt files moved/copied into
+# checkpoints/full_run_cloud_<name>/ first — there's no RUN_NAME value that
+# reaches test_results/ as-is.
 #
 # Everything structural is read from the checkpoint's saved cfg — including,
 # since this revision, value_embedding / static_in_token / direct_head. Those
@@ -59,7 +78,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   (that silent drop is what invalidated every v9–v13 test number). To
 #   evaluate an old run, check out the commit that trained it:
 #       git checkout <commit>  &&  bash src/scripts/run_test_cloud.sh
-RUN_NAME="v26-res"
+RUN_NAME="v27"
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
