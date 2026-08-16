@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v29"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v30-nll"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -319,8 +319,8 @@ DELTA0=""                                        # <- v23: uniform (default)
 # nothing and the spatial machinery is not earning its cost — which is the
 # take-home message either way. Compare the per-lead curves and the error
 # TAILS, not just the means.
-#SPATIAL=""                                         # <- full axial (default)
-SPATIAL="--no_spatial_attn"                      # <- station-independent arm
+SPATIAL=""                                          # <- v27/v30: full axial (default)
+#SPATIAL="--no_spatial_attn"                      # <- v28/v29 station-independent arm
 DIRECT=""                                          # <- v23 keeps the decoder
 # ANCHOR="" ; DIRECT="--direct_head --readout last"   # <- v22 arm
 # DIRECT=""                                        # <- v20: keep the query decoder
@@ -333,6 +333,48 @@ DIRECT=""                                          # <- v23 keeps the decoder
 # tokens, redrawn every step. Both index groups are now sorted, so the ORDER is
 # deterministic while WHICH stations are masked stays random. At mask_ratio 0
 # the visible set is exactly arange(N). See tests/test_station_order.py.
+
+# ── Loss family: Huber (default) or heteroscedastic Gaussian NLL (v30) ───────
+# v30 = v27's EXACT configuration with only the loss family changed, so the
+# comparison against v27's numbers isolates the loss.
+#
+#   NLL_v = 0.5 x ( err^2 * exp(-log_var_v) + log_var_v )
+#
+# The decoder grows a second linear head (decoder.log_var_head) predicting
+# log sigma^2 per variable per station per horizon. This is the classic
+# heteroscedastic regression setup (Nix & Weigend 1994; Kendall & Gal 2017,
+# arXiv:1703.04977), last used in this project by v9.
+#
+# WHY IT IS WORTH RE-RUNNING NOW. Every current model emits a bare point
+# forecast, so nothing distinguishes "0.4 m/s error because the weather is
+# calm and predictable" from "0.4 m/s error because this site is chaotic".
+# The station analysis showed error is dominated by SITE, not architecture
+# (Spearman 0.96 between v27 and the LSTM station rankings) — a variance head
+# lets the model SAY which sites and which lead times it cannot resolve,
+# which is a more useful deliverable than another 1% of MAE.
+#
+# SAFETY NOTES on this implementation (verified in model/mae.py):
+#   * log_var is clamped to [-10, 10] every step, so sigma^2 cannot collapse
+#     to 0 (infinite loss) or explode.
+#   * decoder.log_var_head is initialised to ZERO weight AND zero bias, so
+#     sigma^2 = exp(0) = 1 at step 0 and the NLL starts numerically identical
+#     to 0.5*MSE. No warmup schedule on the variance is needed.
+#   * KNOWN RISK: NLL is L2-like in the residual, whereas the Huber(delta=1)
+#     baseline caps the gradient of large errors. Wind has heavy tails and is
+#     ~70% of the error budget, so v30 may trade wind MAE for calibration.
+#     The variance head partly absorbs this (it can widen sigma on noisy
+#     variables instead of chasing the outlier) — that is the thing to check.
+#   * val/overall_mae still monitors the MEAN, so early stopping and
+#     checkpoint selection stay comparable with v27.
+#
+# Evaluation needs NO flag: test.py detects the head from the WEIGHTS
+# (decoder.log_var_head.*) rather than the cfg, and engine/evaluate.py's
+# collect_predictions() then stores log_var alongside preds in predictions.pt.
+# Recover the standard deviation with  sigma = exp(0.5 * log_var), in
+# per-station normalised units — multiply by obs_stats["std"][station, var]
+# for physical units.
+NLL="--nll_loss"                                 # <- v30: Gaussian NLL + sigma head
+# NLL=""                                         # <- v27/v28/v29: Huber(delta=1)
 
 RESIDUAL="--residual_head"                       # <- v20/v26: y(t0) added outside attention
 # RESIDUAL=""                                        # <- v23: REMOVED. The anchor
@@ -582,7 +624,7 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0 \
+    --mask_ratio       0.5 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.1 \
@@ -608,6 +650,7 @@ python main.py \
     $OBS_ENCODER \
     $STATIC \
     $RESIDUAL \
+    $NLL \
     $ANCHOR \
     $SPATIAL \
     $DIRECT \
@@ -617,7 +660,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v29${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v30-nll${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"

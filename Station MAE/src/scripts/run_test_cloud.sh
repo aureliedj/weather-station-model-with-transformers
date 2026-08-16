@@ -37,6 +37,12 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 # previously produced a run that loaded v11 while writing into test_results/v12.
 #
 #   RUN_NAME    checkpoint directory                notes
+#   v30-nll     checkpoints/full_run_cloud_v30-nll  v27 config + Gaussian NLL loss;
+#                                                    decoder also predicts log sigma^2,
+#                                                    saved as log_var in predictions.pt
+#                                                    (sigma = exp(0.5*log_var), normalised)
+#   v29         checkpoints/full_run_cloud_v29      no spatial attn, trained MR0.0
+#   v28         checkpoints/full_run_cloud_v28      no spatial attn, trained MR0.5
 #   v27         checkpoints/full_run_cloud_v27      v26 config, CLEAN embeddings.py
 #                                                    (final Nyquist fixes + wavelength
 #                                                    placement + sharing, all landed) ← current
@@ -112,11 +118,17 @@ if not cfg:
     raise SystemExit(0)
 print(f"[preflight] epoch {c.get('epoch','?')}, step {c.get('global_step','?')}")
 for k in ("d_model", "enc_layers", "dec_layers", "temporal_patch",
-          "factorised_encoder", "temporal_window", "mask_ratio",
-          "value_embedding", "wind_encoder", "static_in_token",
-          "residual_head", "direct_head", "readout"):
+          "factorised_encoder", "encoder_spatial_attn", "temporal_window",
+          "mask_ratio", "value_embedding", "wind_encoder", "static_in_token",
+          "residual_head", "direct_head", "readout", "use_nll_loss"):
     if k in cfg:
         print(f"[preflight]   {k:20s} {cfg[k]}")
+# The uncertainty head is detected from the WEIGHTS, not the cfg key (the cfg
+# key is unreliable on v9-era runs) — mirror test.py's own check here so the
+# banner cannot disagree with what actually gets built.
+_sd = c.get("state_dict", {})
+_has_sigma = any(k.endswith("decoder.log_var_head.weight") for k in _sd)
+print(f"[preflight]   sigma head           {'PRESENT — log_var will be saved in predictions.pt' if _has_sigma else 'absent (point predictions only)'}")
 if cfg.get("direct_head"):
     print("[preflight] direct_head — only mask ratio 0.0 will be evaluated")
 PYEOF
