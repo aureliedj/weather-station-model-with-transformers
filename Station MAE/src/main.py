@@ -206,6 +206,14 @@ def parse_args() -> argparse.Namespace:
                         "instead of two independent ones, so the encoder can "
                         "form speed and direction directly. Safe: the u and v "
                         "masks are identical in 100%% of station-samples.")
+    p.add_argument("--station_local_decoder", action="store_true",
+                   help="Make the DECODER station-independent: each station's "
+                        "Delta-queries attend only to one another and cross-attend "
+                        "only to that station's own encoder tokens. Combined with "
+                        "--no_spatial_attn this gives a fully station-blind model "
+                        "that still uses the Delta-query decoder. Requires "
+                        "--mask_ratio 0, since a masked station has no encoder "
+                        "tokens to attend to.")
     p.add_argument("--no_spatial_attn",     action="store_true",
                    help="Remove the spatial sub-layer from every factorised encoder "
                         "block: each station is encoded from its own temporal window "
@@ -800,6 +808,7 @@ def main() -> None:
         value_embedding=args.value_embedding,
         wind_pair=((3, 4) if args.wind_encoder else None),
         encoder_spatial_attn=not args.no_spatial_attn,
+        station_local_decoder=args.station_local_decoder,
         static_in_token=args.static_in_token,
         query_anchor=args.query_anchor,
         direct_head=args.direct_head,
@@ -970,6 +979,7 @@ def main() -> None:
         "masked_only_loss":    args.masked_only_loss,
         "delta0_weight":       args.delta0_weight,
         "use_nll_loss":        args.nll_loss,
+        "station_local_decoder": args.station_local_decoder,
         "use_persist_norm":    args.persist_norm,
         "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,

@@ -184,6 +184,18 @@ def parse_args() -> argparse.Namespace:
                         "ratio; all metrics are computed downstream from the saved "
                         "predictions (Test_Results_Exploration.ipynb). "
                         "--save_predictions caps the window count (0 = ALL).")
+    p.add_argument("--seed",              type=int, default=42,
+                   help="Seed for the EVALUATION-time station mask. The mask at "
+                        "mask_ratio>0 is drawn from the global RNG inside "
+                        "StationMAEEncoder._mask_stations(); without a fixed seed "
+                        "two evaluation runs hide different stations, which makes "
+                        "masked-station comparisons across models unpaired. The "
+                        "RNG is re-seeded once per mask ratio (see the evaluation "
+                        "loop), so a given seed yields the same masked set "
+                        "regardless of which other ratios are evaluated in the "
+                        "same invocation. Reproducibility additionally requires "
+                        "the same --batch_size, --index_mode and --stride, since "
+                        "those change how much randomness each pass consumes.")
     p.add_argument("--seasonal",          action="store_true",
                    help="Compute and save per-season metrics (DJF/MAM/JJA/SON). "
                         "Useful for analysing model behaviour across weather regimes.")
@@ -1214,6 +1226,33 @@ def main() -> None:
             # Override the encoder mask ratio for this evaluation pass
             model.encoder.mask_ratio = _test_mr
             model.eval()
+
+            # ── Fix the station mask ────────────────────────────────────────
+            # _mask_stations() draws torch.rand(B, N) from the GLOBAL RNG on
+            # every forward pass, INCLUDING at mask_ratio 0 (the draw happens
+            # before num_masked is applied). Two consequences, both handled by
+            # re-seeding here rather than once at start-up:
+            #
+            #   1. Without a seed, two evaluation runs hide different stations,
+            #      so masked-station errors cannot be compared pairwise across
+            #      models. Measured previously: 0 of 11,684 windows shared a
+            #      masked set between two runs, mean overlap 49.5% (chance).
+            #   2. Because the mask_ratio 0 pass still consumes randomness,
+            #      seeding only once would make the mr0.50 mask depend on
+            #      whether mr0.00 ran first. Re-seeding per ratio makes each
+            #      pass independent of the others, so `--test_mask_ratios 0.5`
+            #      and `--test_mask_ratios 0.0 0.5` produce the same mr0.50
+            #      masked set.
+            #
+            # Reproducibility still requires the same --batch_size,
+            # --index_mode and --stride: those change the shape and number of
+            # draws, hence the sequence of masks.
+            torch.manual_seed(args.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(args.seed)
+            print(f"  [seed] station mask seeded with {args.seed} "
+                  f"(reproducible at batch_size={args.batch_size}, "
+                  f"index_mode={args.index_mode}, stride={args.stride})")
 
             _mr_tag   = f"mr{_test_mr:.2f}"
             label     = f"{base_label}_{_mr_tag}"

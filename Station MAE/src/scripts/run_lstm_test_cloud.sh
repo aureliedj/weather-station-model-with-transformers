@@ -32,7 +32,17 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"                                       
 # THIS script at the end, so a stale name here would silently re-dump the old
 # checkpoint. Set to lstm-baseline-v1 to regenerate the earlier baseline
 # (its dump already exists under test_results/lstm-baseline-v1/).
-RUN_NAME="lstm-baseline-v2"
+RUN_NAME="lstm-baseline-v1"
+# ^ Set to v1: that is the checkpoint under checkpoints/lstm-baseline-v1/ and the
+#   dump every reported LSTM number comes from. lstm-baseline-v2 has no
+#   checkpoint on disk, so leaving it here would fail at the guard below.
+#
+# NOTE ON THE PER-STATION DENORMALISATION FIX: it does not affect this script.
+# test_lstm.py only writes predictions.pt (normalised values, same schema as the
+# transformer dump); it never calls evaluate_full() or the other metric
+# functions that were fixed. Re-running therefore reproduces the same file.
+# LSTM metrics are computed downstream from predictions.pt, where the
+# per-station inverse transform is applied correctly.
 CHECKPOINT="${PROJ_DIR}/checkpoints/${RUN_NAME}/best.ckpt"
 SAVE_DIR="${PROJ_DIR}/test_results"
 

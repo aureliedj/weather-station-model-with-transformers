@@ -229,6 +229,7 @@ class StationMAEDecoder(nn.Module):
         pos_emb:                  "nn.Module | None" = None,
         station_emb:              "nn.Module | None" = None,
         temporal_emb:             "nn.Module | None" = None,
+        station_local:            bool = False,
     ):
         super().__init__()
 
@@ -237,6 +238,13 @@ class StationMAEDecoder(nn.Module):
         self.use_checkpoint      = use_checkpoint
         self.use_cross_attention = cross_attention
         self.predict_uncertainty = predict_uncertainty
+        # station_local=True folds the station axis into the batch dimension, so
+        # a station's queries attend only to one another and cross-attend only
+        # to THAT station's encoder tokens. Combined with an encoder built with
+        # spatial_attn=False this yields a genuinely station-independent model,
+        # while keeping the Delta-query decoder intact. Requires mask_ratio 0
+        # (a masked station contributes no encoder tokens to attend to).
+        self.station_local       = bool(station_local)
         # W: input window length.  Decoder step indices = W-1 + delta_steps,
         # continuing the encoder's 0..W-1 timeline into future positions.
         self.window_size         = window_size
@@ -520,7 +528,31 @@ class StationMAEDecoder(nn.Module):
                     + step_emb.unsqueeze(1)                         # (B, N, d_model)
             queries = self.query_norm(queries)                      # (B, N, d_model)
 
-            if self.use_cross_attention:
+            if self.use_cross_attention and self.station_local:
+                # Same fold as the multi-delta path, with K = 1: each station
+                # becomes its own attention problem. Without this branch the
+                # single-delta path would still mix stations while the
+                # multi-delta path did not.
+                _WN = encoded_vis.shape[1]
+                if _WN % N != 0:
+                    raise RuntimeError(
+                        f"station_local decoder needs every station present: "
+                        f"encoder returned {_WN} tokens which is not divisible "
+                        f"by N={N}. Train and evaluate with --mask_ratio 0.")
+                _W = _WN // N
+                kv_local = (encoded_vis
+                            .view(B, _W, N, self.d_model)
+                            .permute(0, 2, 1, 3)
+                            .reshape(B * N, _W, self.d_model))
+                h = queries.reshape(B * N, 1, self.d_model)
+                for block in self.blocks:
+                    if self.use_checkpoint and torch.is_grad_enabled():
+                        h = _cp_checkpoint(block, h, kv_local, use_reentrant=False)
+                    else:
+                        h = block(h, kv_local)
+                h = h.reshape(B, N, self.d_model)
+
+            elif self.use_cross_attention:
                 h = queries
                 for block in self.blocks:
                     if self.use_checkpoint and torch.is_grad_enabled():
@@ -561,7 +593,40 @@ class StationMAEDecoder(nn.Module):
             queries_NK  = self.query_norm(queries_NK)
             queries_seq = queries_NK.reshape(B, N * K, self.d_model)   # (B, N*K, d_model)
 
-            if self.use_cross_attention:
+            if self.use_cross_attention and self.station_local:
+                # ── Station-independent decoding ────────────────────────────
+                # Fold the station axis into the batch so each station is a
+                # separate attention problem: its K queries attend only to one
+                # another, and cross-attend only to its OWN W encoder tokens.
+                #
+                # Layouts (verified against encoder.py and the head below):
+                #   encoded_vis : (B, W*N, d)  W-major, station fastest
+                #   queries_NK  : (B, N, K, d) station-major, lead fastest
+                #
+                # Requires every station present: a masked station has no
+                # encoder tokens, so there would be nothing to attend to.
+                _WN = encoded_vis.shape[1]
+                if _WN % N != 0:
+                    raise RuntimeError(
+                        f"station_local decoder needs every station present: "
+                        f"encoder returned {_WN} tokens which is not divisible "
+                        f"by N={N}. Train and evaluate with --mask_ratio 0.")
+                _W = _WN // N
+                kv_local = (encoded_vis
+                            .view(B, _W, N, self.d_model)   # (B, W, N, d)
+                            .permute(0, 2, 1, 3)            # (B, N, W, d)
+                            .reshape(B * N, _W, self.d_model))
+                h = queries_NK.reshape(B * N, K, self.d_model)
+                for block in self.blocks:
+                    if self.use_checkpoint and torch.is_grad_enabled():
+                        h = _cp_checkpoint(block, h, kv_local, use_reentrant=False)
+                    else:
+                        h = block(h, kv_local)
+                # Back to (B, N*K, d) — station-major, lead fastest, exactly the
+                # layout the head and its reshape below already expect.
+                h = h.reshape(B, N * K, self.d_model)
+
+            elif self.use_cross_attention:
                 h = queries_seq
                 for block in self.blocks:
                     if self.use_checkpoint and torch.is_grad_enabled():

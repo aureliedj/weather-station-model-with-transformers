@@ -30,7 +30,7 @@ cd "${SRC_DIR}"                                              # so `python main.p
 # unaffected). Backfill later: wandb sync "$(ls -dt wandb/run-* | head -1)"
 source "${SCRIPT_DIR}/_wandb_preflight.sh"
 
-RUN_NAME="lstm-baseline-v2"
+RUN_NAME="lstm-baseline-v1"
 SAVE_DIR="${PROJ_DIR}/checkpoints/${RUN_NAME}"
 
 EXCLUDE="--exclude_stations PFA"   # same station dropped as the transformer

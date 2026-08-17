@@ -324,8 +324,31 @@ DELTA0=""                                        # <- v23: uniform (default)
 # nothing and the spatial machinery is not earning its cost — which is the
 # take-home message either way. Compare the per-lead curves and the error
 # TAILS, not just the means.
-SPATIAL=""                                          # <- v27/v30: full axial (default)
-#SPATIAL="--no_spatial_attn"                      # <- v28/v29 station-independent arm
+SPATIAL=""                                          # <- v27/v30/v31: full axial (default)
+#SPATIAL="--no_spatial_attn"                      # <- v32: station-blind arm
+
+# ── v32: fully station-blind transformer, Delta-query decoder KEPT ───────────
+# --no_spatial_attn alone is NOT station-independent: it removes the encoder's
+# spatial sub-layer, but the decoder's queries still attend to one another
+# across stations AND cross-attend to every station's encoder tokens. That is
+# why the earlier v28/v29 arms could not answer "do stations inform each other".
+#
+# --station_local_decoder closes both remaining paths by folding the station
+# axis into the batch: each station's K queries attend only to one another and
+# cross-attend only to that station's own W encoder tokens. The Delta-query
+# mechanism, the shared embeddings and the residual head are all unchanged, so
+# v32 differs from v31 in spatial information ONLY -- not in the prediction
+# head, as the --direct_head alternative would.
+#
+# For v32 set:
+#     SPATIAL="--no_spatial_attn"
+#     DECODER_LOCAL="--station_local_decoder"
+#     --mask_ratio 0        (a masked station has no encoder tokens to attend to)
+#
+# Isolation is enforced by tests/test_station_local_decoder.py, which perturbs
+# one station and requires every other station's prediction to be bit-identical.
+DECODER_LOCAL=""                                   # <- v27/v30/v31: decoder sees all stations
+#DECODER_LOCAL="--station_local_decoder"          # <- v32: decoder is station-local
 DIRECT=""                                          # <- v23 keeps the decoder
 # ANCHOR="" ; DIRECT="--direct_head --readout last"   # <- v22 arm
 # DIRECT=""                                        # <- v20: keep the query decoder
@@ -658,6 +681,7 @@ python main.py \
     $NLL \
     $ANCHOR \
     $SPATIAL \
+    $DECODER_LOCAL \
     $DIRECT \
     $DELTA0 \
     $ENCODER \

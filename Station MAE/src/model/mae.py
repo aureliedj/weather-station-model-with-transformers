@@ -145,6 +145,7 @@ class StationMAE(nn.Module):
         "readout":            "readout",
         "residual_head":      "residual_head",
         "cross_attn_decoder": "cross_attention_decoder",
+        "station_local_decoder": "station_local_decoder",
         "drop_path_rate":     "drop_path_rate",
         "masked_only_loss":   "masked_only_loss",
         "use_persist_norm":   "use_persist_norm",
@@ -204,6 +205,7 @@ class StationMAE(nn.Module):
         readout:                 str   = "last",         # "last" | "mean"
         num_horizons:            int   = 13,
         cross_attention_decoder: bool  = False,
+        station_local_decoder:   bool  = False,   # decoder attends within one station only
         drop_path_rate:          float = 0.0,
         masked_only_loss:         bool  = False,
         residual_head:            bool  = False,        # v15: ŷ = y(t0) + f(·)
@@ -418,6 +420,7 @@ class StationMAE(nn.Module):
             fourier_dim=fourier_dim,
             use_checkpoint=use_checkpoint,
             cross_attention=cross_attention_decoder,
+            station_local=station_local_decoder,
             drop_path_rate=drop_path_rate,
             predict_uncertainty=use_nll_loss,
             window_size=window_size,

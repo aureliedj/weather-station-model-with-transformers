@@ -84,7 +84,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   (that silent drop is what invalidated every v9–v13 test number). To
 #   evaluate an old run, check out the commit that trained it:
 #       git checkout <commit>  &&  bash src/scripts/run_test_cloud.sh
-RUN_NAME="v30-nll"
+RUN_NAME="v27"
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
@@ -192,6 +192,51 @@ MASK_RATIOS="0.0 0.5"   # mr0.00 FIRST for v20. The question v20 exists to
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 
+# ── Predictions-only, or full metrics? ───────────────────────────────────────
+# --predictions_only dumps predictions.pt and RETURNS IMMEDIATELY (test.py:1229),
+# before evaluate_full() / evaluate_gap_filling() / compute_seasonal_metrics()
+# are ever called.
+#
+# THIS MATTERS AFTER THE PER-STATION DENORMALISATION FIX. That fix changed the
+# METRIC functions, not the prediction dump: predictions.pt stores NORMALISED
+# values and is byte-for-byte unaffected. Re-running with --predictions_only
+# therefore reproduces the same file and gains nothing.
+#
+# To actually exercise the fix, run with PREDICTIONS_ONLY=0. That computes
+# physical-unit metrics with each station's own std (instead of the network
+# average), and additionally writes:
+#     delta_variable_rmse_matrix.csv   per-variable x lead-time RMSE
+#     per_station_metrics.csv          per-station metrics for map plots
+# Expect wind to change by ~6-7% and the other variables by under 1%;
+# normalised metrics are identical either way.
+#
+#   PREDICTIONS_ONLY=1  dump only   (fast; metrics computed downstream in the notebook)
+#   PREDICTIONS_ONLY=0  full metrics (slower; needed to benefit from the fix)
+PREDICTIONS_ONLY="${PREDICTIONS_ONLY:-0}"
+if [[ "$PREDICTIONS_ONLY" == "1" ]]; then
+    PRED_ONLY_ARG="--predictions_only"
+    echo "[run_test_cloud.sh] mode: predictions-only (metric fix NOT exercised)"
+else
+    PRED_ONLY_ARG=""
+    echo "[run_test_cloud.sh] mode: full metrics (per-station denormalisation)"
+fi
+
+# ── Evaluation-time station mask seed ────────────────────────────────────────
+# The mask at mask_ratio>0 is drawn from the global RNG inside
+# _mask_stations(). test.py re-seeds it ONCE PER MASK RATIO, so:
+#   * two runs with the same SEED hide the same stations -> masked-station
+#     results are directly comparable (paired) across models;
+#   * the mr0.50 mask does not depend on whether mr0.00 ran first in the same
+#     invocation.
+# Use the SAME seed for every model you intend to compare at mask_ratio 0.5.
+# Reproducibility also requires the same BATCH_SIZE, INDEX_MODE and STRIDE.
+#
+# NOTE: the existing dumps were produced BEFORE seeding existed, so their
+# masked sets are arbitrary. Re-running now will not reproduce them; any model
+# whose mr0.50 numbers you want to compare pairwise must be re-evaluated with
+# this seed.
+SEED="${SEED:-42}"
+
 python test.py \
     --data_root        "$DATA_ROOT" \
     --checkpoint       "$CHECKPOINT" \
@@ -201,7 +246,8 @@ python test.py \
     --stride           "$STRIDE" \
     --exclude_stations PFA \
     --test_mask_ratios $MASK_RATIOS \
-    --predictions_only \
+    --seed             "$SEED" \
+    $PRED_ONLY_ARG \
     --save_predictions 0 \
     $GLOBAL_NORM \
     --save_dir         "$SAVE_DIR"
