@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v27"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v31"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 # ⚠ full_run_cloud_v27/ ALREADY CONTAINS best.ckpt + last.ckpt (epoch 40).
 #   With RESUME=1 (the default) a re-launch CONTINUES that run from epoch 40 —
 #   it does NOT retrain from scratch. For a genuinely fresh v27, point
@@ -629,7 +629,7 @@ python main.py \
     --dec_heads        8 \
     --enc_layers       8 \
     --dec_layers       2 \
-    --mask_ratio       0.5 \
+    --mask_ratio       0.0 \
     --temporal_patch   $PATCH \
     --var_weights      1.0 1.0 1.0 1.0 1.0 \
     --dropout          0.1 \
@@ -665,7 +665,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v27${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v30${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
