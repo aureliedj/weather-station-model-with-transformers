@@ -198,6 +198,49 @@ def _wind_dir_deg(u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
     return deg % 360.0
 
 
+def _row_stat(table: torch.Tensor, v: int, station_idx: torch.Tensor) -> torch.Tensor:
+    """
+    Per-row normalisation statistic for variable ``v``.
+
+    Physical-unit metrics must undo the SAME transform the data went through.
+    Observations are z-scored per (station, variable), so the only correct
+    inverse is that station's own mean/std::
+
+        x_phys = x_norm * std[station, v] + mean[station, v]
+
+    This module used to collapse ``std`` to its cross-station mean before
+    converting, which silently mis-scales every station whose spread differs
+    from the network average. The damage is worst for wind, where std spans
+    0.51-7.19 m/s across the 155 stations (a 14x range) against only 1.4x for
+    temperature: measured on v27, the averaged-std shortcut inflated
+    wind-direction MAE from 15.8 deg to 20.3 deg for winds above 3 m/s.
+
+    Args:
+        table:       (N, V) per-station stats, or (V,) global stats.
+        v:           variable column.
+        station_idx: (R,) station index for each row of the flattened arrays.
+
+    Returns:
+        (R,) tensor aligned with the flattened rows.
+
+    Falls back to the cross-station mean for any row whose station index is
+    out of range — that should never happen, but a silent mis-index would
+    corrupt every physical number, so it is guarded and reported rather than
+    trusted.
+    """
+    R = station_idx.shape[0]
+    if table.dim() == 1:                      # global stats — nothing to index
+        return table[v].reshape(1).expand(R)
+
+    n_stats = table.shape[0]
+    col = table[:, v]
+    valid = station_idx < n_stats
+    out = col[station_idx.clamp(max=n_stats - 1)]
+    if not bool(valid.all()):
+        out = torch.where(valid, out, col.mean())
+    return out
+
+
 def _circular_mae_deg(pred_deg: torch.Tensor, true_deg: torch.Tensor) -> float:
     """Mean absolute error on a circular quantity (degrees)."""
     diff = pred_deg - true_deg
@@ -303,6 +346,15 @@ def evaluate_full(
     preds_all   = torch.cat([r["pred"]   for r in records], dim=0)
     targets_all = torch.cat([r["target"] for r in records], dim=0)
     masks_all   = torch.cat([r["mask"]   for r in records], dim=0).bool()
+    # Station index for every flattened row. Each record was reshaped from
+    # (B, N, V) in row-major order, so the station axis cycles fastest:
+    # [n0 … n(N-1)] repeated B times. Without this the per-station
+    # normalisation cannot be inverted correctly (see _row_stat).
+    station_all = torch.cat(
+        [torch.arange(r["N"]).repeat(r["pred"].shape[0] // r["N"])
+         for r in records],
+        dim=0,
+    )
 
     metrics: dict[str, float] = {
         "avg_loss": total_loss / max(n_batches, 1),
@@ -310,14 +362,19 @@ def evaluate_full(
 
     # ── Helper: compute scalar metrics for one (pred, target, mask) slice ──
     def _scalars(p: torch.Tensor, t: torch.Tensor, m: torch.Tensor,
-                 prefix: str, std_scale: float = 1.0) -> None:
-        """Write rmse, mae, bias, r2 into metrics dict under `prefix`."""
+                 prefix: str, std_scale=1.0) -> None:
+        """Write rmse, mae, bias, r2 into metrics dict under `prefix`.
+
+        ``std_scale`` may be a scalar (normalised metrics) or a per-row tensor
+        aligned with ``p`` (physical metrics with per-station stats).
+        """
         if m.sum() == 0:
             for k in ("rmse", "mae", "bias", "r2"):
                 metrics[f"{prefix}_{k}"] = float("nan")
             return
-        pv = p[m] * std_scale
-        tv = t[m] * std_scale
+        sc = std_scale[m] if torch.is_tensor(std_scale) else std_scale
+        pv = p[m] * sc
+        tv = t[m] * sc
         err = pv - tv
         metrics[f"{prefix}_rmse"] = float(err.pow(2).mean().sqrt().item())
         metrics[f"{prefix}_mae"]  = float(err.abs().mean().item())
@@ -349,34 +406,32 @@ def evaluate_full(
         mean_t = obs_stats["mean"].cpu()   # (V,) or (N, V)
         std_t  = obs_stats["std"].cpu()    # (V,) or (N, V)
 
-        # Per-station normalization produces (N, V) stats.
-        # Average over stations for a single representative std per variable
-        # used in physical-unit display (RMSE_phys ≈ RMSE_norm × mean_std).
-        if std_t.dim() == 2:
-            std_per_var  = std_t.mean(dim=0)   # (V,)
-            mean_per_var = mean_t.mean(dim=0)  # (V,)
-        else:
-            std_per_var  = std_t
-            mean_per_var = mean_t
+        # EXACT per-station inverse transform. This used to average std over
+        # stations first, which mis-scales every station whose spread differs
+        # from the network mean — see _row_stat for the measured impact.
+        # _row_stat falls back to the cross-station mean only for rows whose
+        # station is unknown, and for (V,)-shaped global stats.
+        _std_row  = {v: _row_stat(std_t,  v, station_all)
+                     for v in range(NUM_TARGET_VARIABLES)}
+        _mean_row = {v: _row_stat(mean_t, v, station_all)
+                     for v in range(NUM_TARGET_VARIABLES)}
 
         # Per-variable in physical units
         for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
-            std_v = float(std_per_var[v].item())
             _scalars(
                 preds_all[:, v], targets_all[:, v], masks_all[:, v],
                 prefix=var_name,
-                std_scale=std_v,
+                std_scale=_std_row[v],
             )
 
         # Overall physical
         if masks_all.sum() > 0:
             errs_phys = []
             for v in range(NUM_TARGET_VARIABLES):
-                std_v = float(std_per_var[v].item())
                 m = masks_all[:, v]
                 if m.sum() > 0:
                     errs_phys.append(
-                        ((preds_all[m, v] - targets_all[m, v]) * std_v)
+                        ((preds_all[m, v] - targets_all[m, v]) * _std_row[v][m])
                     )
             if errs_phys:
                 e = torch.cat(errs_phys)
@@ -388,16 +443,18 @@ def evaluate_full(
         ui = _IDX.get("wind_u")
         vi = _IDX.get("wind_v")
         if ui is not None and vi is not None:
-            mean_u  = float(mean_per_var[ui].item())
-            std_u   = float(std_per_var[ui].item())
-            mean_v  = float(mean_per_var[vi].item())
-            std_v_w = float(std_per_var[vi].item())
+            # Speed is a distance from the origin and direction is an angle, so
+            # BOTH depend on getting each station's own mean and std right — an
+            # averaged std shears the (u, v) plane and rotates the recovered
+            # direction. This is the single worst-affected metric in the file.
             m_uv = masks_all[:, ui] & masks_all[:, vi]
             if m_uv.sum() > 0:
-                u_pred = preds_all[m_uv, ui]   * std_u + mean_u
-                u_true = targets_all[m_uv, ui] * std_u + mean_u
-                v_pred = preds_all[m_uv, vi]   * std_v_w + mean_v
-                v_true = targets_all[m_uv, vi] * std_v_w + mean_v
+                su, mu = _std_row[ui][m_uv], _mean_row[ui][m_uv]
+                sv, mv = _std_row[vi][m_uv], _mean_row[vi][m_uv]
+                u_pred = preds_all[m_uv, ui]   * su + mu
+                u_true = targets_all[m_uv, ui] * su + mu
+                v_pred = preds_all[m_uv, vi]   * sv + mv
+                v_true = targets_all[m_uv, vi] * sv + mv
 
                 ws_pred = (u_pred.pow(2) + v_pred.pow(2)).sqrt()
                 ws_true = (u_true.pow(2) + v_true.pow(2)).sqrt()
@@ -678,6 +735,11 @@ def evaluate_gap_filling(
     all_targets: list[torch.Tensor] = []
     all_valid:   list[torch.Tensor] = []   # bool — sensor present at target step
     all_stds:    list[torch.Tensor] = []   # (n_masked, 5) per-station stds (or None)
+    all_means:   list[torch.Tensor] = []   # (n_masked, 5) per-station means (or None)
+    # Means are tracked as well as stds because wind speed/direction need the
+    # full affine inverse: speed is a distance from the ORIGIN, so a wrong
+    # offset moves the calm point and rotates the recovered direction. Using a
+    # per-station std with a global mean (the previous behaviour) is still wrong.
 
     for batch in loader:
         x       = batch["x"].to(device)       # (B, W, N, V)
@@ -696,12 +758,16 @@ def evaluate_gap_filling(
         yh_last = x_hours[:, -1]             # (B,)
         delta_z = torch.zeros(B, dtype=torch.long, device=device)
 
-        # Pre-compute per-station stds if obs_stats is (N, V)
+        # Pre-compute per-station stats if obs_stats is (N, V)
         _std_cpu = None
+        _mean_cpu = None
         if obs_stats is not None:
             _s = obs_stats["std"].cpu()
             if _s.dim() == 2:
                 _std_cpu = _s[:, :NUM_TARGET_VARIABLES]   # (N, 5)
+            _m = obs_stats["mean"].cpu()
+            if _m.dim() == 2:
+                _mean_cpu = _m[:, :NUM_TARGET_VARIABLES]  # (N, 5)
 
         for _ in range(n_repeats):
             # Each forward() call samples a fresh random station mask
@@ -724,6 +790,8 @@ def evaluate_gap_filling(
                 # Track exact per-station stds for physical unnormalization
                 if _std_cpu is not None:
                     all_stds.append(_std_cpu[m_idx])                # (N_masked, 5)
+                if _mean_cpu is not None:
+                    all_means.append(_mean_cpu[m_idx])              # (N_masked, 5)
 
     if not all_preds:
         return {"gap_n_masked_evals": 0.0}
@@ -784,6 +852,7 @@ def evaluate_gap_filling(
         # Otherwise fall back to station-mean std.
         if all_stds:
             stds_cat = torch.cat(all_stds, dim=0)   # (total_masked, 5) exact per-station
+            means_cat = (torch.cat(all_means, dim=0) if all_means else None)
             use_per_station = True
         else:
             use_per_station = False
@@ -845,20 +914,26 @@ def evaluate_gap_filling(
         ui   = _IDX.get("wind_u")
         vi_i = _IDX.get("wind_v")
         if ui is not None and vi_i is not None:
-            if use_per_station:
+            if not use_per_station:
                 mean_per_var = mean_t.mean(dim=0) if mean_t.dim() == 2 else mean_t
-            mean_u  = float(mean_per_var[ui].item())
-            mean_v  = float(mean_per_var[vi_i].item())
             m_uv = valid_cat[:, ui] & valid_cat[:, vi_i]
             if m_uv.sum() > 0:
-                # Use element-wise per-station std when available so that stations
-                # far from the mean std are denormalised correctly.
+                # Full per-station affine inverse for BOTH components. Using a
+                # per-station std with a global mean still shifts the origin,
+                # which biases speed and rotates direction.
                 if use_per_station:
                     std_u_vec   = stds_cat[m_uv, ui]
                     std_v_w_vec = stds_cat[m_uv, vi_i]
                 else:
                     std_u_vec   = std_per_var[ui]
                     std_v_w_vec = std_per_var[vi_i]
+                if use_per_station and means_cat is not None:
+                    mean_u = means_cat[m_uv, ui]
+                    mean_v = means_cat[m_uv, vi_i]
+                else:
+                    _mpv = (mean_t.mean(dim=0) if mean_t.dim() == 2 else mean_t)
+                    mean_u = float(_mpv[ui].item())
+                    mean_v = float(_mpv[vi_i].item())
                 u_pred = preds_cat[m_uv, ui]   * std_u_vec   + mean_u
                 u_true = targets_cat[m_uv, ui] * std_u_vec   + mean_u
                 v_pred = preds_cat[m_uv, vi_i] * std_v_w_vec + mean_v
@@ -1282,6 +1357,10 @@ def compute_seasonal_metrics(
         preds_all   = torch.cat([r["pred"]   for r in recs], dim=0)
         targets_all = torch.cat([r["target"] for r in recs], dim=0)
         masks_all   = torch.cat([r["mask"]   for r in recs], dim=0).bool()
+        # Each record is one (sample, horizon) covering all N stations in order,
+        # so the station axis cycles fastest across the concatenation.
+        _N_rec      = recs[0]["pred"].shape[0]
+        station_all = torch.arange(_N_rec).repeat(len(recs))
 
         m: dict[str, float] = {"n_samples": float(len(recs))}
 
@@ -1303,10 +1382,10 @@ def compute_seasonal_metrics(
         # Physical units
         if obs_stats is not None:
             _std = obs_stats["std"].cpu()
-            std_per_var = _std.mean(dim=0) if _std.dim() == 2 else _std
             for v, var_name in enumerate(TARGET_VARIABLE_NAMES):
                 mv  = masks_all[:, v]
-                sv  = float(std_per_var[v].item())
+                # Per-station inverse, not the cross-station average.
+                sv  = _row_stat(_std, v, station_all)[mv]
                 if mv.sum() > 0:
                     err = (preds_all[mv, v] - targets_all[mv, v]) * sv
                     m[f"{var_name}_rmse"] = float(err.pow(2).mean().sqrt().item())

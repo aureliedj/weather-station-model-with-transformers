@@ -53,7 +53,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v30-nll"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v27"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+# ⚠ full_run_cloud_v27/ ALREADY CONTAINS best.ckpt + last.ckpt (epoch 40).
+#   With RESUME=1 (the default) a re-launch CONTINUES that run from epoch 40 —
+#   it does NOT retrain from scratch. For a genuinely fresh v27, point
+#   SAVE_DIR at a new directory (e.g. ..._v27b); RESUME=0 will refuse to start
+#   because best.ckpt is already there, which is the intended guard.
 LOCAL_CACHE="/tmp/station_mae_cache"
 
 # ── WandB ────────────────────────────────────────────────────────────────────
@@ -373,8 +378,8 @@ DIRECT=""                                          # <- v23 keeps the decoder
 # Recover the standard deviation with  sigma = exp(0.5 * log_var), in
 # per-station normalised units — multiply by obs_stats["std"][station, var]
 # for physical units.
-NLL="--nll_loss"                                 # <- v30: Gaussian NLL + sigma head
-# NLL=""                                         # <- v27/v28/v29: Huber(delta=1)
+# NLL="--nll_loss"                               # <- v30: Gaussian NLL + sigma head
+NLL=""                                           # <- v27/v28/v29: Huber(delta=1)
 
 RESIDUAL="--residual_head"                       # <- v20/v26: y(t0) added outside attention
 # RESIDUAL=""                                        # <- v23: REMOVED. The anchor
@@ -660,7 +665,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v30-nll${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v27${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
