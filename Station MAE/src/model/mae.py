@@ -407,6 +407,16 @@ class StationMAE(nn.Module):
                 f"must be visible; got mask_ratio={mask_ratio}. Use "
                 "--mask_ratio 0, or drop --direct_head.")
             self.direct_proj = nn.Linear(d_model, self.num_horizons * num_target_vars)
+        self.station_local_decoder = bool(station_local_decoder)
+        if self.station_local_decoder:
+            # Same requirement as direct_head, same reason: the station-local
+            # decoder attends to each station's OWN encoder tokens, so a station
+            # dropped by masking would have nothing to attend to.
+            assert mask_ratio == 0.0, (
+                "station_local_decoder folds the station axis into the batch, so "
+                "every station must contribute encoder tokens; got "
+                f"mask_ratio={mask_ratio}. Use --mask_ratio 0, or drop "
+                "--station_local_decoder.")
         self.num_target_vars_ = num_target_vars
 
         self.decoder = StationMAEDecoder(
@@ -565,6 +575,19 @@ class StationMAE(nn.Module):
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
         encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
+        # station_local decoder: every station must still be present. A
+        # divisibility check inside the decoder is NOT sufficient — with
+        # N_vis = N/2 the token count can still divide by N and the reshape
+        # then silently uses the wrong temporal length (caught by
+        # tests/test_station_local_decoder.py). masked_idx is the direct signal.
+        if self.station_local_decoder and masked_idx is not None \
+                and masked_idx.numel() > 0:
+            raise RuntimeError(
+                f"station_local_decoder needs every station present, but "
+                f"{masked_idx.shape[-1]} of {x.shape[2]} stations were masked "
+                f"(encoder.mask_ratio={self.encoder.mask_ratio}). Set "
+                f"mask_ratio=0 for this model.")
+
         decoder_out = self.decoder(
             encoded, spatial, y_hours, delta_steps,
             station_masked=self._station_masked(
@@ -653,6 +676,19 @@ class StationMAE(nn.Module):
                 f"max_delta // delta_grid_stride + 1.")
             preds_all, log_var_all = self._direct_predict(encoded, x.shape[2]), None
         else:
+            # station_local decoder: every station must still be present. A
+            # divisibility check inside the decoder is NOT sufficient — with
+            # N_vis = N/2 the token count can still divide by N and the reshape
+            # then silently uses the wrong temporal length (caught by
+            # tests/test_station_local_decoder.py). masked_idx is the direct signal.
+            if self.station_local_decoder and masked_idx is not None \
+                    and masked_idx.numel() > 0:
+                raise RuntimeError(
+                    f"station_local_decoder needs every station present, but "
+                    f"{masked_idx.shape[-1]} of {x.shape[2]} stations were masked "
+                    f"(encoder.mask_ratio={self.encoder.mask_ratio}). Set "
+                    f"mask_ratio=0 for this model.")
+
             decoder_out = self.decoder(
                 encoded, spatial, y_hours, delta_steps,
                 station_masked=self._station_masked(
@@ -775,6 +811,19 @@ class StationMAE(nn.Module):
         """
         self.eval()
         encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
+        # station_local decoder: every station must still be present. A
+        # divisibility check inside the decoder is NOT sufficient — with
+        # N_vis = N/2 the token count can still divide by N and the reshape
+        # then silently uses the wrong temporal length (caught by
+        # tests/test_station_local_decoder.py). masked_idx is the direct signal.
+        if self.station_local_decoder and masked_idx is not None \
+                and masked_idx.numel() > 0:
+            raise RuntimeError(
+                f"station_local_decoder needs every station present, but "
+                f"{masked_idx.shape[-1]} of {x.shape[2]} stations were masked "
+                f"(encoder.mask_ratio={self.encoder.mask_ratio}). Set "
+                f"mask_ratio=0 for this model.")
+
         decoder_out = self.decoder(
             encoded, spatial, y_hours, delta_steps,
             station_masked=self._station_masked(

@@ -533,6 +533,13 @@ class StationMAEDecoder(nn.Module):
                 # becomes its own attention problem. Without this branch the
                 # single-delta path would still mix stations while the
                 # multi-delta path did not.
+                # NOTE: divisibility alone is NOT a sufficient check. With
+                # N_vis = N/2 the token count T*N_vis can still divide by N,
+                # and the reshape then silently uses a wrong temporal length
+                # (T/2) while mixing stations. StationMAE therefore rejects any
+                # masked station BEFORE calling the decoder, using masked_idx.
+                # This check remains only as a last-resort shape guard for
+                # callers that use the decoder directly.
                 _WN = encoded_vis.shape[1]
                 if _WN % N != 0:
                     raise RuntimeError(
@@ -605,6 +612,13 @@ class StationMAEDecoder(nn.Module):
                 #
                 # Requires every station present: a masked station has no
                 # encoder tokens, so there would be nothing to attend to.
+                # NOTE: divisibility alone is NOT a sufficient check. With
+                # N_vis = N/2 the token count T*N_vis can still divide by N,
+                # and the reshape then silently uses a wrong temporal length
+                # (T/2) while mixing stations. StationMAE therefore rejects any
+                # masked station BEFORE calling the decoder, using masked_idx.
+                # This check remains only as a last-resort shape guard for
+                # callers that use the decoder directly.
                 _WN = encoded_vis.shape[1]
                 if _WN % N != 0:
                     raise RuntimeError(

@@ -126,12 +126,43 @@ def test_station_order_is_preserved():
             f"were blanked — station ordering or isolation is wrong")
 
 
-def test_requires_all_stations_present():
-    """A masked station has no encoder tokens; the decoder must say so clearly."""
+def test_requires_all_stations_present_at_construction():
+    """A real run sets mask_ratio up front; reject it there."""
+    with pytest.raises(AssertionError, match="every station must contribute"):
+        StationMAE(
+            d_model=D_MODEL, enc_heads=2, dec_heads=2, enc_layers=2, dec_layers=2,
+            window_size=W, temporal_patch=P, mask_ratio=0.5,
+            factorised_encoder=True, encoder_spatial_attn=False,
+            cross_attention_decoder=True, station_local_decoder=True,
+            num_horizons=K,
+        )
+
+
+def test_requires_all_stations_present_at_forward():
+    """
+    mask_ratio can also be changed AFTER construction (test.py does exactly this
+    when sweeping mask ratios). The forward pass must still refuse.
+
+    This case is why a divisibility check inside the decoder is not enough:
+    with N=6 and mask_ratio 0.5 the encoder returns T*3 = 12 tokens, and
+    12 % 6 == 0, so the reshape would silently succeed with a halved temporal
+    length instead of raising.
+    """
     model = _build(station_local=True)
     model.encoder.mask_ratio = 0.5                 # forced after construction
     with pytest.raises(RuntimeError, match="every station present"):
         _predict(model, _batch())
+
+
+def test_divisibility_alone_would_not_have_caught_it():
+    """
+    Documents the trap explicitly, so nobody 'simplifies' the guard back to a
+    divisibility test. With these dimensions the bad reshape is well-formed.
+    """
+    T = W // P
+    n_vis = N - int(N * 0.5)
+    assert (T * n_vis) % N == 0, "the dimensions no longer demonstrate the trap"
+    assert (T * n_vis) // N != T, "the wrong temporal length must differ from T"
 
 
 def test_cfg_roundtrip_preserves_the_flag():

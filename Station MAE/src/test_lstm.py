@@ -120,6 +120,15 @@ def main() -> None:
                         use_mask_feature=g("use_mask_feature", False))
     sd = {k.removeprefix("model."): v for k, v in ckpt["state_dict"].items()
           if k.startswith("model.")}
+    # `horizon_steps` is a persistent buffer added after some checkpoints were
+    # trained (see lstm_baseline.py) — older checkpoints simply don't have it.
+    # `model` above was already constructed with the correct horizon grid
+    # (from the checkpoint's cfg, or the test dataset's delta_grid as a
+    # fallback), so backfill it from there rather than loosening strict=True.
+    if "horizon_steps" not in sd:
+        print("  [compat] checkpoint predates the horizon_steps buffer — "
+              f"filling it in as {model.horizon_steps.tolist()}")
+        sd["horizon_steps"] = model.horizon_steps.clone()
     model.load_state_dict(sd, strict=True)
     model = model.to(device).eval()
     print(f"Loaded LSTM: {model.count_parameters():,} params  "
