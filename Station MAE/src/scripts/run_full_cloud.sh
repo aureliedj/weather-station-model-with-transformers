@@ -53,7 +53,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
-SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v31"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
+SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v32-blind"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 # ⚠ full_run_cloud_v27/ ALREADY CONTAINS best.ckpt + last.ckpt (epoch 40).
 #   With RESUME=1 (the default) a re-launch CONTINUES that run from epoch 40 —
 #   it does NOT retrain from scratch. For a genuinely fresh v27, point
@@ -324,8 +324,8 @@ DELTA0=""                                        # <- v23: uniform (default)
 # nothing and the spatial machinery is not earning its cost — which is the
 # take-home message either way. Compare the per-lead curves and the error
 # TAILS, not just the means.
-SPATIAL=""                                          # <- v27/v30/v31: full axial (default)
-#SPATIAL="--no_spatial_attn"                      # <- v32: station-blind arm
+#SPATIAL=""                                        # <- v27/v30/v31: full axial (default)
+SPATIAL="--no_spatial_attn"                       # <- v32: station-blind arm (ACTIVE)
 
 # ── v32: fully station-blind transformer, Delta-query decoder KEPT ───────────
 # --no_spatial_attn alone is NOT station-independent: it removes the encoder's
@@ -347,8 +347,8 @@ SPATIAL=""                                          # <- v27/v30/v31: full axial
 #
 # Isolation is enforced by tests/test_station_local_decoder.py, which perturbs
 # one station and requires every other station's prediction to be bit-identical.
-DECODER_LOCAL=""                                   # <- v27/v30/v31: decoder sees all stations
-#DECODER_LOCAL="--station_local_decoder"          # <- v32: decoder is station-local
+#DECODER_LOCAL=""                                 # <- v27/v30/v31: decoder sees all stations
+DECODER_LOCAL="--station_local_decoder"           # <- v32: decoder is station-local (ACTIVE)
 DIRECT=""                                          # <- v23 keeps the decoder
 # ANCHOR="" ; DIRECT="--direct_head --readout last"   # <- v22 arm
 # DIRECT=""                                        # <- v20: keep the query decoder
@@ -689,7 +689,7 @@ python main.py \
     $INDEX_MODE \
     $EXCLUDE \
     --wandb_project    station-mae \
-    --wandb_run_name   "patch${PATCH}-d384-L8-v31${RUN_SUFFIX}" \
+    --wandb_run_name   "patch${PATCH}-d384-L8-v32-station-blind${RUN_SUFFIX}" \
     ${SANITY_ARGS[@]+"${SANITY_ARGS[@]}"} \
     ${RESUME_ARG[@]+"${RESUME_ARG[@]}"} \
     --save_dir         "$SAVE_DIR"
