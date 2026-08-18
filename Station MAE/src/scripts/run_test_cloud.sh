@@ -200,7 +200,42 @@ MASK_RATIOS="0.0"   # mr0.00 FIRST for v20. The question v20 exists to
 # if it STILL OOMs, drop further (2, then 1) — correctness is unaffected,
 # only wall-clock. expandable_segments reduces the allocator fragmentation
 # PyTorch's own OOM message flagged (1.43 GiB reserved-but-unallocated).
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+# ── CUDA allocator: expandable_segments is NOT safe on every vGPU ────────────
+# expandable_segments:True reduces allocator fragmentation, but it switches
+# PyTorch's caching allocator onto the CUDA virtual-memory-management API
+# (cuMemCreate / cuMemAddressReserve / cuMemMap). Several vGPU profiles --
+# including the NVIDIA A10-8Q this project is allocated -- do not implement
+# those calls, and the FIRST host->device copy then fails with
+#
+#     RuntimeError: CUDA driver error: operation not supported
+#
+# raised from `model.to(device)`, long after torch.cuda.is_available() has
+# already returned True (so _cuda_preflight.sh passes). This is why training
+# works on the same node: run_full_cloud.sh never sets this variable.
+#
+# Probe instead of assuming: enable it only if a tiny transfer actually works.
+# Force either way with EXPANDABLE_SEGMENTS=1 / =0.
+_probe_expandable() {
+    PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" python - <<'PYEOF' >/dev/null 2>&1
+import torch
+if torch.cuda.is_available():
+    torch.zeros(8).to("cuda")      # the operation that was failing
+PYEOF
+}
+case "${EXPANDABLE_SEGMENTS:-auto}" in
+  1) export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+     echo "[alloc] expandable_segments:True (forced)" ;;
+  0) unset PYTORCH_CUDA_ALLOC_CONF
+     echo "[alloc] expandable_segments disabled (forced)" ;;
+  *) if _probe_expandable; then
+         export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+         echo "[alloc] expandable_segments:True — probe passed, enabled"
+     else
+         unset PYTORCH_CUDA_ALLOC_CONF
+         echo "[alloc] expandable_segments unsupported on this GPU — disabled"
+         echo "        (vGPU without CUDA VMM support; default allocator used)"
+     fi ;;
+esac
 BATCH_SIZE="${BATCH_SIZE:-4}"
 
 # ── Predictions-only, or full metrics? ───────────────────────────────────────

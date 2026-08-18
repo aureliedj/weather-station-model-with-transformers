@@ -1124,7 +1124,29 @@ def main() -> None:
         ):
             if _cli is not None:
                 _overrides[StationMAE._CFG_TO_ARG.get(_arg, _arg)] = _cli
-        model = StationMAE.from_cfg(saved_cfg_for_build, **_overrides).to(device)
+        model = StationMAE.from_cfg(saved_cfg_for_build, **_overrides)
+        try:
+            model = model.to(device)
+        except RuntimeError as _e:
+            # "CUDA driver error: operation not supported" here is almost always
+            # the allocator, not the model: expandable_segments:True puts the
+            # caching allocator on the CUDA virtual-memory API, which several
+            # vGPU profiles (e.g. A10-8Q) do not implement. It surfaces on the
+            # first host->device copy, well after torch.cuda.is_available()
+            # returned True. Name the fix rather than leaving a bare driver error.
+            if "operation not supported" in str(_e) and device.type == "cuda":
+                _alloc = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "<unset>")
+                raise RuntimeError(
+                    f"Moving the model to {device} failed with: {_e}\n\n"
+                    f"PYTORCH_CUDA_ALLOC_CONF={_alloc}\n"
+                    "If that contains expandable_segments, this GPU very likely "
+                    "does not support the CUDA virtual-memory API it relies on "
+                    "(common on vGPU profiles). Re-run with:\n"
+                    "    EXPANDABLE_SEGMENTS=0 bash src/scripts/run_test_cloud.sh\n"
+                    "or unset PYTORCH_CUDA_ALLOC_CONF. Training is unaffected "
+                    "because run_full_cloud.sh never sets it."
+                ) from _e
+            raise
 
         # ── Legacy-checkpoint compatibility: un-share what this checkpoint
         # never shared ────────────────────────────────────────────────────
