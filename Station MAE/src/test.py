@@ -870,13 +870,40 @@ def main() -> None:
             # model — and the NLL run exists precisely for this output.
             if "log_var" in _res:
                 _lv = _res["log_var"]
-                _sig = torch.exp(0.5 * _lv.float())
                 print(f"  [uncertainty] log_var saved: {tuple(_lv.shape)} "
                       f"(M, K, N, V)")
-                print(f"                sigma = exp(0.5*log_var), normalised "
-                      f"units: median {_sig.median():.4f}, "
-                      f"p05 {_sig.quantile(0.05):.4f}, "
-                      f"p95 {_sig.quantile(0.95):.4f}")
+                # These are display-only statistics; predictions.pt is already
+                # on disk by this point. Never let them abort the mask-ratio
+                # sweep — a full dump costs ~10 min of GPU time, and losing the
+                # next ratio to a formatting bug is not an acceptable trade.
+                try:
+                    _sig = torch.exp(0.5 * _lv.float()).flatten()
+                    # torch.quantile() rejects inputs above 2**24 elements
+                    # ("input tensor is too large"); a full dump is
+                    # M*K*N*V ~ 1.2e8. median() has no such cap, which is why
+                    # only the percentiles used to fail. Subsample first.
+                    _MAXQ = 1 << 20
+                    _note = ""
+                    if _sig.numel() > _MAXQ:
+                        # Random, not strided: the tensor is laid out
+                        # (M, K, N, V), so a fixed stride can alias with the
+                        # variable or station period and sample one variable
+                        # far more often than the others. Draw from a LOCAL
+                        # generator — touching the global RNG here would shift
+                        # the station mask and break cross-model pairing.
+                        _g = torch.Generator().manual_seed(0)
+                        _idx = torch.randint(0, _sig.numel(), (_MAXQ,),
+                                             generator=_g)
+                        _sig = _sig[_idx]
+                        _note = f"   [{_MAXQ:,}-value subsample]"
+                    print(f"                sigma = exp(0.5*log_var), "
+                          f"normalised units: median {_sig.median():.4f}, "
+                          f"p05 {_sig.quantile(0.05):.4f}, "
+                          f"p95 {_sig.quantile(0.95):.4f}{_note}")
+                except Exception as _e:
+                    print(f"                [warn] sigma summary failed "
+                          f"({type(_e).__name__}: {_e}). predictions.pt is "
+                          f"already written — compute sigma downstream.")
             elif _use_nll:
                 print("  [uncertainty] ⚠ checkpoint has a sigma head but no "
                       "log_var was returned — investigate before using it.")
