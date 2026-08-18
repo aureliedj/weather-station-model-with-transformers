@@ -1300,6 +1300,24 @@ def main() -> None:
                     save_path=_pred_path,
                 )
                 print(f"  ⏱  {_time.time()-t0:.0f}s")
+                # Report the uncertainty explicitly. It is stored only when the
+                # checkpoint carries decoder.log_var_head, so a silent absence
+                # would otherwise be indistinguishable from a point-prediction
+                # model — and the NLL run exists precisely for this output.
+                if "log_var" in _res:
+                    _lv = _res["log_var"]
+                    _sig = torch.exp(0.5 * _lv.float())
+                    print(f"  [uncertainty] log_var saved: {tuple(_lv.shape)} "
+                          f"(M, K, N, V)")
+                    print(f"                sigma = exp(0.5*log_var), normalised "
+                          f"units: median {_sig.median():.4f}, "
+                          f"p05 {_sig.quantile(0.05):.4f}, "
+                          f"p95 {_sig.quantile(0.95):.4f}")
+                elif _use_nll:
+                    print("  [uncertainty] ⚠ checkpoint has a sigma head but no "
+                          "log_var was returned — investigate before using it.")
+                else:
+                    print("  [uncertainty] none (point-prediction checkpoint)")
                 _prediction_sanity_check(_res, label)
                 del _res
                 continue

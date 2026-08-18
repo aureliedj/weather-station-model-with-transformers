@@ -258,7 +258,16 @@ BATCH_SIZE="${BATCH_SIZE:-4}"
 #
 #   PREDICTIONS_ONLY=1  dump only   (fast; metrics computed downstream in the notebook)
 #   PREDICTIONS_ONLY=0  full metrics (slower; needed to benefit from the fix)
-PREDICTIONS_ONLY="${PREDICTIONS_ONLY:-0}"
+# DEFAULT = 1: dump predictions.pt only; all metrics are computed downstream in
+# the notebook, where the per-station inverse transform is applied correctly.
+#
+# UNCERTAINTY (v30-nll): no extra flag is needed. collect_predictions() calls
+# forward_multi_delta(..., return_log_var=True) and stores log sigma^2 in
+# predictions.pt as "log_var" (M, K, N, 5) whenever the checkpoint carries the
+# sigma head — which test.py detects from the WEIGHTS. Recover the standard
+# deviation with  sigma = exp(0.5 * log_var)  in per-station normalised units;
+# multiply by obs_stats["std"][station, var] for physical units.
+PREDICTIONS_ONLY="${PREDICTIONS_ONLY:-1}"
 if [[ "$PREDICTIONS_ONLY" == "1" ]]; then
     PRED_ONLY_ARG="--predictions_only"
     echo "[run_test_cloud.sh] mode: predictions-only (metric fix NOT exercised)"
