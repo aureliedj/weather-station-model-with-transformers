@@ -50,7 +50,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   v31          yes               global       0.0        0.0        (0.5 is OOD)
 #   v32-blind    no                station-local 0.0       0.0 only   (see below)
 #   lstm-*       n/a               n/a          n/a        use run_lstm_test_cloud.sh
-RUN_NAME="v30-nll"
+RUN_NAME="${RUN_NAME:-v27}"
 
 CKPT_DIR="full_run_cloud_${RUN_NAME}"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${CKPT_DIR}/best.ckpt"
@@ -106,10 +106,11 @@ STRIDE=9
 #       checkpoints TRAINED with masking (v27, v30-nll); for a model trained at
 #       MR 0 it is out of distribution and reports robustness, not a ranking.
 #
-# v30-nll was trained at MR 0.5, so both ratios are in distribution: 0.0 gives
-# the LSTM-comparable forecasting numbers, 0.5 the paired masked-station
-# comparison against v27. Both passes write log_var, so the sigma calibration
-# can be checked on visible and hidden stations separately.
+# v27 and v30-nll were both trained at MR 0.5, so both ratios are in
+# distribution for either: 0.0 gives the LSTM-comparable forecasting numbers,
+# 0.5 the masked-station comparison. Run the two models at the SAME seed and
+# batch size or the MR 0.5 masked sets differ and the comparison is unpaired —
+# which is why the v27 dumps from 2026-08-08 (pre-seed) cannot be reused.
 MASK_RATIOS="${MASK_RATIOS:-0.0 0.5}"
 
 # ── Normalisation ────────────────────────────────────────────────────────────
