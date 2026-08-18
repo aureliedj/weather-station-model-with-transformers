@@ -37,6 +37,17 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 # previously produced a run that loaded v11 while writing into test_results/v12.
 #
 #   RUN_NAME    checkpoint directory                notes
+#   v32-blind   checkpoints/full_run_cloud_v32-blind  station-BLIND: no encoder
+#                                                    spatial attn + station-local
+#                                                    decoder. Delta-queries kept.
+#                                                    MR0.0 ONLY (test.py raises at
+#                                                    MR>0: a masked station has no
+#                                                    encoder tokens to attend to)
+#   v31         checkpoints/full_run_cloud_v31      v27 config trained at MR0.0
+#                                                    (train/eval regimes matched).
+#                                                    MR0.5 is OUT OF DISTRIBUTION
+#                                                    for it -- report as robustness,
+#                                                    not as a ranking  <- current
 #   v30-nll     checkpoints/full_run_cloud_v30-nll  v27 config + Gaussian NLL loss;
 #                                                    decoder also predicts log sigma^2,
 #                                                    saved as log_var in predictions.pt
@@ -84,7 +95,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   (that silent drop is what invalidated every v9–v13 test number). To
 #   evaluate an old run, check out the commit that trained it:
 #       git checkout <commit>  &&  bash src/scripts/run_test_cloud.sh
-RUN_NAME="v27"
+RUN_NAME="v31"
 
 case "$RUN_NAME" in
   v9)  CKPT_DIR="run_full_cloud_v9"  ;;
@@ -154,7 +165,7 @@ STRIDE=9
 # GLOBAL_NORM="--global_norm"
 GLOBAL_NORM=""
 
-MASK_RATIOS="0.0 0.5"   # mr0.00 FIRST for v20. The question v20 exists to
+MASK_RATIOS="0.0"   # mr0.00 FIRST for v20. The question v20 exists to
                         # answer is whether the residual head fixes the copy
                         # failure — v15 scored 0.1512 on pressure against a
                         # 0.0224 persistence baseline — and that comparison is
