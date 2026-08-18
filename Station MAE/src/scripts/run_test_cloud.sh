@@ -1,115 +1,66 @@
 #!/usr/bin/env bash
-# run_test_cloud.sh — prediction dump on the cloud (predictions-only)
+# run_test_cloud.sh — dump raw test-set predictions for one checkpoint.
 #
-# Loads the best checkpoint and runs ONE forward pass over the sliding test
-# windows per mask ratio, saving raw predictions only:
+# One forward pass over the sliding test windows per mask ratio, writing:
+#     test_results/<RUN_NAME>/best_mr<R>/predictions.pt
 #
-#   test_results/best_mr0.00/predictions.pt   (all stations visible)
-#   test_results/best_mr0.50/predictions.pt   (50% masked; masked_idx included)
+# That file is the ONLY output. Every metric — MAE/RMSE per lead time, per
+# variable, per station, masked vs visible, persistence skill — is derived
+# downstream in notebooks/Test_Results_Exploration.ipynb, where the per-station
+# inverse normalisation is applied correctly.
 #
-# NO metrics are computed here — persistence, skill, per-station, seasonal etc.
-# are all derived downstream from predictions.pt in Test_Results_Exploration.ipynb.
-# Same schema as the LSTM dump (test_lstm.py), so runs drop into the same
-# comparison cells.
+# predictions.pt contains:
+#     preds        (M, K, N, 5)   normalised predictions
+#     targets      (M, K, N, 6)   normalised targets
+#     masks        (M, K, N, 6)   sensor availability
+#     masked_idx   (M, n_masked)  stations hidden from the encoder (empty at MR 0)
+#     delta_steps  (M, K)         lead times in 10-min steps
+#     window_hours (M,)           window start, hours since epoch
+#     target_hours (M, K)         target time per lead
+#     spatial      (N, 15)        static station descriptors
+#     log_var      (M, K, N, 5)   log sigma^2 — ONLY for NLL checkpoints
 #
-# All architecture settings are auto-read from the checkpoint.
+# All architecture settings are read from the checkpoint's saved cfg, so the
+# model is always rebuilt exactly as it was trained.
 #
 # Usage:
-#   chmod +x run_test_cloud.sh
-#   ./run_test_cloud.sh
+#   bash src/scripts/run_test_cloud.sh
+#   MASK_RATIOS="0.0 0.5" bash src/scripts/run_test_cloud.sh
+#   SEED=7 BATCH_SIZE=2 bash src/scripts/run_test_cloud.sh
 
 set -euo pipefail
 
 DATA_ROOT="/home/renku/work/PeakWeatherDataset"
 
-# Resolve paths relative to this script so they work from any working directory.
-# Checkpoints are saved by run_full_cloud.sh inside the project directory.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
-SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
-PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
-cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
+SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src
+PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root
+cd "${SRC_DIR}"
 
-# Fail fast if torch cannot use the GPU (wheel/driver mismatch on the older node).
+# Fail fast if torch cannot use the GPU (wheel/driver mismatch).
 source "${SCRIPT_DIR}/_cuda_preflight.sh"
-# ── Which run to evaluate ────────────────────────────────────────────────────
-# Set RUN_NAME only. The checkpoint path and the output folder are both derived
-# from it, so they cannot drift apart — editing one and forgetting the other
-# previously produced a run that loaded v11 while writing into test_results/v12.
-#
-#   RUN_NAME    checkpoint directory                notes
-#   v32-blind   checkpoints/full_run_cloud_v32-blind  station-BLIND: no encoder
-#                                                    spatial attn + station-local
-#                                                    decoder. Delta-queries kept.
-#                                                    MR0.0 ONLY (test.py raises at
-#                                                    MR>0: a masked station has no
-#                                                    encoder tokens to attend to)
-#   v31         checkpoints/full_run_cloud_v31      v27 config trained at MR0.0
-#                                                    (train/eval regimes matched).
-#                                                    MR0.5 is OUT OF DISTRIBUTION
-#                                                    for it -- report as robustness,
-#                                                    not as a ranking  <- current
-#   v30-nll     checkpoints/full_run_cloud_v30-nll  v27 config + Gaussian NLL loss;
-#                                                    decoder also predicts log sigma^2,
-#                                                    saved as log_var in predictions.pt
-#                                                    (sigma = exp(0.5*log_var), normalised)
-#   v29         checkpoints/full_run_cloud_v29      no spatial attn, trained MR0.0
-#   v28         checkpoints/full_run_cloud_v28      no spatial attn, trained MR0.5
-#   v27         checkpoints/full_run_cloud_v27      v26 config, CLEAN embeddings.py
-#                                                    (final Nyquist fixes + wavelength
-#                                                    placement + sharing, all landed) ← current
-#   v26.1       test_results/full_run_cloud_v26.1   shared emb + temporal wavelength
-#                                                    fix, but step/delta_emb still at
-#                                                    the half-wrong intermediate Nyquist
-#                                                    value (2.0/1.0, not 2.5/1.25) —
-#                                                    saved OUTSIDE checkpoints/, see below
-#   v26-res     test_results/full_run_cloud_v26-res shared-embedding fix only; predates
-#                                                    every wavelength/Nyquist fix —
-#                                                    saved OUTSIDE checkpoints/, see below
-#   v20         checkpoints/full_run_cloud_v20      residual head + station_state
-#   v19         checkpoints/full_run_cloud_v19      v17 + MLP value embedding
-#   v17         checkpoints/full_run_cloud_v17      token rebalance (0.04% -> 22%)
-#   v15         checkpoints/full_run_cloud_v15      patch-3 tokens, no residual
-#   v14         checkpoints/full_run_cloud_v14      patch-6, input-context decoder
-#   v13         checkpoints/full_run_cloud_v13      pre-audit-fix architecture
-#   v12/v11/v9  checkpoints/...                     older Huber / NLL runs
-#
-# v26-res and v26.1 were saved into test_results/full_run_cloud_<name>/ instead
-# of checkpoints/full_run_cloud_<name>/ (that's where run_full_cloud.sh's
-# SAVE_DIR actually writes). CHECKPOINT below is always derived from RUN_NAME
-# via checkpoints/full_run_cloud_${RUN_NAME}/best.ckpt, so evaluating either of
-# those two needs the .ckpt files moved/copied into
-# checkpoints/full_run_cloud_<name>/ first — there's no RUN_NAME value that
-# reaches test_results/ as-is.
-#
-# Everything structural is read from the checkpoint's saved cfg — including,
-# since this revision, value_embedding / static_in_token / direct_head. Those
-# three were recorded by main.py but never read here, so a v18+ checkpoint
-# rebuilt itself with the pre-v18 defaults. The load-time structural guard
-# catches it (var_proj weights land in missing/unexpected and it aborts), but
-# only after the dataset build, so check the [v18+] banner line matches the
-# training run before letting a long sweep proceed.
-#
-# ⚠ PRE-v15 CHECKPOINTS CANNOT BE EVALUATED WITH THIS CODE. v15 removed the
-#   decoder input-context pathway, so those checkpoints carry weights this
-#   model no longer has; test.py ABORTS rather than silently dropping them
-#   (that silent drop is what invalidated every v9–v13 test number). To
-#   evaluate an old run, check out the commit that trained it:
-#       git checkout <commit>  &&  bash src/scripts/run_test_cloud.sh
-RUN_NAME="v31"
 
-case "$RUN_NAME" in
-  v9)  CKPT_DIR="run_full_cloud_v9"  ;;
-  *)   CKPT_DIR="full_run_cloud_${RUN_NAME}" ;;
-esac
+# ── Which run to evaluate ────────────────────────────────────────────────────
+# Set RUN_NAME only: the checkpoint path and the output folder are both derived
+# from it, so they cannot drift apart.
+#
+#   RUN_NAME     encoder spatial   decoder      train MR   valid mask ratios
+#   v27          yes               global       0.5        0.0, 0.5
+#   v30-nll      yes               global       0.5        0.0, 0.5   (+ log_var)
+#   v31          yes               global       0.0        0.0        (0.5 is OOD)
+#   v32-blind    no                station-local 0.0       0.0 only   (see below)
+#   lstm-*       n/a               n/a          n/a        use run_lstm_test_cloud.sh
+RUN_NAME="v30-nll"
+
+CKPT_DIR="full_run_cloud_${RUN_NAME}"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${CKPT_DIR}/best.ckpt"
 SAVE_DIR="${PROJ_DIR}/test_results/${RUN_NAME}"
 
-# Fail here rather than 4 minutes into the dataset build.
 if [[ ! -f "$CHECKPOINT" ]]; then
   echo "[run_test_cloud.sh] checkpoint for RUN_NAME='${RUN_NAME}' not found:"
   echo "    $CHECKPOINT"
-  echo "  available runs under ${PROJ_DIR}/checkpoints:"
-  ls -1 "${PROJ_DIR}/checkpoints" 2>/dev/null | sed 's/^/    /' || echo "    (no checkpoints/ directory)"
+  echo "  available:"
+  ls -1 "${PROJ_DIR}/checkpoints" 2>/dev/null | sed 's/^/    /' || echo "    (none)"
   exit 1
 fi
 echo "[run_test_cloud.sh] RUN_NAME=${RUN_NAME}"
@@ -117,109 +68,75 @@ echo "                    checkpoint: ${CHECKPOINT}"
 echo "                    output:     ${SAVE_DIR}"
 
 # ── Architecture preflight ───────────────────────────────────────────────────
-# Print what the checkpoint says it is BEFORE the ~4 minute dataset build, so a
-# cfg/code mismatch costs seconds instead of a build. test.py aborts on this
-# anyway (the structural guard), just much later.
+# Print what the checkpoint says it is BEFORE the ~4 min dataset build, so a
+# mismatch costs seconds instead of a full build.
 python - "$CHECKPOINT" <<'PYEOF'
 import sys, torch
 c = torch.load(sys.argv[1], map_location="cpu", weights_only=False)
 cfg = c.get("hyper_parameters", {}).get("cfg", {})
 if not cfg:
-    print("[preflight] no cfg in checkpoint — test.py will fall back to CLI/defaults")
+    print("[preflight] no cfg in checkpoint — test.py falls back to CLI/defaults")
     raise SystemExit(0)
 print(f"[preflight] epoch {c.get('epoch','?')}, step {c.get('global_step','?')}")
 for k in ("d_model", "enc_layers", "dec_layers", "temporal_patch",
-          "factorised_encoder", "encoder_spatial_attn", "temporal_window",
-          "mask_ratio", "value_embedding", "wind_encoder", "static_in_token",
+          "factorised_encoder", "encoder_spatial_attn", "station_local_decoder",
+          "temporal_window", "mask_ratio", "value_embedding", "static_in_token",
           "residual_head", "direct_head", "readout", "use_nll_loss"):
     if k in cfg:
-        print(f"[preflight]   {k:20s} {cfg[k]}")
-# The uncertainty head is detected from the WEIGHTS, not the cfg key (the cfg
-# key is unreliable on v9-era runs) — mirror test.py's own check here so the
-# banner cannot disagree with what actually gets built.
+        print(f"[preflight]   {k:22s} {cfg[k]}")
+# The sigma head is detected from the WEIGHTS, not the cfg key (unreliable on
+# v9-era runs) — mirror test.py so the banner cannot disagree with the build.
 _sd = c.get("state_dict", {})
-_has_sigma = any(k.endswith("decoder.log_var_head.weight") for k in _sd)
-print(f"[preflight]   sigma head           {'PRESENT — log_var will be saved in predictions.pt' if _has_sigma else 'absent (point predictions only)'}")
-if cfg.get("direct_head"):
-    print("[preflight] direct_head — only mask ratio 0.0 will be evaluated")
+if any(k.endswith("decoder.log_var_head.weight") for k in _sd):
+    print("[preflight]   sigma head           PRESENT — log_var saved in predictions.pt")
+if cfg.get("direct_head") or cfg.get("station_local_decoder"):
+    print("[preflight] ⚠ this model requires mask_ratio 0 — MR>0 will be refused")
 PYEOF
 
-# ── Window mode ───────────────────────────────────────────────────────────────
-# blocks:  non-overlapping windows (~1,460) — fast, clean — recommended default
-# sliding: all overlapping windows (~105k)  — slow, most stable — for final paper metrics
-# Rolling-origin evaluation: sliding windows every STRIDE steps (9 = 90 min = 1h30).
+# ── Evaluation window protocol ───────────────────────────────────────────────
+# sliding + stride 9 (90 min) over 2023-24 → 11,684 windows. Keep these fixed:
+# every existing dump uses them, and changing either makes runs incomparable.
 INDEX_MODE="sliding"
 STRIDE=9
-# INDEX_MODE="blocks"   # fast non-overlapping alternative
 
-# ── Mask ratio sweep ──────────────────────────────────────────────────────────
-# 0.0 → all stations visible to encoder (pure temporal forecasting)
-# 0.5 → trained setting: 50% masked (gap-filling + forecasting)
-# The model is loaded ONCE and evaluated at each ratio in sequence.
-# Results save to separate subdirs: test_results/.../best_mr0.00/, best_mr0.50/
-# A comparison table is printed at the end.
-# ── Normalisation mode ───────────────────────────────────────────────────────
-# Use --global_norm for checkpoints trained BEFORE per-station normalisation
-# was introduced (i.e. all baseline-cloud and early tw12-d1024 runs).
-# Omit (default) for new checkpoints trained with per-station normalisation.
-# GLOBAL_NORM="--global_norm"
+# ── Mask ratios ──────────────────────────────────────────────────────────────
+# 0.0 → all stations visible: pure forecasting. The only regime in which the
+#       LSTM baseline is comparable, and the only one v31/v32 support.
+# 0.5 → 50% of stations hidden: gap-filling + forecasting. Meaningful only for
+#       checkpoints TRAINED with masking (v27, v30-nll); for a model trained at
+#       MR 0 it is out of distribution and reports robustness, not a ranking.
+#
+# v30-nll was trained at MR 0.5, so both ratios are in distribution: 0.0 gives
+# the LSTM-comparable forecasting numbers, 0.5 the paired masked-station
+# comparison against v27. Both passes write log_var, so the sigma calibration
+# can be checked on visible and hidden stations separately.
+MASK_RATIOS="${MASK_RATIOS:-0.0 0.5}"
+
+# ── Normalisation ────────────────────────────────────────────────────────────
+# Empty = per-station (all current runs). --global_norm only for pre-per-station
+# checkpoints; it must match how the checkpoint was trained.
 GLOBAL_NORM=""
 
-MASK_RATIOS="0.0"   # mr0.00 FIRST for v20. The question v20 exists to
-                        # answer is whether the residual head fixes the copy
-                        # failure — v15 scored 0.1512 on pressure against a
-                        # 0.0224 persistence baseline — and that comparison is
-                        # only meaningful with every station visible, which is
-                        # also the setting the LSTM and simple-MAE numbers use.
-                        # mr0.50 is the trained setting and gives skill-vs-
-                        # persistence + gap-filling; keep it second so killing
-                        # the run still leaves the comparable number.
-                        # For pre-v20 runs the old order (0.5 first) was right.
-# MASK_RATIOS="0.0"                 # single ratio (faster)
+# ── Batch size ───────────────────────────────────────────────────────────────
+# Inference holds no optimiser state or activations, but MR 0.0 is the heaviest
+# case: nothing is masked, so the encoder carries all 155 stations
+# (24x155 = 3,720 tokens vs 24x78 = 1,872 at MR 0.5). Predictions are identical
+# at any batch size; only speed changes. Drop to 2 or 1 if it OOMs.
+BATCH_SIZE="${BATCH_SIZE:-4}"
 
-# The model is loaded ONCE; each ratio is a single forward sweep over the same
-# sliding windows. --save_predictions 0 = keep ALL windows (sliding/9 over
-# 2023-24 ≈ 11k windows; expect ~1.5 GB per ratio).
-# batch_size: inference keeps no optimiser state and no activations, so it can
-# run larger batches than training — ON THE HARDWARE THIS WAS TUNED FOR.
-#
-# mr0.00 is the heaviest configuration this runs: nothing is masked, so the
-# encoder carries all 155 stations instead of the ~78 it sees during training.
-# At --temporal_patch 3 that is 24x155 = 3,720 tokens vs 24x78 = 1,872 at
-# training time — on 11,684 windows. 4x, not 8x, if you ever evaluate a
-# PATCH=1 (raw) checkpoint, where mr0.00 is 72x155 = 11,160.
-# Predictions are bit-identical at any batch size; only speed changes.
-#
-# BATCH_SIZE WAS 16, TUNED FOR THE A100 MIG 3g.20gb (~20 GB) — HARDCODED
-# ---------------------------------------------------------------------------
-# OOM observed 2026-08 at mr0.00 on a smaller allocation: total capacity
-# 7.82 GiB (not the ~20 GB the comment above assumed — check `nvidia-smi` /
-# the OOM message's "GPU 0 has a total capacity of ..." line before assuming
-# which node you have; Renku hands out different slices across sessions).
-# 16 does not fit a GPU ~2.5x smaller. Dropped to 4 here as a safe default;
-# if it STILL OOMs, drop further (2, then 1) — correctness is unaffected,
-# only wall-clock. expandable_segments reduces the allocator fragmentation
-# PyTorch's own OOM message flagged (1.43 GiB reserved-but-unallocated).
-# ── CUDA allocator: expandable_segments is NOT safe on every vGPU ────────────
-# expandable_segments:True reduces allocator fragmentation, but it switches
-# PyTorch's caching allocator onto the CUDA virtual-memory-management API
-# (cuMemCreate / cuMemAddressReserve / cuMemMap). Several vGPU profiles --
-# including the NVIDIA A10-8Q this project is allocated -- do not implement
-# those calls, and the FIRST host->device copy then fails with
-#
+# ── CUDA allocator ───────────────────────────────────────────────────────────
+# expandable_segments:True cuts allocator fragmentation but puts the caching
+# allocator on the CUDA virtual-memory API (cuMemCreate / cuMemAddressReserve).
+# Several vGPU profiles — including the A10-8Q this project is allocated — do
+# not implement those, and the first host->device copy then fails with
 #     RuntimeError: CUDA driver error: operation not supported
-#
-# raised from `model.to(device)`, long after torch.cuda.is_available() has
-# already returned True (so _cuda_preflight.sh passes). This is why training
-# works on the same node: run_full_cloud.sh never sets this variable.
-#
-# Probe instead of assuming: enable it only if a tiny transfer actually works.
-# Force either way with EXPANDABLE_SEGMENTS=1 / =0.
+# from model.to(device), long after torch.cuda.is_available() returned True.
+# Probe instead of assuming. Force with EXPANDABLE_SEGMENTS=1 / =0.
 _probe_expandable() {
     PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True" python - <<'PYEOF' >/dev/null 2>&1
 import torch
 if torch.cuda.is_available():
-    torch.zeros(8).to("cuda")      # the operation that was failing
+    torch.zeros(8).to("cuda")
 PYEOF
 }
 case "${EXPANDABLE_SEGMENTS:-auto}" in
@@ -233,63 +150,16 @@ case "${EXPANDABLE_SEGMENTS:-auto}" in
      else
          unset PYTORCH_CUDA_ALLOC_CONF
          echo "[alloc] expandable_segments unsupported on this GPU — disabled"
-         echo "        (vGPU without CUDA VMM support; default allocator used)"
      fi ;;
 esac
-BATCH_SIZE="${BATCH_SIZE:-4}"
 
-# ── Predictions-only, or full metrics? ───────────────────────────────────────
-# --predictions_only dumps predictions.pt and RETURNS IMMEDIATELY (test.py:1229),
-# before evaluate_full() / evaluate_gap_filling() / compute_seasonal_metrics()
-# are ever called.
-#
-# THIS MATTERS AFTER THE PER-STATION DENORMALISATION FIX. That fix changed the
-# METRIC functions, not the prediction dump: predictions.pt stores NORMALISED
-# values and is byte-for-byte unaffected. Re-running with --predictions_only
-# therefore reproduces the same file and gains nothing.
-#
-# To actually exercise the fix, run with PREDICTIONS_ONLY=0. That computes
-# physical-unit metrics with each station's own std (instead of the network
-# average), and additionally writes:
-#     delta_variable_rmse_matrix.csv   per-variable x lead-time RMSE
-#     per_station_metrics.csv          per-station metrics for map plots
-# Expect wind to change by ~6-7% and the other variables by under 1%;
-# normalised metrics are identical either way.
-#
-#   PREDICTIONS_ONLY=1  dump only   (fast; metrics computed downstream in the notebook)
-#   PREDICTIONS_ONLY=0  full metrics (slower; needed to benefit from the fix)
-# DEFAULT = 1: dump predictions.pt only; all metrics are computed downstream in
-# the notebook, where the per-station inverse transform is applied correctly.
-#
-# UNCERTAINTY (v30-nll): no extra flag is needed. collect_predictions() calls
-# forward_multi_delta(..., return_log_var=True) and stores log sigma^2 in
-# predictions.pt as "log_var" (M, K, N, 5) whenever the checkpoint carries the
-# sigma head — which test.py detects from the WEIGHTS. Recover the standard
-# deviation with  sigma = exp(0.5 * log_var)  in per-station normalised units;
-# multiply by obs_stats["std"][station, var] for physical units.
-PREDICTIONS_ONLY="${PREDICTIONS_ONLY:-1}"
-if [[ "$PREDICTIONS_ONLY" == "1" ]]; then
-    PRED_ONLY_ARG="--predictions_only"
-    echo "[run_test_cloud.sh] mode: predictions-only (metric fix NOT exercised)"
-else
-    PRED_ONLY_ARG=""
-    echo "[run_test_cloud.sh] mode: full metrics (per-station denormalisation)"
-fi
-
-# ── Evaluation-time station mask seed ────────────────────────────────────────
-# The mask at mask_ratio>0 is drawn from the global RNG inside
-# _mask_stations(). test.py re-seeds it ONCE PER MASK RATIO, so:
-#   * two runs with the same SEED hide the same stations -> masked-station
-#     results are directly comparable (paired) across models;
-#   * the mr0.50 mask does not depend on whether mr0.00 ran first in the same
-#     invocation.
-# Use the SAME seed for every model you intend to compare at mask_ratio 0.5.
+# ── Station-mask seed ────────────────────────────────────────────────────────
+# The mask at MR>0 is drawn from the global RNG. test.py re-seeds it ONCE PER
+# MASK RATIO, so the same SEED hides the same stations across models (paired
+# masked-station comparisons) and the MR 0.5 mask does not depend on whether
+# MR 0.0 ran first. Use the SAME seed for every model you intend to compare.
 # Reproducibility also requires the same BATCH_SIZE, INDEX_MODE and STRIDE.
-#
-# NOTE: the existing dumps were produced BEFORE seeding existed, so their
-# masked sets are arbitrary. Re-running now will not reproduce them; any model
-# whose mr0.50 numbers you want to compare pairwise must be re-evaluated with
-# this seed.
+# Dumps produced before seeding existed cannot be reproduced.
 SEED="${SEED:-42}"
 
 python test.py \
@@ -302,11 +172,10 @@ python test.py \
     --exclude_stations PFA \
     --test_mask_ratios $MASK_RATIOS \
     --seed             "$SEED" \
-    $PRED_ONLY_ARG \
     --save_predictions 0 \
     $GLOBAL_NORM \
     --save_dir         "$SAVE_DIR"
 
 echo ""
-echo "Done. Predictions under: ${SAVE_DIR}/  (one dir per mask ratio: ${MASK_RATIOS})"
-echo "Compute all metrics in Test_Results_Exploration.ipynb."
+echo "Done. predictions.pt under: ${SAVE_DIR}/  (one dir per mask ratio: ${MASK_RATIOS})"
+echo "Compute metrics in notebooks/Test_Results_Exploration.ipynb."
