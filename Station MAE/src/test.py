@@ -809,6 +809,21 @@ def main() -> None:
                       f"readout needs every station present. Evaluating "
                       f"{_test_mrs} only.")
 
+        # Same restriction, different cause: --station_local_decoder folds the
+        # station axis into the batch, so the decoder needs the encoder to
+        # return tokens for EVERY station. StationMAE asserts this at
+        # construction, but that assertion cannot fire here — the sweep sets
+        # model.encoder.mask_ratio after the model is built. Without this drop
+        # the run reaches the forward-time guard and dies mid-dump, after the
+        # dataset build and possibly after an earlier ratio has been written.
+        if getattr(model, "station_local_decoder", False):
+            _dropped = [mr for mr in _test_mrs if mr > 0.0]
+            _test_mrs = [mr for mr in _test_mrs if mr == 0.0] or [0.0]
+            if _dropped:
+                print(f"  [station_local_decoder] skipping mask ratios "
+                      f"{_dropped} — every station must contribute encoder "
+                      f"tokens. Evaluating {_test_mrs} only.")
+
         for _test_mr in _test_mrs:
             # Override the encoder mask ratio for this evaluation pass
             model.encoder.mask_ratio = _test_mr

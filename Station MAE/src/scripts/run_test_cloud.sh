@@ -50,7 +50,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   v31          yes               global       0.0        0.0        (0.5 is OOD)
 #   v32-blind    no                station-local 0.0       0.0 only   (see below)
 #   lstm-*       n/a               n/a          n/a        use run_lstm_test_cloud.sh
-RUN_NAME="${RUN_NAME:-v27}"
+RUN_NAME="${RUN_NAME:-v32-blind}"
 
 CKPT_DIR="full_run_cloud_${RUN_NAME}"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${CKPT_DIR}/best.ckpt"
@@ -111,7 +111,14 @@ STRIDE=9
 # 0.5 the masked-station comparison. Run the two models at the SAME seed and
 # batch size or the MR 0.5 masked sets differ and the comparison is unpaired —
 # which is why the v27 dumps from 2026-08-08 (pre-seed) cannot be reused.
-MASK_RATIOS="${MASK_RATIOS:-0.0 0.5}"
+#
+# v32-blind is MR 0.0 ONLY, and not by convention: --station_local_decoder
+# folds the station axis into the batch, so the decoder requires encoder tokens
+# for every station. Asking for 0.5 is refused by test.py and, if that guard
+# were bypassed, by StationMAE.forward. It is also the right comparison — v32
+# answers "how much does cross-station information buy us?", which is only
+# meaningful against v31 (same MR 0.0 training, spatial attention intact).
+MASK_RATIOS="${MASK_RATIOS:-0.0}"
 
 # ── Normalisation ────────────────────────────────────────────────────────────
 # Empty = per-station (all current runs). --global_norm only for pre-per-station
