@@ -6,7 +6,7 @@ re-derived elsewhere. Nothing here is imported by `src/` or `notebooks/`.
 | file | last touched | superseded by |
 |---|---|---|
 | `Data_Exploration.ipynb` | 2026-07-28 | `notebooks/Train_Test_Exploration.ipynb` |
-| `plot_test_results.ipynb` | 2026-07-26 | `notebooks/Test_Results_Exploration.ipynb` |
+| `plot_test_results.ipynb` | moved 2026-08-21 | `notebooks/Station_MAE_Map.ipynb` (DEM/map sections, updated for the v27 predictions.pt schema — no more `per_station_metrics.csv`) and `notebooks/Test_Results_Exploration.ipynb` (aggregate model-comparison stats) |
 | `plot_model.ipynb` | 2026-07-24 | `notebooks/Model_Architecture.ipynb` |
 | `plot_stations.ipynb` | 2026-06-19 | `notebooks/Train_Test_Exploration.ipynb` (station/terrain sections) |
 | `analysis.ipynb` | 2026-06-19 | `notebooks/Test_Results_Exploration.ipynb` |
