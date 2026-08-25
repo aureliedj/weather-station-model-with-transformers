@@ -11,11 +11,15 @@ __pycache__/
 venv/
 
 # ── Data, artefacts and logs (large, regenerable, machine-specific) ──────────
-Station MAE/PeakWeatherDataset/
-Station MAE/checkpoints/
-Station MAE/checkpoints_mini/
-Station MAE/test_results/
-Station MAE/wandb/
-Station MAE/archive/_junk/
+PeakWeatherDataset/
+checkpoints/
+checkpoints_mini/
+test_results/
+wandb/
+archive/_junk/
 *.ckpt
 *.log
+
+# ── Bulk artefacts now at the repo root ──────────────────────────────────────
+analysis_outputs/cache/
+*.pt
