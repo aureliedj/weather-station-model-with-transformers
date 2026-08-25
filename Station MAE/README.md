@@ -107,7 +107,7 @@ Station MAE/
 │
 ├── src/
 │   ├── data/dataset.py       windowing, splits, per-station normalisation
-│   ├── engine/evaluate.py    prediction collection and metric aggregation
+│   ├── engine/evaluate.py    prediction collection (metrics live in notebooks/)
 │   ├── model/                MAE (encoder/decoder/embeddings) + LSTM baseline
 │   ├── main.py               train the transformer
 │   ├── test.py               evaluate a transformer → predictions.pt
@@ -153,6 +153,24 @@ slow.
 does not depend on the suite.
 
 Notebooks never import from each other, and `src/` never imports a notebook.
+
+### Import convention
+
+**No package re-exports anything.** `data/__init__.py`, `model/__init__.py` and
+`engine/__init__.py` hold a docstring and nothing else, so always import from
+the module:
+
+```python
+from data.dataset import load_peakweather      # yes
+from data import load_peakweather              # no — not exported
+```
+
+A package `__init__.py` runs on *every* import of any of its submodules, so a
+re-export there is paid by every process. Before this rule was enforced,
+`data/__init__.py` pulled geopandas and rioxarray into every training run, and
+`model/__init__.py` pulled pytorch_lightning into `test.py`, which never uses
+it. Module layering is documented in `model/__init__.py`; there are no import
+cycles.
 
 ---
 

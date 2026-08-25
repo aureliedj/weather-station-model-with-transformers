@@ -100,3 +100,92 @@ Old checkpoints still contain `decoder.anchor_norm.weight` / `.bias`. These land
 in `unexpected` under `strict=False` and are ignored; `src/test.py` now filters
 them from the load report so a supervisor does not read them as a structural
 mismatch. No checkpoint file was modified.
+
+### 2026-08-25 — legacy in-script metrics moved out of `engine/evaluate.py`
+
+`archive/removed_deadcode_2026-08-25/engine_evaluate_legacy_metrics.py`
+
+`src/engine/evaluate.py` was 1,018 lines, of which 645 were unreachable. Moved
+here verbatim:
+
+| moved | lines | what it did |
+|---|---|---|
+| `evaluate_full` | 271 | full test-set evaluation in physical units — RMSE / MAE / bias / R², wind speed, circular wind-direction error, per-lead breakdown |
+| `evaluate_gap_filling` | 269 | the same, split by masked vs visible stations |
+| `_row_stat`, `_r2`, `_wind_dir_deg`, `_circular_mae_deg` | 61 | helpers called only by those two |
+| `_VAR_UNITS`, `_IDX` | 10 | module constants read only by those two |
+
+These are the functions that computed metrics **inside** the evaluation script.
+They became unreachable when `test.py` switched to dumping raw tensors to
+`predictions.pt` and letting `notebooks/` own every metric, so that the script
+and the analysis cannot disagree. **Results predating that switch were produced
+by this code**; results after it come from the notebooks. The two are not
+guaranteed to agree — see `EXPERIMENTS.md`, "Open questions".
+
+What remains in `src/engine/evaluate.py` (362 lines):
+
+* `collect_predictions` — the live path, called by `src/test.py:848`
+* `evaluate_per_station` — called by `notebooks/Station_MAE_Map.ipynb`
+
+Both were verified **byte-for-byte identical** before and after the extraction
+(SHA-256 of the exact source span). Removal was gated on an AST check that
+neither retained function references any moved name.
+
+The archived file is a record, not a module: it was cut out of a package and
+still expects `engine/evaluate.py`'s imports. To run any of it, paste the
+function back.
+
+Also removed in the same pass: `import shutil` in `src/main.py`, left behind by
+the `CopyCheckpointToPolybox` deletion.
+
+**Deliberately kept** (they look unused and are not):
+
+* `rioxarray` in `data/visualize.py` — imported for the `.rio` accessor side
+  effect; already marked `# noqa: F401`
+* `from __future__ import annotations` in `model/token_balance.py`
+* `StationMAE.mask_ratio` — read by `test.py:788`
+* `StationMAE.readout`, `StationMAE.num_horizons` — one-line assignments never
+  read back, left in place as a record of the configuration
+
+### 2026-08-25 — package `__init__.py` re-exports removed
+
+No file was moved and no import statement outside the three `__init__.py` files
+was touched. `data/__init__.py` and `model/__init__.py` were emptied of their
+eager re-exports, bringing them in line with the policy already documented in
+`engine/__init__.py`.
+
+Why it mattered: a package `__init__.py` executes on every import of any of its
+submodules.
+
+* `data/__init__.py` re-exported from `.visualize`, so every
+  `from data.dataset import ...` — i.e. **all four entry points** — imported
+  geopandas, rioxarray and matplotlib. Training runs paid for a plotting stack
+  used by one notebook.
+* `model/__init__.py` re-exported `StationMAELightning`, so every
+  `from model.mae import ...` imported pytorch_lightning. `src/test.py` does
+  this at line 657 and never references Lightning.
+
+Verified safe before the change: all 44 package imports in `src/`, `notebooks/`
+and `tests/` already use the submodule form (`from data.dataset import`,
+`from model.mae import`). Nothing used the flat re-export, so nothing broke.
+After the change, 112 imported names were re-checked against the modules that
+define them — all resolve.
+
+Transitive imports of each entry point, after:
+
+| entry point | pytorch_lightning | geopandas / rioxarray |
+|---|---|---|
+| `main.py` | yes — it trains | no |
+| `train_lstm.py` | yes — it trains | no |
+| `test.py` | **no** (was yes) | **no** (was yes) |
+| `test_lstm.py` | no | **no** (was yes) |
+
+The old re-export list is preserved in git history; it is not reproduced here
+because every name in it is still importable from its own module.
+
+Considered and NOT done, to keep import paths stable for the supervisor:
+moving `data/visualize.py` out of the data package, and `model/lightning_module.py`
+into `engine/`. Both are defensible on layering grounds — `visualize` is a
+notebook helper and `lightning_module` is a training wrapper rather than a
+model — but neither is required now that the `__init__` files no longer force
+them onto unrelated processes.

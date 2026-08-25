@@ -1,54 +1,31 @@
-# model/__init__.py
-from .embeddings import (
-    # Embedding modules
-    PositionalEmbedding,     # p1 — Fourier 2D positional (easting/northing)
-    StationEmbedding,        # p2 — MLP over topographic characteristics
-    TemporalEmbedding,       # t  — multi-scale Fourier encoding (Aurora-inspired)
-    DeltaTimeEmbedding,      # Δt — Fourier lead-time encoding [decoder only]
-    VariableProjection,      # v  — per-variable measurement projection
-    # Helper functions
-    encode_temporal,
-    # Constants
-    VARIABLE_NAMES,
-    NUM_VARIABLES,
-    TARGET_VARIABLE_NAMES,
-    NUM_TARGET_VARIABLES,
-    SPATIAL_FEATURE_NAMES,
-    SPATIAL_INPUT_DIM,
-    POSITION_DIM,
-    STATION_CHAR_DIM,
-    POSITION_FOURIER_DIM,
-    TEMPORAL_FOURIER_DIM,
-    DELTA_FOURIER_DIM,
-)
-from .encoder          import StationMAEEncoder, TransformerBlock, FactorisedTransformerBlock
-from .decoder          import StationMAEDecoder, CrossAttentionBlock
-from .mae              import StationMAE
-from .lightning_module import StationMAELightning
+"""Station-MAE model components.
 
-__all__ = [
-    "StationMAE",
-    "StationMAELightning",
-    "StationMAEEncoder",
-    "StationMAEDecoder",
-    "TransformerBlock",
-    "FactorisedTransformerBlock",
-    "CrossAttentionBlock",
-    "PositionalEmbedding",
-    "StationEmbedding",
-    "TemporalEmbedding",
-    "DeltaTimeEmbedding",
-    "VariableProjection",
-    "encode_temporal",
-    "VARIABLE_NAMES",
-    "NUM_VARIABLES",
-    "TARGET_VARIABLE_NAMES",
-    "NUM_TARGET_VARIABLES",
-    "SPATIAL_FEATURE_NAMES",
-    "SPATIAL_INPUT_DIM",
-    "POSITION_DIM",
-    "STATION_CHAR_DIM",
-    "POSITION_FOURIER_DIM",
-    "TEMPORAL_FOURIER_DIM",
-    "DELTA_FOURIER_DIM",
-]
+Nothing is re-exported eagerly. This file is executed by any
+`from model.<mod> import ...`, so a re-export here would pull the entire model
+stack — including lightning_module, and therefore pytorch_lightning — into
+processes that need only one piece. src/test.py imports `model.mae` and never
+touches Lightning; it should not pay for it.
+
+Import from the module:
+
+    from model.embeddings      import TARGET_VARIABLE_NAMES, VariableProjection
+    from model.encoder         import StationMAEEncoder
+    from model.decoder         import StationMAEDecoder
+    from model.mae             import StationMAE
+    from model.lightning_module import StationMAELightning
+    from model.lstm_baseline   import StationLSTM, StationLSTMLightning
+    from model.token_balance   import token_balance, format_report
+
+Every import in this repository already uses that form; the re-export block
+that used to live here was unused. Same policy as engine/__init__.py and
+data/__init__.py.
+
+Layering (no cycles):
+
+    embeddings
+      ├─> encoder ─┐
+      ├─> decoder ─┴─> mae ──> lightning_module
+      ├─> lstm_baseline
+      └─> (engine.evaluate)
+    token_balance is standalone.
+"""

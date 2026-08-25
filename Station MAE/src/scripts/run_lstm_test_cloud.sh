@@ -46,7 +46,7 @@ RUN_NAME="lstm-baseline-v1"
 #
 # NOTE ON THE PER-STATION DENORMALISATION FIX: it does not affect this script.
 # test_lstm.py only writes predictions.pt (normalised values, same schema as the
-# transformer dump); it never calls evaluate_full() or the other metric
+# transformer dump); it never calls the archived in-script metric
 # functions that were fixed. Re-running therefore reproduces the same file.
 # LSTM metrics are computed downstream from predictions.pt, where the
 # per-station inverse transform is applied correctly.
