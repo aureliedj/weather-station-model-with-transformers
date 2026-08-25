@@ -1,0 +1,46 @@
+cff-version: 1.2.0
+message: "If you use this code, please cite it as below."
+title: "Station-MAE: weather station modelling with transformers"
+abstract: >-
+  A Masked AutoEncoder over MeteoSwiss SwissMetNet station data (PeakWeather).
+  Given a 12-hour window of observations from 155 Swiss weather stations, the
+  model forecasts five variables at 13 lead times from 0 to 6 hours, with a
+  configurable fraction of stations hidden from the encoder so that forecasting
+  and spatial gap-filling are learned in one objective. A spatially blind LSTM
+  and two temporal baselines are included as references.
+type: software
+authors:
+  - family-names: "de Jong"
+    given-names: "Aurélie"
+    email: aurelie.dejong@live.com
+    # orcid: "https://orcid.org/0000-0000-0000-0000"   # [VERIFY] add if you have one
+# Supervisors and affiliation are intentionally left blank rather than guessed.
+# [VERIFY] Add supervisor(s) as additional authors or in `contact:` before handover.
+version: "1.0.0"
+date-released: "2026-08-25"   # [VERIFY] set to the handover date
+keywords:
+  - masked autoencoder
+  - transformer
+  - weather forecasting
+  - spatiotemporal deep learning
+  - PeakWeather
+  - SwissMetNet
+references:
+  - type: article
+    title: "PeakWeather: MeteoSwiss Weather Station Measurements for Spatiotemporal Deep Learning"
+    authors:
+      - family-names: Zambon
+        given-names: Daniele
+      - family-names: Cattaneo
+        given-names: Michele
+      - family-names: Marisca
+        given-names: Ivan
+      - family-names: Bhend
+        given-names: Jonas
+      - family-names: Nerini
+        given-names: Daniele
+      - family-names: Alippi
+        given-names: Cesare
+    year: 2025
+    url: "https://arxiv.org/abs/2506.13652"
+    notes: "The dataset this project is built on."

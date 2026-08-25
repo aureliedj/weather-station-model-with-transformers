@@ -1,0 +1,64 @@
+peakweather @ git+https://github.com/MeteoSwiss/PeakWeather.git@28a28c2d17f47b8bf33f22ee62fc92adac9b4778
+
+# ── Core deep learning ───────────────────────────────────────────────────────
+# Install with a plain:   pip install -r requirements.txt
+#
+# History of this pin (read before changing it)
+# ---------------------------------------------
+# This file used to pin `torch==2.13.0+cu128`, which DOES NOT EXIST. PyTorch's
+# cu128 index stops at 2.11.0+cu128 — from 2.12 onwards the builds moved to a
+# newer CUDA. The pin was unsatisfiable on any index, which is why installs
+# failed with the misleading "Could not find a version that satisfies".
+#
+# The reason a CUDA-12.8 build was wanted at all is also gone: an earlier Renku
+# node had a driver that topped out below 12.8, so the default PyPI wheel failed
+# CUDA init and fell back to CPU silently. As of 2026-07-31 the node reports
+#     driver 580.159.04, CUDA 13.0, A100-80GB MIG 3g.20gb (19,968 MiB, 28 SMs)
+# which is NEWER than the wheel needs, so the stock PyPI wheel works.
+#
+# ALWAYS run `python src/scripts/verify_env.py` after installing. A CUDA/driver
+# mismatch does not raise — it silently trains on CPU, and you find out days later.
+torch==2.13.0; sys_platform == "linux"
+torch==2.13.0; sys_platform == "darwin"      # macOS: MPS/CPU, no CUDA variants
+
+# ── Fallback: older driver that cannot run the stock wheel ───────────────────
+# THE PROJECT RUNS ON TWO RENKU COMPUTES WITH DIFFERENT DRIVER GENERATIONS:
+#   newer node: driver CUDA 13.0 → the stock PyPI wheel above works
+#   older node: driver CUDA 12.8 → stock wheel FAILS CUDA init
+#     (bare torch: silent CPU fallback; Lightning: hard crash
+#      "The NVIDIA driver on your system is too old ... found version 12080")
+# so no single pin can be correct for both. After ANY venv (re)build, run:
+#
+#     bash src/scripts/fix_torch_cuda.sh
+#
+# It is idempotent: exits immediately when CUDA initialises; otherwise reads
+# the driver's CUDA version from nvidia-smi and installs the matching build
+# (cu128 index tops out at torch 2.11.0 for Python 3.13 — verified 2026-08).
+# Do NOT put an --extra-index-url in this file: pip then resolves plain
+# versions ambiguously across indexes.
+#
+# Note: on the older node this leaves torch 2.11.0 while the newer node runs
+# 2.13.0 — checkpoints remain interchangeable (serialization format is
+# compatible across these versions), but keep it in mind for exact reproducibility.
+
+# ── Training framework + experiment tracking ─────────────────────────────────
+pytorch-lightning>=2.2
+wandb>=0.17
+
+# ── Data handling ────────────────────────────────────────────────────────────
+numpy>=1.24
+pandas>=2.0
+
+# ── Geospatial (station map visualisation) ───────────────────────────────────
+geopandas>=0.14
+rioxarray>=0.15
+matplotlib>=3.7
+
+# ── Notebooks ────────────────────────────────────────────────────────────────
+jupyterlab>=4.0
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+# NOTE: the pytest suite is NOT in this copy of the repository — see the
+# "Tests" section of README.md. pytest is kept as a dependency so the suite
+# runs as soon as tests/ is restored.
+pytest>=8.0
