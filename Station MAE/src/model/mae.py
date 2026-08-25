@@ -108,11 +108,6 @@ class StationMAE(nn.Module):
                                  scheduled from 0 at layer 0 to drop_path_rate at the
                                  deepest layer, in both encoder and decoder).
                                  Recommended range: 0.05–0.20.  Default 0.0 = disabled.
-        masked_only_loss:        If True, the training loss is computed only over
-                                 encoder-masked stations.  Visible stations are used
-                                 as context only and receive no gradient.
-                                 Appropriate for inpainting (max_delta=0) where visible
-                                 stations have a shortcut via their own input window.
     """
 
     # Every key main.py records in hyper_parameters["cfg"] that changes the
@@ -140,16 +135,11 @@ class StationMAE(nn.Module):
         "temporal_patch":     "temporal_patch",
         "value_embedding":    "value_embedding",
         "static_in_token":    "static_in_token",
-        "query_anchor":       "query_anchor",
-        "direct_head":        "direct_head",
         "readout":            "readout",
         "residual_head":      "residual_head",
         "cross_attn_decoder": "cross_attention_decoder",
         "station_local_decoder": "station_local_decoder",
         "drop_path_rate":     "drop_path_rate",
-        "masked_only_loss":   "masked_only_loss",
-        "use_persist_norm":   "use_persist_norm",
-        "delta0_weight":      "delta0_weight",
         "var_weights":        "var_weights",
     }
 
@@ -163,15 +153,12 @@ class StationMAE(nn.Module):
         that for ``dropout=0.0`` and for CLI flags that override the checkpoint.
 
         Two keys are derived rather than copied:
-          * ``wind_pair``    from the boolean ``wind_encoder``
           * ``num_horizons`` from ``max_delta // delta_grid_stride + 1``, the
             same arithmetic main.py uses; it must match the trained
             ``direct_proj`` width or the head reshapes into the wrong horizons.
         """
         kw = {arg: cfg[key] for key, arg in cls._CFG_TO_ARG.items() if key in cfg}
 
-        if "wind_encoder" in cfg:
-            kw["wind_pair"] = (3, 4) if cfg["wind_encoder"] else None
         if "max_delta" in cfg:
             stride = int(cfg.get("delta_grid_stride", 3) or 3)
             kw["num_horizons"] = int(cfg["max_delta"]) // stride + 1
@@ -198,37 +185,18 @@ class StationMAE(nn.Module):
         temporal_window:         int   = 0,
         temporal_patch:          int   = 1,
         value_embedding:         str   = "linear",     # v18
-        wind_pair:               "tuple | None" = None,  # v18
         static_in_token:         bool  = False,          # v21
-        query_anchor:            bool  = False,          # v23: anchor queries
-        direct_head:             bool  = False,          # v22: no decoder
         readout:                 str   = "last",         # "last" | "mean"
         num_horizons:            int   = 13,
         cross_attention_decoder: bool  = False,
         station_local_decoder:   bool  = False,   # decoder attends within one station only
         drop_path_rate:          float = 0.0,
-        masked_only_loss:         bool  = False,
         residual_head:            bool  = False,        # v15: ŷ = y(t0) + f(·)
-        delta0_weight:            float = 1.0,
         var_weights:              "list | None" = None,
         use_nll_loss:             bool  = False,
-        use_persist_norm:         bool  = False,
         window_size:              int   = 72,
     ):
         """
-        delta0_weight controls the relative loss weight of the k=0 horizon
-        (delta=0, reconstruction of the current timestep) versus all forecast
-        horizons (k≥1).
-
-        Justification: at delta=0, visible stations can almost directly copy
-        their own last input token — their contribution to the loss is near zero
-        and provides almost no gradient signal.  The k=0 target is mainly useful
-        for masked stations (gap-filling), but its presence at equal weight with
-        the 12 forecast horizons dilutes the forecasting gradient by 1/13.
-
-        delta0_weight=1.0  : uniform (current default, all K horizons equal)
-        delta0_weight=0.1  : down-weight k=0 to 1/10 of a forecast horizon
-        delta0_weight=0.0  : exclude k=0 entirely; model is a pure forecaster
 
         use_nll_loss controls whether the per-variable loss is MSE/Huber or the
         heteroscedastic Gaussian NLL (equivalent to CRPS for Gaussian predictions):
@@ -262,7 +230,6 @@ class StationMAE(nn.Module):
         variables contribute comparable gradient magnitudes regardless of their
         inherent predictability.
 
-        Call set_persist_mse() with a (num_target_vars,) tensor before training.
         The buffer is saved in checkpoints and restored on resume.
 
         use_persist_norm=False : default — raw MSE scale (backward compat)
@@ -274,14 +241,12 @@ class StationMAE(nn.Module):
 
         self.mask_ratio        = mask_ratio
         self.num_vars          = num_vars
-        self.delta0_weight     = float(delta0_weight)
         self.num_target_vars   = num_target_vars
-        self.masked_only_loss  = masked_only_loss
         self.use_nll_loss      = use_nll_loss
-        self.use_persist_norm  = use_persist_norm
 
         # Persistence MSE normaliser — one scalar per target variable.
-        # Initialised to 1.0 so the loss is unchanged until set_persist_mse()
+        # Retained at 1.0: present in every saved state_dict, so keeping the
+        # buffer means existing checkpoints load without unexpected keys.
         # is called.  Saved/restored automatically via Lightning checkpoints.
         self.register_buffer(
             "persist_mse",
@@ -364,7 +329,6 @@ class StationMAE(nn.Module):
             temporal_window=temporal_window,
             temporal_patch=temporal_patch,
             value_embedding=value_embedding,
-            wind_pair=wind_pair,
             static_in_token=static_in_token,
             drop_path_rate=drop_path_rate,
             step_emb=shared_step_emb,
@@ -397,16 +361,8 @@ class StationMAE(nn.Module):
         # rebalance and trained at a content fraction of 0.04%, so the readout
         # was never cleanly implicated. Treat it as untested, not as known-bad.
         assert readout in ("last", "mean"), readout
-        self.query_anchor = bool(query_anchor)
-        self.direct_head  = bool(direct_head)
         self.readout      = readout
         self.num_horizons = int(num_horizons)
-        if self.direct_head:
-            assert mask_ratio == 0.0, (
-                "direct_head reads each station's own tokens, so every station "
-                f"must be visible; got mask_ratio={mask_ratio}. Use "
-                "--mask_ratio 0, or drop --direct_head.")
-            self.direct_proj = nn.Linear(d_model, self.num_horizons * num_target_vars)
         self.station_local_decoder = bool(station_local_decoder)
         if self.station_local_decoder:
             # Same requirement as direct_head, same reason: the station-local
@@ -448,64 +404,7 @@ class StationMAE(nn.Module):
     # v22: direct head — one vector per station, straight to all K horizons
     # ------------------------------------------------------------------
 
-    def _direct_predict(self, encoded: torch.Tensor, n_stations: int) -> torch.Tensor:
-        """
-        encoded: (B, T*N, d_model) from the encoder, with every station visible.
-        returns: (B, K, N, num_target_vars)
-        """
-        B, TN, d = encoded.shape
-        assert TN % n_stations == 0, (
-            f"encoder returned {TN} tokens for {n_stations} stations; "
-            f"direct_head needs every station present (mask_ratio 0)")
-        T = TN // n_stations
-        h = encoded.view(B, T, n_stations, d)
-        s = h[:, -1] if self.readout == "last" else h.mean(dim=1)   # (B, N, d)
-        p = self.direct_proj(s)                                     # (B, N, K*Vt)
-        p = p.view(B, n_stations, self.num_horizons, self.num_target_vars_)
-        return p.permute(0, 2, 1, 3).contiguous()                   # (B, K, N, Vt)
 
-    def _query_anchor(self, encoded, visible_idx, B, N):
-        """
-        (B, N, d) — each VISIBLE station's own final encoder token, with the
-        learned mask_token standing in for stations the encoder never saw.
-
-        Why this exists
-        ---------------
-        The decoder query carries no observations, so reproducing a station's
-        own recent state was a RETRIEVAL problem: attention had to locate that
-        station among 1,872 encoder tokens, learned from scratch, starting from
-        a near-uniform softmax over 1,872 keys.
-
-        Measured on v15, the failure was ordered exactly by how copyable a
-        variable is — pressure 11.2x the persistence bound, wind 0.94x, i.e.
-        BETTER than a copy. It failed hardest where copying was the whole
-        answer, which is a lookup failure, not a modelling failure.
-
-        But the station index is known when the query is built. Attention was
-        being used to do a soft, learned lookup for something `gather` does
-        exactly. This hands the station its own representation directly — not
-        a single scalar per variable as the persistence residual did, but
-        everything the encoder built from its history and its neighbours, and
-        equally at every lead time rather than fading as delta grows.
-
-        NOT the removed input_context pathway
-        -------------------------------------
-        That one built a SEPARATE key/value set of last-step embeddings, zeros
-        for masked stations, and cross-attended to it — so at mask 0.5 half the
-        keys were zero vectors that softmax still had to spend mass on. Here
-        there is no extra attention and no extra key set: it is a gather into
-        the query, and a masked station receives a LEARNED vector, not a zero.
-
-        Masked stations keep mask_token, so nothing hidden from the encoder
-        reaches the query — the leak guard is structural, not a multiplication.
-        """
-        d      = encoded.shape[-1]
-        n_vis  = visible_idx.shape[1]
-        T      = encoded.shape[1] // n_vis
-        own    = encoded.view(B, T, n_vis, d)[:, -1]              # (B, N_vis, d)
-        anchor = self.decoder.mask_token.expand(B, N, d).clone()  # (B, N, d)
-        return anchor.scatter(
-            1, visible_idx.unsqueeze(-1).expand(B, n_vis, d), own.to(anchor.dtype))
 
     def _station_masked(self, masked_idx, B, N, device):
         """(B, N) bool — True where the encoder could not see the station."""
@@ -592,8 +491,7 @@ class StationMAE(nn.Module):
             encoded, spatial, y_hours, delta_steps,
             station_masked=self._station_masked(
                 masked_idx, x.shape[0], x.shape[2], x.device),
-            anchor=(self._query_anchor(encoded, visible_idx, x.shape[0], x.shape[2])
-                    if self.query_anchor else None))
+            )
         if self.use_nll_loss:
             preds, log_var = decoder_out
         else:
@@ -605,7 +503,7 @@ class StationMAE(nn.Module):
         y_target      = y[:, :, :self.num_target_vars]
         y_mask_target = y_mask[:, :, :self.num_target_vars]
         # Optionally restrict loss to masked stations (inpainting regime)
-        _midx = masked_idx if self.masked_only_loss else None
+        _midx = None          # masked_only_loss was never enabled
         loss  = self._supervised_loss(preds, y_target, y_mask_target, _midx, log_var=log_var)
 
         return loss, preds, masked_idx
@@ -663,42 +561,30 @@ class StationMAE(nn.Module):
         encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
         # encoded: (B, T*N_vis, d_model)   (T = patched sequence length)
 
-        # ── Predictions: direct head, or the query decoder ───────────────
-        if self.direct_head:
-            # direct_proj emits num_horizons * V in one shot, so a batch with a
-            # different K reshapes into the wrong horizons instead of failing.
-            # num_horizons comes from max_delta // delta_grid_stride + 1 in
-            # main.py; if either is changed without the other, catch it here
-            # rather than in a broadcast error three frames down.
-            assert K == self.num_horizons, (
-                f"direct_head was built for {self.num_horizons} horizons but "
-                f"this batch has K={K}. num_horizons must equal "
-                f"max_delta // delta_grid_stride + 1.")
-            preds_all, log_var_all = self._direct_predict(encoded, x.shape[2]), None
-        else:
-            # station_local decoder: every station must still be present. A
-            # divisibility check inside the decoder is NOT sufficient — with
-            # N_vis = N/2 the token count can still divide by N and the reshape
-            # then silently uses the wrong temporal length (caught by
-            # tests/test_station_local_decoder.py). masked_idx is the direct signal.
-            if self.station_local_decoder and masked_idx is not None \
-                    and masked_idx.numel() > 0:
-                raise RuntimeError(
-                    f"station_local_decoder needs every station present, but "
-                    f"{masked_idx.shape[-1]} of {x.shape[2]} stations were masked "
-                    f"(encoder.mask_ratio={self.encoder.mask_ratio}). Set "
-                    f"mask_ratio=0 for this model.")
+        # ── Predictions: Delta-query decoder ─────────────────────────────
+        # (the direct-head branch was removed: direct_head=False in every run)
+        # station_local decoder: every station must still be present. A
+        # divisibility check inside the decoder is NOT sufficient — with
+        # N_vis = N/2 the token count can still divide by N and the reshape
+        # then silently uses the wrong temporal length (caught by
+        # tests/test_station_local_decoder.py). masked_idx is the direct signal.
+        if self.station_local_decoder and masked_idx is not None \
+                and masked_idx.numel() > 0:
+            raise RuntimeError(
+                f"station_local_decoder needs every station present, but "
+                f"{masked_idx.shape[-1]} of {x.shape[2]} stations were masked "
+                f"(encoder.mask_ratio={self.encoder.mask_ratio}). Set "
+                f"mask_ratio=0 for this model.")
 
-            decoder_out = self.decoder(
-                encoded, spatial, y_hours, delta_steps,
-                station_masked=self._station_masked(
-                    masked_idx, x.shape[0], x.shape[2], x.device),
-                anchor=(self._query_anchor(encoded, visible_idx, x.shape[0], x.shape[2])
-                        if self.query_anchor else None))
-            if self.use_nll_loss:
-                preds_all, log_var_all = decoder_out
-            else:
-                preds_all, log_var_all = decoder_out, None
+        decoder_out = self.decoder(
+            encoded, spatial, y_hours, delta_steps,
+            station_masked=self._station_masked(
+                masked_idx, x.shape[0], x.shape[2], x.device),
+            )
+        if self.use_nll_loss:
+            preds_all, log_var_all = decoder_out
+        else:
+            preds_all, log_var_all = decoder_out, None
         # preds_all: (B, K, N, num_target_vars)
         # log_var_all: (B, K, N, num_target_vars)  or  None
 
@@ -717,14 +603,9 @@ class StationMAE(nn.Module):
         # GPU->CPU transfer on every training step and, under --compile, a
         # graph break at the same point every iteration. torch.where keeps the
         # decision on-device; the numerics are identical.
-        h_weights = encoded.new_ones(K)
-        _is_delta0 = (delta_steps[0, 0] == 0)
-        h_weights[0] = torch.where(
-            _is_delta0,
-            h_weights.new_tensor(self.delta0_weight),
-            h_weights.new_tensor(1.0),
-        )
-        h_weights = h_weights / h_weights.sum()   # normalise → sums to 1
+        # Uniform across horizons: delta0_weight was 1.0 in every run, so the
+        # torch.where collapsed to new_ones(K) / K.
+        h_weights = encoded.new_ones(K) / K
 
         # ── Per-horizon masking strategy ──────────────────────────────────
         # delta=0 (inpainting / reconstruction):
@@ -774,8 +655,7 @@ class StationMAE(nn.Module):
             # inputs. Uniform supervision is also what the LSTM baseline gets,
             # so the comparison is like-for-like.
             _has_masked = masked_idx is not None and masked_idx.shape[1] > 0
-            _midx_k = (masked_idx if (self.masked_only_loss and _has_masked)
-                       else None)
+            _midx_k = None    # masked_only_loss was never enabled
 
             loss_acc = loss_acc + h_weights[k] * self._supervised_loss(
                 preds_all[:, k], y_target_k, y_mask_target_k, _midx_k, log_var=lv_k
@@ -828,8 +708,7 @@ class StationMAE(nn.Module):
             encoded, spatial, y_hours, delta_steps,
             station_masked=self._station_masked(
                 masked_idx, x.shape[0], x.shape[2], x.device),
-            anchor=(self._query_anchor(encoded, visible_idx, x.shape[0], x.shape[2])
-                    if self.query_anchor else None))
+            )
         # When NLL mode is active, decoder returns (mean, log_var) — return mean only.
         preds = decoder_out[0] if self.use_nll_loss else decoder_out
         base  = self._persistence_base(x, x_mask, masked_idx)
@@ -940,37 +819,12 @@ class StationMAE(nn.Module):
             # of how spatially predictable each one is — wind (large persist MSE)
             # is down-weighted, pressure (small persist MSE) is up-weighted.
             # persist_mse is clamped to ≥ 1e-6 to guard against near-zero values.
-            if self.use_persist_norm:
-                var_loss = var_loss / self.persist_mse[v].clamp(min=1e-6)
 
             loss_per_var.append(var_loss)
 
         weighted = (weights * torch.stack(loss_per_var)).sum()
         return weighted / weights.sum()
 
-    # ------------------------------------------------------------------
-    # Convenience
-    # ------------------------------------------------------------------
-
-    def set_persist_mse(self, persist_mse: "torch.Tensor") -> None:
-        """Set per-variable persistence MSE for loss normalisation (Fix 2).
-
-        Must be called before training when ``use_persist_norm=True``.
-        The values are estimated from the validation set by the
-        ``_estimate_persist_mse`` helper in main.py.
-
-        Args:
-            persist_mse: (num_target_vars,) float tensor — persistence MSE
-                         per variable in normalised (z-score) space.
-                         Typically in the range [0.05, 0.80] depending on
-                         how spatially predictable each variable is.
-
-        Example::
-
-            persist_mse = _estimate_persist_mse(val_loader, num_target_vars=5)
-            model.set_persist_mse(persist_mse)
-        """
-        self.persist_mse.copy_(persist_mse.to(self.persist_mse.device))
 
     def count_parameters(self) -> int:
         """Return the total number of trainable parameters."""

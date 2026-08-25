@@ -256,19 +256,6 @@ class StationMAEDecoder(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        # ── Query anchor (v23) ───────────────────────────────────────────
-        # When the caller supplies `anchor`, a VISIBLE station's query starts
-        # from that station's OWN final encoder token instead of the shared
-        # mask_token. The station index is known when the query is built, so
-        # the token is fetched by gather — attention is not needed to find it.
-        #
-        # The two sources are on different scales: encoder output has passed
-        # through LayerNorm, mask_token is trunc_normal(std=0.02). Without a
-        # norm the visible queries would be ~50x the masked ones and the
-        # regimes would differ in magnitude rather than in content, so
-        # normalise the assembled anchor and let station_state carry the bit.
-        self.anchor_norm = nn.LayerNorm(d_model)
-
         # ------------------------------------------------------------------
         # STATION-STATE embedding — "was this station visible to the encoder?"
         #
@@ -440,7 +427,6 @@ class StationMAEDecoder(nn.Module):
         y_hours:       torch.Tensor,           # (B,) or (B, K)
         delta_steps:   torch.Tensor,           # (B,) or (B, K)
         station_masked: "torch.Tensor | None" = None,   # (B, N) bool: hidden from the encoder
-        anchor:         "torch.Tensor | None" = None,   # (B, N, d) v23 query anchor
     ) -> torch.Tensor:
         """
         Predict variables for all N stations at one or K target times.
@@ -496,12 +482,11 @@ class StationMAEDecoder(nn.Module):
         #                   + p1: pos_emb(spatial[n, :2])     — WHERE (position)
         #                   + p2: station_emb(spatial[n, 2:]) — WHERE (topo)
         # ------------------------------------------------------------------
-        if anchor is None:
-            spatial_q = self.mask_token.expand(B, N, -1).contiguous()   # (B, N, d_model)
-        else:
-            # v23: visible stations carry their own encoder token here; masked
-            # ones carry mask_token (mae.py assembles it). Nothing is retrieved.
-            spatial_q = self.anchor_norm(anchor)                        # (B, N, d_model)
+        # Every query starts from the shared mask_token. (The v23 "anchor"
+        # variant, which started VISIBLE queries from their own encoder token,
+        # was never enabled in any run and has been removed; station_state
+        # below still carries the visible/masked distinction.)
+        spatial_q = self.mask_token.expand(B, N, -1).contiguous()   # (B, N, d_model)
         spatial_q = spatial_q + self.pos_emb(spatial_b[..., :2])   # (B, N, d_model)
         spatial_q = spatial_q + self.station_emb(spatial_b[..., 2:])  # (B, N, d_model)
 

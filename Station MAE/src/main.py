@@ -47,12 +47,10 @@ Arguments
     --cross_attn_decoder   Cross-attention decoder (queries attend to encoder context)
     --grad_checkpoint      Gradient checkpointing (~66% less VRAM, ~33% slower)
     --drop_path_rate FLT   Max stochastic depth probability (0 = off; try 0.1)
-    --masked_only_loss     Supervise encoder-masked stations only (inpainting mode)
 
   Regularisation
     --train_stride   INT   Step between training window starts (1=default, 6=hourly, 12=2-h)
     --drop_path_rate FLT   Stochastic depth max prob (0=off, try 0.05–0.20)
-    --masked_only_loss     Supervise masked stations only (inpainting: --max_delta 0)
 
   Training
     --num_delta      INT   Lead-times per sample (1 = single-delta; default 1)
@@ -180,11 +178,6 @@ def parse_args() -> argparse.Namespace:
                         "(linearly scheduled from 0 at layer 0 to this value at the "
                         "deepest layer, in both encoder and decoder).  Default 0.0 = "
                         "disabled.  Recommended range 0.05–0.20 for overfitting runs.")
-    p.add_argument("--masked_only_loss",    action="store_true",
-                   help="Restrict training loss to encoder-masked stations only. "
-                        "Prevents visible stations from being used as supervision "
-                        "targets — appropriate for inpainting (--max_delta 0) where "
-                        "visible stations have a shortcut via their own input window.")
     p.add_argument("--value_embedding",     type=str, default="linear",
                    choices=["linear", "mlp", "fourier"],
                    help="v18 observation encoder. 'linear' (default) is v17: "
@@ -193,11 +186,6 @@ def parse_args() -> argparse.Namespace:
                         "piecewise basis over the value axis, best on kinks "
                         "and thresholds. 'fourier' is PLR (Gorishniy et al. "
                         "2022) and wins only on angular quantities.")
-    p.add_argument("--wind_encoder",        action="store_true",
-                   help="v18: encode (wind_u, wind_v) with ONE shared map "
-                        "instead of two independent ones, so the encoder can "
-                        "form speed and direction directly. Safe: the u and v "
-                        "masks are identical in 100%% of station-samples.")
     p.add_argument("--station_local_decoder", action="store_true",
                    help="Make the DECODER station-independent: each station's "
                         "Delta-queries attend only to one another and cross-attend "
@@ -213,25 +201,9 @@ def parse_args() -> argparse.Namespace:
                         "against the LSTM — if the error curves coincide, neighbouring "
                         "stations are contributing nothing and the spatial machinery is "
                         "not earning its cost.")
-    p.add_argument("--query_anchor",        action="store_true",
-                   help="v23. Start each VISIBLE station's decoder query from that "
-                        "station's OWN final encoder token (fetched by gather — the "
-                        "index is known when the query is built) instead of the shared "
-                        "mask_token. Masked stations keep mask_token, so nothing hidden "
-                        "from the encoder reaches the query. Removes the retrieval "
-                        "problem the persistence residual only short-circuited: it hands "
-                        "over the full learned representation rather than one scalar per "
-                        "variable, and does so equally at every lead time instead of "
-                        "fading as delta grows. Not the removed input_context pathway — "
-                        "there is no extra key/value set and no zero-vector keys.")
-    p.add_argument("--direct_head",         action="store_true",
-                   help="v22: drop the decoder. Read one vector per station "
-                        "from the encoder and project straight to all K "
-                        "horizons. Requires --mask_ratio 0, since the readout "
-                        "uses each station's own tokens.")
     p.add_argument("--readout",             type=str, default="last",
                    choices=["last", "mean"],
-                   help="Only with --direct_head. 'last' takes the most recent "
+                   help="Readout mode. 'last' takes the most recent "
                         "temporal slot (the attention analogue of an LSTM's "
                         "final hidden state, and the shortest path from a "
                         "station's last observation to its own prediction); "
@@ -256,29 +228,6 @@ def parse_args() -> argparse.Namespace:
                         "comparison on humidity and wind unfair to the transformer — "
                         "it gets 0.7x and 0.5x the gradient on exactly the variables "
                         "where it loses. Pass 1.0 1.0 1.0 1.0 1.0 for a fair match.")
-    p.add_argument("--delta0_weight", type=float, default=1.0,
-                   help="Relative loss weight for the k=0 horizon (delta=0, reconstruction) "
-                        "vs all forecast horizons (k≥1, weight=1.0). Weights are normalised "
-                        "to sum=1 before applying. "
-                        "1.0 = uniform (default, all K horizons equal). "
-                        "0.1 = down-weight reconstruction to 1/10 of a forecast horizon — "
-                        "  shifts gradient mass toward forecasting without discarding gap-fill. "
-                        "0.0 = exclude k=0 entirely; pure forecaster. "
-                        "Motivation: at delta=0, visible stations near-trivially copy their "
-                        "input, contributing near-zero loss that dilutes forecasting gradients. "
-                        "(Challu et al. 2023, N-HiTS; see REVIEW.md §5.4)")
-
-    p.add_argument("--persist_norm", action="store_true",
-                   help="Normalise each variable's loss by its persistence MSE, converting "
-                        "the loss to a skill-score scale (1.0 = matches persistence baseline). "
-                        "Estimated from 200 validation batches before training starts — no "
-                        "extra data or configuration needed. "
-                        "Effect: pressure (small persist MSE, high spatial predictability) "
-                        "gets a larger gradient weight; wind (large persist MSE, low "
-                        "predictability) gets a smaller weight — automatically balancing "
-                        "gradient contributions across variables. "
-                        "Compatible with both MSE/Huber and --nll_loss modes. "
-                        "(Rasp & Lerch 2018; Demaeyer et al. 2023 EUPPBench; REVIEW.md §5.1)")
     p.add_argument("--nll_loss", action="store_true",
                    help="Replace MSE/Huber with heteroscedastic Gaussian NLL (CRPS). "
                         "Adds a log-variance head to the decoder: the model predicts both "
@@ -541,71 +490,6 @@ class OverfitEarlyStop(object):
 
 
 
-def _estimate_persist_mse(
-    val_loader,
-    num_target_vars: int,
-    n_batches: int = 200,
-) -> "torch.Tensor":
-    """Estimate per-variable persistence MSE from the first *n_batches* validation batches.
-
-    Persistence prediction: repeat the last observed input step x[:, −1, :, :].
-    MSE is computed in normalised (z-score) space and averaged across all K
-    forecast horizons and all batches, weighted by sensor availability.
-
-    The result is used by StationMAE._supervised_loss() to convert each variable's
-    loss to a skill-score scale (L_v / MSE_persist_v), automatically equalising
-    gradient contributions across variables regardless of their spatial predictability.
-
-    Args:
-        val_loader:       Validation DataLoader (multi-delta batches, no gradient).
-        num_target_vars:  Number of predicted variables (typically 5).
-        n_batches:        Number of batches to average over (default 200 — fast,
-                          covers ~800 samples; set higher for more precision).
-
-    Returns:
-        persist_mse: (num_target_vars,) CPU float tensor — persistence MSE per variable.
-    """
-    totals = torch.zeros(num_target_vars)
-    counts = torch.zeros(num_target_vars)
-
-    with torch.no_grad():
-        for i, batch in enumerate(val_loader):
-            if i >= n_batches:
-                break
-            x           = batch["x"]            # (B, W, N, V)
-            y           = batch["y"]             # (B, K, N, V)  or  (B, N, V)
-            y_mask      = batch["y_mask"]        # same shape
-            delta_steps = batch["delta_steps"]   # (B, K) or (B,)
-
-            # Last observed input step — the persistence prediction for any horizon
-            persist = x[:, -1, :, :num_target_vars].float()  # (B, N, V_target)
-
-            if y.dim() == 4:           # multi-delta: (B, K, N, V)
-                K = y.shape[1]
-                for k in range(K):
-                    # Skip delta=0: the target IS the last input step, so
-                    # (persist - y_k)^2 = 0 exactly — including it inflates
-                    # the count without adding signal, biasing persist_mse low.
-                    if delta_steps[0, k].item() == 0:
-                        continue
-                    y_k  = y[:, k, :, :num_target_vars].float()      # (B, N, V_t)
-                    ok_k = y_mask[:, k, :, :num_target_vars].bool()   # (B, N, V_t)
-                    sq   = (y_k - persist).pow(2)                     # (B, N, V_t)
-                    for v in range(num_target_vars):
-                        ok_v = ok_k[..., v]
-                        totals[v] += (sq[..., v] * ok_v.float()).sum().item()
-                        counts[v] += ok_v.float().sum().item()
-            else:                      # single-delta: (B, N, V)
-                y_t = y[:, :, :num_target_vars].float()
-                ok  = y_mask[:, :, :num_target_vars].bool()
-                sq  = (y_t - persist).pow(2)
-                for v in range(num_target_vars):
-                    ok_v = ok[..., v]
-                    totals[v] += (sq[..., v] * ok_v.float()).sum().item()
-                    counts[v] += ok_v.float().sum().item()
-
-    persist_mse = totals / counts.clamp(min=1.0)
-    return persist_mse
 
 
 def main() -> None:
@@ -747,23 +631,17 @@ def main() -> None:
         factorised_encoder=args.factorised_encoder,
         temporal_window=args.temporal_window,
         value_embedding=args.value_embedding,
-        wind_pair=((3, 4) if args.wind_encoder else None),
         encoder_spatial_attn=not args.no_spatial_attn,
         station_local_decoder=args.station_local_decoder,
         static_in_token=args.static_in_token,
-        query_anchor=args.query_anchor,
-        direct_head=args.direct_head,
         readout=args.readout,
         num_horizons=(args.max_delta // args.delta_grid_stride + 1),
         temporal_patch=args.temporal_patch,
         cross_attention_decoder=args.cross_attn_decoder,
         drop_path_rate=args.drop_path_rate,
-        masked_only_loss=args.masked_only_loss,
         residual_head=args.residual_head,
         var_weights=args.var_weights,
-        delta0_weight=args.delta0_weight,
         use_nll_loss=args.nll_loss,
-        use_persist_norm=args.persist_norm,
         window_size=args.window,
     )
 
@@ -783,9 +661,6 @@ def main() -> None:
     if args.drop_path_rate > 0:
         print(f"Stochastic depth         : drop_path_rate={args.drop_path_rate}  "
               f"(linearly 0 → {args.drop_path_rate} across encoder + decoder layers)")
-    if args.masked_only_loss:
-        print("Loss                     : masked stations only  "
-              "(visible stations are context, not supervision targets)")
     if args.nll_loss:
         print("Loss mode                : Gaussian NLL / CRPS  "
               "(heteroscedastic — decoder predicts mean + log σ² per variable; "
@@ -798,15 +673,8 @@ def main() -> None:
         print(f"Factorised encoder       : ON  (temporal + spatial{_tw_str})")
     if args.cross_attn_decoder:
         print("Cross-attention decoder  : ON")
-    if args.value_embedding != "linear" or args.wind_encoder:
-        _w = "  |  shared (u,v) encoder" if args.wind_encoder else ""
-        print(f"Observation encoder      : {args.value_embedding}{_w}  (v18)")
-    if args.direct_head:
-        print(f"Prediction head          : DIRECT, readout={args.readout} "
-              f"(v22 — no decoder, no queries)")
-    if args.query_anchor:
-        print("Query anchor             : ON  (visible queries start from their own "
-              "encoder token; masked keep mask_token)")
+    if args.value_embedding != "linear":
+        print(f"Observation encoder      : {args.value_embedding}  (v18)")
     if args.static_in_token:
         print("Static features          : INSIDE the variable block (v21) — "
               "pos_emb / station_emb removed from the token")
@@ -827,20 +695,6 @@ def main() -> None:
     except Exception as _e:                                       # noqa: BLE001
         print(f"[token-balance] skipped ({type(_e).__name__}: {_e})")
 
-    # ── Persistence MSE normalisation (Fix 2) ───────────────────────────────
-    # Estimate per-variable persistence MSE from the validation set and store
-    # as a buffer in the model.  Must run BEFORE torch.compile so that the
-    # buffer is part of the compiled computation graph.
-    if args.persist_norm:
-        from model.embeddings import TARGET_VARIABLE_NAMES, NUM_TARGET_VARIABLES
-        _n_persist = len(val_loader)
-        print(f"Estimating persistence MSE from validation set ({_n_persist} batches) …")
-        _persist_mse = _estimate_persist_mse(val_loader, NUM_TARGET_VARIABLES, n_batches=_n_persist)
-        model.set_persist_mse(_persist_mse)
-        print("  Persistence MSE per variable (normalised space):")
-        for _v, (_name, _mse) in enumerate(zip(TARGET_VARIABLE_NAMES, _persist_mse)):
-            print(f"    {_name:12s}  persist_mse = {_mse:.4f}  "
-                  f"(σ_persist = {_mse.sqrt():.4f}  →  loss scale factor = {1/_mse.clamp(min=1e-6):.2f}×)")
 
     # ── torch.compile ────────────────────────────────────────────────────────
     # Compile BEFORE wrapping in Lightning so that the compiled forward()
@@ -891,11 +745,8 @@ def main() -> None:
         "factorised_encoder":  args.factorised_encoder,
         "temporal_window":     args.temporal_window,
         "value_embedding":     args.value_embedding,
-        "wind_encoder":        args.wind_encoder,
         "encoder_spatial_attn": not args.no_spatial_attn,
         "static_in_token":     args.static_in_token,
-        "query_anchor":        args.query_anchor,
-        "direct_head":         args.direct_head,
         "readout":             args.readout,
         "temporal_patch":      args.temporal_patch,
         # Structural (v15): MUST be recorded or evaluation rebuilds the
@@ -917,11 +768,8 @@ def main() -> None:
         "val_mask_ratio":     args.val_mask_ratio,
         "dropout":             args.dropout,
         "drop_path_rate":      args.drop_path_rate,
-        "masked_only_loss":    args.masked_only_loss,
-        "delta0_weight":       args.delta0_weight,
         "use_nll_loss":        args.nll_loss,
         "station_local_decoder": args.station_local_decoder,
-        "use_persist_norm":    args.persist_norm,
         "index_mode":          args.index_mode,
         "train_stride":        args.train_stride,
         "delta_mode":          args.delta_mode,

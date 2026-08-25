@@ -536,15 +536,7 @@ def main() -> None:
             # The defaults below are the pre-v18 behaviour, so v15 and
             # earlier checkpoints keep loading exactly as they did.
             value_emb    = saved_cfg.get("value_embedding", "linear") or "linear"
-            wind_enc     = bool(saved_cfg.get("wind_encoder", False))
             static_tok   = bool(saved_cfg.get("static_in_token", False))
-            direct_head  = bool(saved_cfg.get("direct_head", False))
-            readout      = saved_cfg.get("readout", "last") or "last"
-            # num_horizons must match the trained direct_proj output width, or
-            # the head is the wrong shape. main.py derives it the same way.
-            _max_delta   = int(saved_cfg.get("max_delta", 36))
-            _grid_stride = int(saved_cfg.get("delta_grid_stride", 3) or 3)
-            num_horizons = _max_delta // _grid_stride + 1
 
             # Strip "model." prefix (Lightning) and then "_orig_mod." prefix
             # (torch.compile wraps parameters under OptimizedModule).
@@ -575,11 +567,7 @@ def main() -> None:
             # Legacy .pt checkpoints all predate v18, so the pre-v18 defaults
             # are the correct reconstruction here.
             value_emb    = "linear"
-            wind_enc     = False
             static_tok   = False
-            direct_head  = False
-            readout      = "last"
-            num_horizons = 13
             state_dict   = ckpt["model_state_dict"]
             saved_cfg    = {}
 
@@ -591,11 +579,8 @@ def main() -> None:
               f"temporal_window={temp_window}  temporal_patch={temp_patch}  "
               f"cross_attn_decoder={cross_attn}")
         print(f"  [v15] residual_head={residual}")
-        print(f"  [v18+] value_embedding={value_emb}  wind_encoder={wind_enc}  "
+        print(f"  [v18+] value_embedding={value_emb}  "
               f"static_in_token={static_tok}")
-        print(f"  [v22]  direct_head={direct_head}"
-              + (f"  readout={readout}  num_horizons={num_horizons}"
-                 if direct_head else ""))
 
         # ── Detect an NLL (heteroscedastic) checkpoint ────────────────────────
         # The cfg key "nll_loss" is unreliable (absent/None on older runs such as
@@ -771,6 +756,12 @@ def main() -> None:
         _structural = ("patch_merge", "patch_norm", "var_proj",
                        "input_cross_attn",   # <-- the one that was silently dropped
                        "encoder.blocks", "decoder.blocks")
+        # decoder.anchor_norm.* appears in every checkpoint trained before the
+        # v23 query-anchor option was removed. The module no longer exists, so
+        # the keys land in `unexpected` and are ignored — expected, not a fault.
+        _known_stale = ("decoder.anchor_norm",)
+        unexpected = [k for k in unexpected
+                      if not any(s in k for s in _known_stale)]
         _bad = [k for k in list(missing) + list(unexpected)
                 if any(s in k for s in _structural)]
         if _bad:
@@ -795,19 +786,6 @@ def main() -> None:
         # CLI --test_mask_ratios overrides, enabling e.g. 0.0 vs 0.5 comparison.
         _test_mrs = (args.test_mask_ratios if args.test_mask_ratios
                      else [model.mask_ratio])
-
-        # A direct-head model reads each station's prediction from that
-        # station's OWN tokens. A masked station has no tokens in the sequence,
-        # so there is nothing to read from and the readout would silently take
-        # a different station's row. Drop any non-zero ratio rather than dump
-        # predictions that look plausible and are misaligned.
-        if model.direct_head:
-            _dropped = [mr for mr in _test_mrs if mr > 0.0]
-            _test_mrs = [mr for mr in _test_mrs if mr == 0.0] or [0.0]
-            if _dropped:
-                print(f"  [direct_head] skipping mask ratios {_dropped} — the "
-                      f"readout needs every station present. Evaluating "
-                      f"{_test_mrs} only.")
 
         # Same restriction, different cause: --station_local_decoder folds the
         # station axis into the batch, so the decoder needs the encoder to
