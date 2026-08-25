@@ -81,7 +81,6 @@ Arguments
 import argparse
 import os
 import random
-import shutil
 import threading
 
 import numpy as np
