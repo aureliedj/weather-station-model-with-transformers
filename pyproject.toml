@@ -1,0 +1,37 @@
+# Tooling configuration. This project is NOT packaged — there is no
+# [build-system] and nothing here makes it pip-installable. The file exists so
+# that `ruff` and `black` behave identically for everyone who opens the repo.
+
+[tool.ruff]
+line-length = 100          # matches the existing code, which is not 88-column
+target-version = "py310"
+exclude = ["archive", "notebooks", ".venv", "__pycache__"]
+
+[tool.ruff.lint]
+# Correctness rules only. Style rules are deliberately NOT enabled: the code
+# uses column-aligned assignments and comments throughout, which most style
+# rules would undo for no gain.
+select = ["F", "E9", "B"]
+ignore = [
+    "B023",   # false positive here: the only hit is `_arch` in test.py, which is
+              # defined AND called inside the same loop iteration, so the closure
+              # never outlives the binding.
+    "B008",   # function call in default argument — used deliberately
+]
+
+[tool.ruff.lint.per-file-ignores]
+# c_enc_heads / c_dec_heads document the legacy-checkpoint branch and are kept
+# on purpose; see EXPERIMENTS.md, "Open questions".
+"src/test.py" = ["F841"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+extend-exclude = "archive|notebooks"
+
+# ── NOTE: black has NOT been run on this repository ──────────────────────────
+# Running it would rewrite ~5,000 lines across 17 files, including collapsing
+# the column alignment used consistently in the model and launcher code. The
+# config above is here so that IF the next maintainer decides to adopt it, the
+# reformat happens once, in its own commit, at a line length that matches the
+# code as written. Do not mix that commit with a substantive change.
