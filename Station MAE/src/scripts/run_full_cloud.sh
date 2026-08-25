@@ -187,8 +187,9 @@ OBS_ENCODER="--value_embedding mlp"
 #
 # Aurora has ~3 statics against many variables; here 15 statics against 6
 # weather variables, so slot-per-feature would drown the weather in its own block.
-# STATIC="--static_in_token"                       # <- v21 statics as slots
-STATIC=""                                          # <- v20 / v18 separate branches
+# Never enabled in any surviving run (static_in_token=False in v27, v30-nll,
+# v31 and v32-blind). The flag still exists in main.py: add --static_in_token
+# to the invocation below to try it.
 
 # ── Persistence residual head (v20) ──────────────────────────────────────────
 # y_hat = base + f(.)   where base = the station's own last observation if it
@@ -311,8 +312,8 @@ STATIC=""                                          # <- v20 / v18 separate branc
 #   - DropPath bf16 threshold fix, GPU-sync removal in the loss
 # No architecture/config difference from v26-res/v26.1 otherwise, so any delta
 # against those is attributable to the embedding fixes above, not the config.
-ANCHOR=""                                          # <- v20 / v23 / v26: off
-#ANCHOR="--query_anchor"                          # <- v24 arm
+# Never enabled in any surviving run (query_anchor=False in all four). The flag
+# still exists in main.py: add --query_anchor to the invocation below to try it.
 
 # ── Delta=0 loss weight ───────────────────────────────────────────────────────
 # The full-budget v20-vs-v23 run (100 epochs, not the 15-epoch sanity check)
@@ -692,10 +693,8 @@ python main.py \
     --grad_checkpoint \
     --cross_attn_decoder \
     $OBS_ENCODER \
-    $STATIC \
     $RESIDUAL \
     $NLL \
-    $ANCHOR \
     $SPATIAL \
     $DECODER_LOCAL \
     $DIRECT \

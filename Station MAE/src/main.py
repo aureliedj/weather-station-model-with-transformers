@@ -72,13 +72,6 @@ Arguments
 
   Checkpointing
     --save_dir       STR   Directory for checkpoints (default "checkpoints")
-    --save_every     INT   Save a numbered snapshot every N epochs (default 5)
-                           Ignored when --save_every_steps > 0.
-    --save_every_steps INT Save a numbered snapshot every N training steps (default 0 = off)
-                           When set, replaces --save_every.  Useful for long epochs (>30 min):
-                           set equal to --val_check_interval so checkpoints align with
-                           validation runs.  Example: --val_check_interval 4000
-                           --save_every_steps 4000  → check + save every ~30 min on A100.
     --resume         STR   Path to Lightning .ckpt file to resume from
 
   Logging / WandB
@@ -393,18 +386,6 @@ def parse_args() -> argparse.Namespace:
 
     # Checkpointing
     p.add_argument("--save_dir",        type=str, default="checkpoints")
-    p.add_argument("--polybox_dir",     type=str, default=None,
-                   help="If set, copy best.ckpt and last.ckpt to this directory after "
-                        "each validation. Useful for persisting checkpoints to a remote "
-                        "mount (e.g. Polybox). The WandB run name is appended as a "
-                        "subdirectory so multiple runs stay organised. "
-                        "Example: --polybox_dir /home/renku/work/polybox-capstone/checkpoints")
-    p.add_argument("--save_every",      type=int, default=5)
-    p.add_argument("--save_every_steps", type=int, default=0,
-                   help="Save a periodic checkpoint every N training steps (0 = off, "
-                        "use --save_every epochs instead). Useful when one epoch is "
-                        ">30 min: set to the same value as --val_check_interval so "
-                        "checkpoints always align with a validation run.")
     p.add_argument("--resume",          type=str, default=None)
 
     # Sub-epoch validation / checkpointing
@@ -413,8 +394,8 @@ def parse_args() -> argparse.Namespace:
                         "(0 = once per epoch, the default). EarlyStopping patience "
                         "then counts in validation-checks, not epochs. Example for a "
                         "50-min epoch on A100 (~6500 steps): use 4000 for ~30-min "
-                        "checks. Set --save_every_steps to the same value to also save "
-                        "checkpoints at each validation point.")
+                        "checks. Checkpointing is unaffected: best.ckpt and last.ckpt are "
+                        "written by ModelCheckpoint at every validation point.")
 
     # Logging / WandB
     p.add_argument("--wandb_project",   type=str, default=None,
@@ -479,9 +460,8 @@ class OverfitEarlyStop(object):
     and in WandB as ``diag/gen_gap``.
 
     Implemented as a plain object with a no-op ``__getattr__`` so every Lightning
-    hook we don't define is silently ignored (same pattern as
-    ``CopyCheckpointToPolybox``); this avoids importing ``pytorch_lightning`` at
-    module import time.
+    hook we don't define is silently ignored; this avoids importing
+    ``pytorch_lightning`` at module import time.
     """
 
     def __getattr__(self, name):
@@ -559,44 +539,6 @@ class OverfitEarlyStop(object):
                       f"{self.best_epoch}). best.ckpt holds the pre-overfit model.")
 
 
-class CopyCheckpointToPolybox(object):
-    """
-    Lightning-compatible callback that copies best.ckpt and last.ckpt to a
-    remote directory (e.g. Polybox mount) after every validation run.
-
-    Files are copied to ``{polybox_dir}/{run_name}/`` so multiple training
-    runs stay organised by their WandB run name.  Failures (e.g. mount
-    temporarily unavailable) are caught and logged without crashing training.
-    """
-
-    def __getattr__(self, name):
-        """Return a no-op for any Lightning hook not explicitly defined."""
-        return lambda *args, **kwargs: None
-
-    def __init__(self, src_dir: str, polybox_dir: str, run_name: str):
-        self.src_dir = src_dir
-        self.dst_dir = os.path.join(polybox_dir, run_name)
-        try:
-            os.makedirs(self.dst_dir, exist_ok=True)
-            print(f"[Polybox] Checkpoint mirror: {self.dst_dir}")
-        except Exception as e:
-            print(f"[Polybox] WARNING — could not create {self.dst_dir}: {e}")
-
-    def _copy(self, filename: str) -> None:
-        src = os.path.join(self.src_dir, filename)
-        dst = os.path.join(self.dst_dir, filename)
-        if not os.path.exists(src):
-            return
-        try:
-            shutil.copy2(src, dst)
-            size_mb = os.path.getsize(dst) / 1e6
-            print(f"[Polybox] ✓ {filename}  ({size_mb:.0f} MB) → {self.dst_dir}")
-        except Exception as e:
-            print(f"[Polybox] WARNING — could not copy {filename}: {e}")
-
-    def on_validation_end(self, trainer, pl_module) -> None:   # noqa: N802
-        self._copy("best.ckpt")
-        self._copy("last.ckpt")
 
 
 def _estimate_persist_mse(
@@ -1056,16 +998,6 @@ def main() -> None:
         LearningRateMonitor(logging_interval="step"),
     ]
 
-    if args.polybox_dir:
-        _run_name = args.wandb_run_name or "unnamed-run"
-        callbacks.append(
-            CopyCheckpointToPolybox(
-                src_dir    = args.save_dir,
-                polybox_dir= args.polybox_dir,
-                run_name   = _run_name,
-            )
-        )
-        print(f"Polybox mirror           : {args.polybox_dir}/{_run_name}/")
 
     if args.patience > 0:
         callbacks.append(
