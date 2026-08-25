@@ -38,9 +38,25 @@
 
 set -euo pipefail
 
-export WANDB_API_KEY="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"
+# ── Weights & Biases ─────────────────────────────────────────────────────────
+# The key is read from the environment; it is NEVER stored in the repository.
+# Set it once per session, or persist it with `wandb login`:
+#     export WANDB_API_KEY=...        # or:  wandb login
+# Training runs fine without it — src/scripts/_wandb_preflight.sh falls back to
+# offline mode, and no metric is lost from the checkpoints.
+if [[ -z "${WANDB_API_KEY:-}" ]]; then
+  echo "[wandb] WANDB_API_KEY not set — logging will run offline."
+  echo "        export WANDB_API_KEY=...   (or run: wandb login)"
+fi
 
-DATA_ROOT="/home/renku/work/PeakWeatherDataset"
+# ── Dataset location ─────────────────────────────────────────────────────────
+# Override without editing this file:  DATA_ROOT=/path/to/PeakWeatherDataset bash ...
+DATA_ROOT="${DATA_ROOT:-/home/renku/work/PeakWeatherDataset}"
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "[run_full_cloud.sh] dataset not found at: $DATA_ROOT"
+  echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
+  exit 1
+fi
 
 # Checkpoints saved inside the project directory — guaranteed writable on Renku.
 # Saving to /home/renku/work/ sub-directories outside this project can silently

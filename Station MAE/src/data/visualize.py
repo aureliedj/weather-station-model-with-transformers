@@ -16,7 +16,7 @@ import matplotlib.lines as mlines
 import geopandas as gpd
 import rioxarray  # noqa: F401 — required to register the .rio accessor on DataArray
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 

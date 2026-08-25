@@ -242,61 +242,6 @@ STATIC_SLOTS_DEFAULT = ((0, 2), (2, 15))
 DELTA_FOURIER_DIM = 16
 
 
-# ---------------------------------------------------------------------------
-# Static encoding helpers  (preprocessing / CPU, not nn.Module)
-# ---------------------------------------------------------------------------
-
-def encode_spatial_static(station_info: dict) -> torch.Tensor:
-    """
-    Encode static station metadata into a 15-dimensional feature vector.
-
-    The output layout matches SPATIAL_INPUT_DIM = 15:
-        columns  0:2  → easting, northing  (consumed by PositionalEmbedding p1)
-        columns 2:15  → characteristics    (consumed by StationEmbedding     p2)
-
-    Aspect angles are sin/cos encoded (genuinely cyclic).
-    All other features are plain scalars and should be normalised
-    (zero-mean, unit-variance across stations) before being passed to the
-    embedding modules.
-
-    Args:
-        station_info: dict-like with keys matching SPATIAL_FEATURE_NAMES
-                      (e.g. a row from ds.stations_table).
-
-    Returns:
-        torch.Tensor of shape (15,), dtype float32.
-    """
-    def _sincos_deg(deg: float):
-        rad = math.radians(float(deg))
-        return math.sin(rad), math.cos(rad)
-
-    # Aspect angles are genuinely cyclic (compass direction → sin/cos correct)
-    sin_asp2k,  cos_asp2k  = _sincos_deg(station_info["ASPECT_2000M_SIGRATIO1"])
-    sin_asp10k, cos_asp10k = _sincos_deg(station_info["ASPECT_10000M_SIGRATIO1"])
-
-    features = [
-        # Geographic position — Swiss LV95/LV03 Cartesian coordinates in metres.
-        # These are NOT angles: sin/cos would be meaningless at ~2.6 M metre scale.
-        # Kept as plain scalars; normalised (zero-mean, unit-var) across the station
-        # population by the caller (build_spatial_features / compute_spatial_normalization).
-        float(station_info["swiss_easting"]),                        # 1 — CH1903 easting  (m) **
-        float(station_info["swiss_northing"]),                       # 1 — CH1903 northing (m) **
-        # Aspect angles — sin/cos encoding is correct for cyclic compass directions
-        sin_asp2k,  cos_asp2k,                                       # 2 — local aspect
-        sin_asp10k, cos_asp10k,                                      # 2 — regional aspect
-        # Scalar topographic features (all normalised by caller)
-        float(station_info["station_height"]),                       # 1 — sensor elevation ***
-        float(station_info["dem"]),                                  # 1 — DEM elevation    ***
-        float(station_info["TPI_2000M"]),                            # 1 — valley(−) vs ridge(+) ***
-        float(station_info["SLOPE_2000M_SIGRATIO1"]),                # 1 — local slope steepness ***
-        float(station_info["SLOPE_10000M_SIGRATIO1"]),               # 1 — regional slope steepness ***
-        float(station_info["SN_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — S-N gradient local   ***
-        float(station_info["SN_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — S-N gradient regional    ***
-        float(station_info["WE_DERIVATIVE_2000M_SIGRATIO1"]),        # 1 — W-E gradient local (Föhn) ***
-        float(station_info["WE_DERIVATIVE_10000M_SIGRATIO1"]),       # 1 — W-E gradient regional ***
-    ]   # total: 2 + 4 + 9 = 15
-
-    return torch.tensor(features, dtype=torch.float32)
 
 
 def encode_temporal(ts: pd.Timestamp) -> float:
@@ -1245,23 +1190,3 @@ class VariableProjection(nn.Module):
                                       missing_keys, unexpected_keys, error_msgs)
 
 
-# ---------------------------------------------------------------------------
-# Normalisation helper  (used during preprocessing, not training)
-# ---------------------------------------------------------------------------
-
-def compute_spatial_normalization(
-    all_spatial_features: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Compute per-feature mean and std across all stations for normalisation.
-
-    Args:
-        all_spatial_features: (N_stations, 15) from encode_spatial_static.
-
-    Returns:
-        mean: (15,)
-        std:  (15,) — clamped to avoid division by zero.
-    """
-    mean = all_spatial_features.mean(dim=0)
-    std  = all_spatial_features.std(dim=0).clamp(min=1e-6)
-    return mean, std

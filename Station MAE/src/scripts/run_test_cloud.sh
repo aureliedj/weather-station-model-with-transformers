@@ -30,7 +30,14 @@
 
 set -euo pipefail
 
-DATA_ROOT="/home/renku/work/PeakWeatherDataset"
+# Override without editing this file:
+#   DATA_ROOT=/path/to/PeakWeatherDataset bash src/scripts/run_test_cloud.sh
+DATA_ROOT="${DATA_ROOT:-/home/renku/work/PeakWeatherDataset}"
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "[run_test_cloud.sh] dataset not found at: $DATA_ROOT"
+  echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
+  exit 1
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src

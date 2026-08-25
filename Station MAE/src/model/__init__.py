@@ -7,9 +7,7 @@ from .embeddings import (
     DeltaTimeEmbedding,      # Δt — Fourier lead-time encoding [decoder only]
     VariableProjection,      # v  — per-variable measurement projection
     # Helper functions
-    encode_spatial_static,
     encode_temporal,
-    compute_spatial_normalization,
     # Constants
     VARIABLE_NAMES,
     NUM_VARIABLES,
@@ -41,9 +39,7 @@ __all__ = [
     "TemporalEmbedding",
     "DeltaTimeEmbedding",
     "VariableProjection",
-    "encode_spatial_static",
     "encode_temporal",
-    "compute_spatial_normalization",
     "VARIABLE_NAMES",
     "NUM_VARIABLES",
     "TARGET_VARIABLE_NAMES",

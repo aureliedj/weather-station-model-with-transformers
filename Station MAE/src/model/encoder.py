@@ -24,11 +24,8 @@ Masking strategy:
          from its own recent history
 """
 
-import warnings
-
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint as _cp_checkpoint
 from .embeddings import (
     PositionalEmbedding,
