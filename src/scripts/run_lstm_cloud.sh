@@ -19,19 +19,22 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
+SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
+PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
+cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
+
 # Override without editing this file:
 #   DATA_ROOT=/path/to/PeakWeatherDataset bash src/scripts/run_lstm_cloud.sh
-DATA_ROOT="${DATA_ROOT:-/home/renku/work/PeakWeatherDataset}"
+# Default matches src/download.py's own default (<project root>/PeakWeatherDataset),
+# not a Renku-specific path — this project's copy lives at the project root.
+DATA_ROOT="${DATA_ROOT:-${PROJ_DIR}/PeakWeatherDataset}"
 if [[ ! -d "$DATA_ROOT" ]]; then
   echo "[run_lstm_cloud.sh] dataset not found at: $DATA_ROOT"
   echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
   exit 1
 fi
 LOCAL_CACHE="/tmp/station_mae_cache"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
-SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
-PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
-cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
 
 # WandB offline on Renku (flaky egress falsely marks runs "crashed"; training is
 # unaffected). Backfill later: wandb sync "$(ls -dt wandb/run-* | head -1)"

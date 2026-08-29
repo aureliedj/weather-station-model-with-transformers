@@ -30,19 +30,21 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
+SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src
+PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root
+cd "${SRC_DIR}"
+
 # Override without editing this file:
 #   DATA_ROOT=/path/to/PeakWeatherDataset bash src/scripts/run_test_cloud.sh
-DATA_ROOT="${DATA_ROOT:-/home/renku/work/PeakWeatherDataset}"
+# Default matches src/download.py's own default (<project root>/PeakWeatherDataset),
+# not a Renku-specific path — this project's copy lives at the project root.
+DATA_ROOT="${DATA_ROOT:-${PROJ_DIR}/PeakWeatherDataset}"
 if [[ ! -d "$DATA_ROOT" ]]; then
   echo "[run_test_cloud.sh] dataset not found at: $DATA_ROOT"
   echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
   exit 1
 fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
-SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src
-PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root
-cd "${SRC_DIR}"
 
 # Fail fast if torch cannot use the GPU (wheel/driver mismatch).
 source "${SCRIPT_DIR}/_cuda_preflight.sh"
@@ -57,7 +59,7 @@ source "${SCRIPT_DIR}/_cuda_preflight.sh"
 #   v31          yes               global       0.0        0.0        (0.5 is OOD)
 #   v32-blind    no                station-local 0.0       0.0 only   (see below)
 #   lstm-*       n/a               n/a          n/a        use run_lstm_test_cloud.sh
-RUN_NAME="${RUN_NAME:-v32-blind}"
+RUN_NAME="${RUN_NAME:-v27}"
 
 CKPT_DIR="full_run_cloud_${RUN_NAME}"
 CHECKPOINT="${PROJ_DIR}/checkpoints/${CKPT_DIR}/best.ckpt"
@@ -113,11 +115,17 @@ STRIDE=9
 #       checkpoints TRAINED with masking (v27, v30-nll); for a model trained at
 #       MR 0 it is out of distribution and reports robustness, not a ranking.
 #
-# v27 and v30-nll were both trained at MR 0.5, so both ratios are in
-# distribution for either: 0.0 gives the LSTM-comparable forecasting numbers,
-# 0.5 the masked-station comparison. Run the two models at the SAME seed and
-# batch size or the MR 0.5 masked sets differ and the comparison is unpaired —
-# which is why the v27 dumps from 2026-08-08 (pre-seed) cannot be reused.
+# v27 and v30-nll train EXCLUSIVELY at MR 0.5 (main.py's --mask_ratio is not
+# swept), so MR 0.5 is the in-distribution regime and MR 0.0 is not — it is
+# selected on validation at val_mask_ratio 0.0 by default, a token count
+# (3,720 vs ~1,872) the encoder never receives a gradient step on. Both are
+# still worth reporting: 0.0 gives the LSTM-comparable forecasting numbers
+# (at the cost of being an out-of-distribution regime for these two models),
+# 0.5 gives the masked-station comparison these models were actually trained
+# for. See experimental_setup.tex's "Known issues" section. Run the two
+# models at the SAME seed and batch size or the MR 0.5 masked sets differ and
+# the comparison is unpaired — which is why the pre-2026-08-25 v27/v30-nll
+# dumps (2026-08-18/19) cannot be reused for a masked-station comparison.
 #
 # v32-blind is MR 0.0 ONLY, and not by convention: --station_local_decoder
 # folds the station axis into the batch, so the decoder requires encoder tokens

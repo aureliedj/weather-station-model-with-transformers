@@ -19,18 +19,21 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
+SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
+PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
+cd "${SRC_DIR}"
+
 # Override without editing this file:
 #   DATA_ROOT=/path/to/PeakWeatherDataset bash src/scripts/run_lstm_test_cloud.sh
-DATA_ROOT="${DATA_ROOT:-/home/renku/work/PeakWeatherDataset}"
+# Default matches src/download.py's own default (<project root>/PeakWeatherDataset),
+# not a Renku-specific path — this project's copy lives at the project root.
+DATA_ROOT="${DATA_ROOT:-${PROJ_DIR}/PeakWeatherDataset}"
 if [[ ! -d "$DATA_ROOT" ]]; then
   echo "[run_lstm_test_cloud.sh] dataset not found at: $DATA_ROOT"
   echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
   exit 1
 fi
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
-SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
-PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
-cd "${SRC_DIR}"
 
 # Fail fast if torch cannot use the GPU (wheel/driver mismatch on the older node).
 source "${SCRIPT_DIR}/_cuda_preflight.sh"                                              # so `python main.py` and `from data...` resolve

@@ -26,14 +26,6 @@ if [[ -z "${WANDB_API_KEY:-}" ]]; then
   echo "        export WANDB_API_KEY=...   (or run: wandb login)"
 fi
 
-# ── Dataset location ─────────────────────────────────────────────────────────
-DATA_ROOT="${DATA_ROOT:-/home/renku/work/PeakWeatherDataset}"
-if [[ ! -d "$DATA_ROOT" ]]; then
-  echo "[run_full_cloud.sh] dataset not found at: $DATA_ROOT"
-  echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
-  exit 1
-fi
-
 # ── Paths ────────────────────────────────────────────────────────────────────
 # Checkpoints go inside the project directory: guaranteed writable on Renku,
 # unlike sibling paths under /home/renku/work/. Copy to Polybox by hand after
@@ -42,6 +34,16 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../src/scripts
 SRC_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"                    # .../src   — python entry points live here
 PROJ_DIR="$(cd "${SRC_DIR}/.." && pwd)"                      # project root — checkpoints/, test_results/, report/
 cd "${SRC_DIR}"                                              # so `python main.py` and `from data...` resolve
+
+# ── Dataset location ─────────────────────────────────────────────────────────
+# Default matches src/download.py's own default (<project root>/PeakWeatherDataset),
+# not a Renku-specific path — this project's copy lives at the project root.
+DATA_ROOT="${DATA_ROOT:-${PROJ_DIR}/PeakWeatherDataset}"
+if [[ ! -d "$DATA_ROOT" ]]; then
+  echo "[run_full_cloud.sh] dataset not found at: $DATA_ROOT"
+  echo "  Set DATA_ROOT, or fetch it with:  python src/download.py"
+  exit 1
+fi
 SAVE_DIR="${PROJ_DIR}/checkpoints/full_run_cloud_v32-blind"   # own dir — never share a SAVE_DIR (that is what produced the -v1 checkpoints)
 LOCAL_CACHE="/tmp/station_mae_cache"
 

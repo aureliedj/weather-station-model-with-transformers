@@ -61,8 +61,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--run_name", type=str, required=True,
                    help="Label stored in the output .npz, e.g. 'v27'.")
     p.add_argument("--data_root", type=str,
-                   default=os.environ.get("DATA_ROOT",
-                                           "/home/renku/work/PeakWeatherDataset"))
+                   default=os.environ.get(
+                       "DATA_ROOT",
+                       os.path.join(os.path.dirname(os.path.dirname(
+                           os.path.dirname(os.path.abspath(__file__)))),
+                           "PeakWeatherDataset")),
+                   help="Defaults to <project root>/PeakWeatherDataset, same "
+                        "as src/download.py's own default.")
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--exclude_stations", type=str, nargs="*", default=None,
                    help="Defaults to the checkpoint's own exclude_stations "

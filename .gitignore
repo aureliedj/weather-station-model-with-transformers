@@ -23,3 +23,10 @@ archive/_junk/
 # ── Bulk artefacts now at the repo root ──────────────────────────────────────
 analysis_outputs/cache/
 *.pt
+/meetings/
+/docs/
+/Capstone_Project_ADJ/
+/archive/
+/analysis_outputs/
+/report/
+
