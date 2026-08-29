@@ -182,6 +182,44 @@ class CrossAttentionBlock(nn.Module):
         q = q + self.drop_path(self.ffn(self.norm_ff(q)))
         return q
 
+    def forward_with_attn(
+        self,
+        q:  torch.Tensor,   # (B, L_q,  d_model)
+        kv: torch.Tensor,   # (B, L_kv, d_model)
+        kv_padding_mask: "torch.Tensor | None" = None,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """
+        Diagnostic-only twin of forward() that also returns the CROSS-attention
+        weights (query -> encoder context). This is the mechanism that actually
+        produces a masked station's prediction: a masked station contributes no
+        token to the encoder (see StationMAEEncoder._mask_stations), so
+        everything it "knows" about its neighbours arrives through this
+        cross-attention read of the visible-station encoder context. Not used
+        by the trained forward path — forward() keeps need_weights=False on
+        both sub-layers for the fused SDPA kernel.
+
+        Returns:
+            q:    (B, L_q, d_model) — identical to forward()'s output
+            attn: (B, L_q, L_kv) cross-attention weights, averaged over heads.
+                  Row n, for L_q indexed by station (single-delta path), sums
+                  to 1 over L_kv = the encoder's (timestep, visible-station)
+                  context tokens.
+        """
+        q_n  = self.norm_sa(q)
+        sa, _ = self.self_attn(q_n, q_n, q_n, need_weights=False)
+        q    = q + self.drop_path(sa)
+
+        kv_n = self.norm_kv(kv)
+        ca, attn = self.cross_attn(
+            self.norm_q(q), kv_n, kv_n,
+            key_padding_mask=kv_padding_mask,
+            need_weights=True, average_attn_weights=True,
+        )
+        q = q + self.drop_path(ca)
+
+        q = q + self.drop_path(self.ffn(self.norm_ff(q)))
+        return q, attn
+
 
 class StationMAEDecoder(nn.Module):
     """
@@ -653,3 +691,91 @@ class StationMAEDecoder(nn.Module):
                 log_var = log_var.permute(0, 2, 1, 3).contiguous()  # (B, K, N, num_target_vars)
                 return mean, log_var
             return mean
+
+    def forward_with_attn(
+        self,
+        encoded_vis:   torch.Tensor,   # (B, W*N_vis, d_model)
+        spatial:       torch.Tensor,   # (N, 15) or (B, N, 15)
+        y_hours:       torch.Tensor,   # (B,) — single-delta only
+        delta_steps:   torch.Tensor,   # (B,) — single-delta only
+        station_masked: "torch.Tensor | None" = None,
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
+        """
+        Diagnostic-only twin of forward(), single-delta path only, that also
+        returns the decoder's cross-attention weights — i.e. for every query
+        station (masked or visible), how much of its prediction's attention
+        mass went to each (timestep, visible-station) encoder token. This is
+        the only place a masked station's prediction "sees" its neighbours,
+        since masked stations contribute no token to the encoder at all.
+
+        Only supports use_cross_attention=True, station_local=False — the
+        configuration every surviving checkpoint with cross_attn_decoder=True
+        (v27, v30-nll, v31) uses. station_local decoders (v32-blind) have no
+        cross-station attention by construction — nothing to extract, which
+        is the point of that ablation. The plain concatenated-self-attention
+        decoder (use_cross_attention=False) is not instrumented; no surviving
+        checkpoint uses it.
+
+        Raises:
+            NotImplementedError if y_hours/delta_steps are multi-delta (B,K),
+            or if this decoder is not a plain cross-attention decoder.
+
+        Returns:
+            preds: (B, N, num_target_vars) — identical to forward()'s mean
+                   output (log_var, if any, is discarded here; this method is
+                   for attention inspection, not calibrated-uncertainty use)
+            attn_per_layer: (num_layers, B, N, W*N_vis) cross-attention
+                   weights, one slice per decoder block, averaged over heads.
+                   attn_per_layer[l, b, n] sums to 1 over the W*N_vis context
+                   tokens; reshape the last axis to (W, N_vis) and sum over W
+                   to get "contribution per visible station."
+        """
+        if y_hours.dim() != 1 or delta_steps.dim() != 1:
+            raise NotImplementedError(
+                "forward_with_attn only supports the single-delta calling "
+                "convention (y_hours, delta_steps both (B,)). Call once per "
+                "lead-time of interest rather than passing the full K-grid."
+            )
+        if not (self.use_cross_attention and not self.station_local):
+            raise NotImplementedError(
+                "forward_with_attn only supports use_cross_attention=True, "
+                "station_local=False (v27 / v30-nll / v31's decoder). "
+                "station_local decoders have no cross-station attention to "
+                "extract; the plain self-attention decoder is not instrumented."
+            )
+
+        B = encoded_vis.size(0)
+        if spatial.dim() == 2:
+            N         = spatial.size(0)
+            spatial_b = spatial.unsqueeze(0).expand(B, -1, -1)
+        else:
+            N         = spatial.size(1)
+            spatial_b = spatial
+
+        spatial_q = self.mask_token.expand(B, N, -1).contiguous()
+        spatial_q = spatial_q + self.pos_emb(spatial_b[..., :2])
+        spatial_q = spatial_q + self.station_emb(spatial_b[..., 2:])
+        if station_masked is None:
+            spatial_q = spatial_q + self.station_state[0]
+        else:
+            spatial_q = spatial_q + self.station_state[station_masked.long()]
+
+        temp_emb = self.temporal_emb(y_hours)
+        delt_emb = self.delta_emb(delta_steps)
+        step_idx = (self.window_size - 1) + delta_steps
+        step_emb = self.step_emb(step_idx)
+
+        queries = spatial_q + temp_emb.unsqueeze(1) + delt_emb.unsqueeze(1) \
+                + step_emb.unsqueeze(1)
+        queries = self.query_norm(queries)                       # (B, N, d_model)
+
+        h = queries
+        attn_per_layer = []
+        for block in self.blocks:
+            h, attn = block.forward_with_attn(h, encoded_vis)    # attn: (B, N, W*N_vis)
+            attn_per_layer.append(attn)
+        attn_per_layer = torch.stack(attn_per_layer, dim=0)      # (L, B, N, W*N_vis)
+
+        h = self.norm(h)
+        mean = self.head(h)                                      # (B, N, num_target_vars)
+        return mean, attn_per_layer

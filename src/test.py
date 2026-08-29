@@ -56,7 +56,8 @@ Arguments
 
   Evaluation
     --test_mask_ratios FLT   Mask ratios to sweep (default: the trained ratio)
-    --seed             INT   Seeds the station mask, once per mask ratio
+    --fixed_eval_mask        Use ONE fixed station mask for the entire test set
+    --seed             INT   Seeds the station mask
     --save_predictions INT   Cap on windows dumped (0 = all)
     --save_dir         STR   Output directory (default "test_results")
 """
@@ -126,10 +127,9 @@ def parse_args() -> argparse.Namespace:
                    help="Override checkpoint exclude_stations. Use abbreviation e.g. PFA.")
     p.add_argument("--global_norm",       action="store_true",
                    help="Use global per-variable normalisation (one mean/std per variable). "
-                        "Required when testing checkpoints trained before per-station "
-                        "normalisation was introduced. Without this flag, per-station "
-                        "normalisation is used, which is inconsistent with old checkpoints "
-                        "and produces astronomical RMSE values.")
+                        "Only for checkpoints trained before per-station normalisation was "
+                        "introduced — no surviving checkpoint needs it. Passing it with a "
+                        "current checkpoint produces astronomical RMSE values.")
     p.add_argument("--test_mask_ratios",  type=float, nargs="+", default=None,
                    help="One or more encoder mask ratios to sweep at inference time. "
                         "Default: use the trained mask_ratio from the checkpoint. "
@@ -154,18 +154,18 @@ def parse_args() -> argparse.Namespace:
                         "for a quick smoke test of a new checkpoint. Each window "
                         "holds preds, targets, masks, masked_idx, delta_steps, "
                         "timestamps and station spatial features.")
+    p.add_argument("--fixed_eval_mask", action="store_true",
+                   help="Use a SINGLE fixed station mask for the entire test set "
+                        "instead of redrawing per batch. The mask is drawn once "
+                        "from --seed and applied identically to every window, "
+                        "making masked-station comparisons paired across models "
+                        "and across time. Enables clean per-station map plots.")
     p.add_argument("--seed",            type=int, default=42,
-                   help="Seed for the EVALUATION-time station mask. The mask at "
-                        "mask_ratio>0 is drawn from the global RNG inside "
-                        "StationMAEEncoder._mask_stations(); without a fixed seed "
-                        "two evaluation runs hide different stations, which makes "
-                        "masked-station comparisons across models unpaired. The "
-                        "RNG is re-seeded once per mask ratio (see the evaluation "
-                        "loop), so a given seed yields the same masked set "
-                        "regardless of which other ratios are evaluated in the "
-                        "same invocation. Reproducibility additionally requires "
-                        "the same --batch_size, --index_mode and --stride, since "
-                        "those change how much randomness each pass consumes.")
+                   help="Seed for the EVALUATION-time station mask. With "
+                        "--fixed_eval_mask the mask is drawn once from this seed "
+                        "and replayed for every window. Without it, the RNG is "
+                        "re-seeded once per mask ratio and the mask is redrawn "
+                        "per batch (legacy behaviour).")
 
     return p.parse_args()
 
@@ -520,7 +520,7 @@ def main() -> None:
             # v15 structural settings — recorded in cfg by main.py
             residual     = bool(saved_cfg.get("residual_head", False))
 
-            # ── v18–v22 structural settings ──────────────────────────────
+            # ── Structural settings recorded by main.py ───────────────────
             # These were recorded by main.py from the start but never READ
             # here, so every one of them silently reverted to its default
             # when rebuilding the model. That is the same defect class as
@@ -549,7 +549,10 @@ def main() -> None:
                     k = k[len("_orig_mod."):]
                 state_dict[k] = v
         else:
-            # Legacy format saved by the old engine/train.py
+            # Legacy format saved by the old engine/train.py.
+            # NO SURVIVING CHECKPOINT USES THIS PATH — all five in checkpoints/
+            # are Lightning .ckpt. Kept as a safety net for any .pt still held
+            # on Renku or Polybox; it cannot be exercised from this repository.
             ckpt_epoch    = ckpt.get("epoch",    "?")
             ckpt_val_loss = ckpt.get("val_loss", float("nan"))
             c_d_model    = _d_model
@@ -578,8 +581,8 @@ def main() -> None:
         print(f"  factorised_encoder={factorised}  "
               f"temporal_window={temp_window}  temporal_patch={temp_patch}  "
               f"cross_attn_decoder={cross_attn}")
-        print(f"  [v15] residual_head={residual}")
-        print(f"  [v18+] value_embedding={value_emb}  "
+        print(f"  residual_head={residual}")
+        print(f"  value_embedding={value_emb}  "
               f"static_in_token={static_tok}")
 
         # ── Detect an NLL (heteroscedastic) checkpoint ────────────────────────
@@ -707,6 +710,8 @@ def main() -> None:
 
         # ── Legacy-checkpoint compatibility: un-share what this checkpoint
         # never shared ────────────────────────────────────────────────────
+        # Not triggered by any surviving checkpoint: v27, v30-nll, v31 and
+        # v32-blind were all trained after embeddings were shared.
         # Rather than refusing to load a pre-shared-embedding checkpoint,
         # give the DECODER its own fresh, separate copy of each mismatched
         # module. Both `encoder.<name>.*` and `decoder.<name>.*` keys then
@@ -807,32 +812,34 @@ def main() -> None:
             model.encoder.mask_ratio = _test_mr
             model.eval()
 
-            # ── Fix the station mask ────────────────────────────────────────
-            # _mask_stations() draws torch.rand(B, N) from the GLOBAL RNG on
-            # every forward pass, INCLUDING at mask_ratio 0 (the draw happens
-            # before num_masked is applied). Two consequences, both handled by
-            # re-seeding here rather than once at start-up:
-            #
-            #   1. Without a seed, two evaluation runs hide different stations,
-            #      so masked-station errors cannot be compared pairwise across
-            #      models. Measured previously: 0 of 11,684 windows shared a
-            #      masked set between two runs, mean overlap 49.5% (chance).
-            #   2. Because the mask_ratio 0 pass still consumes randomness,
-            #      seeding only once would make the mr0.50 mask depend on
-            #      whether mr0.00 ran first. Re-seeding per ratio makes each
-            #      pass independent of the others, so `--test_mask_ratios 0.5`
-            #      and `--test_mask_ratios 0.0 0.5` produce the same mr0.50
-            #      masked set.
-            #
-            # Reproducibility still requires the same --batch_size,
-            # --index_mode and --stride: those change the shape and number of
-            # draws, hence the sequence of masks.
-            torch.manual_seed(args.seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(args.seed)
-            print(f"  [seed] station mask seeded with {args.seed} "
-                  f"(reproducible at batch_size={args.batch_size}, "
-                  f"index_mode={args.index_mode}, stride={args.stride})")
+            # ── Station mask strategy ──────────────────────────────────────
+            N_stations = test_ds.spatial.shape[0]
+            num_masked = int(N_stations * _test_mr)
+
+            if args.fixed_eval_mask and num_masked > 0:
+                # Draw ONE mask from the seed and replay it for every window.
+                # Same seed + same mask_ratio → same mask across all models.
+                torch.manual_seed(args.seed)
+                noise = torch.rand(N_stations)
+                order = torch.argsort(noise)
+                _fm = order[:num_masked].sort().values
+                _fv = order[num_masked:].sort().values
+                model.encoder.set_fixed_eval_mask(_fm, _fv)
+                print(f"  [mask] FIXED eval mask from seed {args.seed}: "
+                      f"{num_masked} masked, {N_stations - num_masked} visible "
+                      f"(same for all {len(test_ds):,} windows)")
+            else:
+                # Legacy: re-seed the RNG and let _mask_stations draw per batch.
+                model.encoder.set_fixed_eval_mask(None, None)
+                torch.manual_seed(args.seed)
+                if torch.cuda.is_available():
+                    torch.cuda.manual_seed_all(args.seed)
+                if num_masked > 0:
+                    print(f"  [mask] per-batch random mask, seeded with "
+                          f"{args.seed} (reproducible at batch_size="
+                          f"{args.batch_size}, stride={args.stride})")
+                else:
+                    print(f"  [mask] mask_ratio=0 — all stations visible")
 
             _mr_tag   = f"mr{_test_mr:.2f}"
             label     = f"{base_label}_{_mr_tag}"

@@ -22,15 +22,25 @@ Data flow
    preds  (B, N, num_target_vars)
         │
         ▼
-   _supervised_loss  →  loss   (scalar, MSE on all N stations × present sensors)
+   _supervised_loss  →  loss   (scalar, Huber/NLL on all N stations × present sensors)
 
 
 Training objective
 ------------------
 We mask a fraction of stations in the encoder (default 50 %).  The decoder
-must predict all variables for EVERY station at the target time (t + Δt),
-but the gradient signal flows only through the masked stations — visible
-stations are used as context, not as supervision targets.
+must predict all variables for EVERY station at the target time (t + Δt).
+Supervision is uniform across ALL stations with a present sensor — masked
+AND visible — not restricted to the masked subset. A visible station's Δ=0
+target is trivially its own last observation (see _persistence_base /
+residual_head below), so that row is an easy but real gradient signal, not
+a step skipped by the loss. This is a deliberate change from earlier
+(v15-v20) behaviour, which supervised only masked stations on the reasoning
+that visible-station targets were "trivial"; that instead left visible-Δ=0
+predictions untrained, and they measurably underperformed masked ones on
+v20's test dump. Uniform supervision also matches what the LSTM baseline
+gets, keeping the two architectures comparable like-for-like. The
+`masked_only_loss` config flag can restore masked-only supervision, but it
+was never enabled for any surviving checkpoint (see forward_multi_delta).
 
 Multi-delta training
 --------------------
@@ -427,13 +437,16 @@ class StationMAE(nn.Module):
         """
         Full training forward pass for a single lead-time per sample.
 
-        Loss semantics: δ=0 is scored on the MASKED
-        stations only (inpainting) and δ>0 on all stations. The residual head
-        only re-parameterises WHAT the decoder outputs (deviation from the
-        last observation for visible stations), never WHERE the loss applies.
+        Loss semantics: supervised uniformly on ALL N stations with a present
+        sensor, masked and visible alike (masked_only_loss was never enabled
+        for any surviving checkpoint — see the module docstring's "Training
+        objective" section for why). The residual head only re-parameterises
+        WHAT the decoder outputs (deviation from the last observation for
+        visible stations, zero base for masked ones), never WHERE the loss
+        applies.
 
         Returns:
-            loss:           scalar — MSE on all N stations (present sensors only)
+            loss:           scalar — Huber/NLL on all N stations (present sensors only)
             preds:          (B, N, num_target_vars)
             masked_indices: (B, N_masked)   — encoder mask, used by caller for analysis
         """
@@ -560,65 +573,53 @@ class StationMAE(nn.Module):
 
         # ── Horizon-weighted loss ─────────────────────────────────────────
         # Uniform weights across all K horizons (normalised to sum=1).
-        # delta0_weight is applied to k=0 when delta=0 is the first grid entry,
-        # though with masked-only supervision at k=0 the gradient is already
-        # naturally smaller (~50% of stations), so delta0_weight=1.0 is preferred.
+        # delta0_weight would apply a separate weight to k=0 when delta=0 is
+        # the first grid entry, but it was 1.0 in every surviving run — see
+        # tab:hparams / tab:scenarios in the report — so it is a no-op here.
         # Built WITHOUT a host sync. `delta_steps[0, 0].item()` forced a
         # GPU->CPU transfer on every training step and, under --compile, a
         # graph break at the same point every iteration. torch.where keeps the
         # decision on-device; the numerics are identical.
-        # Uniform across horizons: delta0_weight was 1.0 in every run, so the
-        # torch.where collapsed to new_ones(K) / K.
         h_weights = encoded.new_ones(K) / K
 
         # ── Per-horizon masking strategy ──────────────────────────────────
-        # delta=0 (inpainting / reconstruction):
-        #   Supervision on MASKED stations only.  Visible stations have a direct
-        #   shortcut through input_context — their predictions are trivially close
-        #   to their own input values, contributing near-zero loss and gradient.
-        #   Limiting to masked stations gives a pure gap-filling signal.
-        #
-        # delta>0 (forecasting):
-        #   Supervision on ALL stations unless masked_only_loss is set globally.
-        #   Both visible and masked stations provide a genuine forecast gradient
-        #   — no shortcut exists at any horizon past the last input step.
+        # delta=0 (inpainting / reconstruction) and delta>0 (forecasting) are
+        # both supervised on ALL stations with a present sensor, masked and
+        # visible alike. See the per-k loop below for why: an earlier version
+        # (v15-v20) restricted delta=0 to masked stations only, and that was
+        # found to be a defect, not a feature — reverted for every checkpoint
+        # that survives in checkpoints/. `masked_only_loss` can restore the
+        # old masked-only behaviour but was never enabled for a trained run.
         loss_acc = encoded.new_zeros(())
         for k in range(K):
             y_target_k      = y[:, k, :, :self.num_target_vars]       # (B, N, num_target_vars)
             y_mask_target_k = y_mask[:, k, :, :self.num_target_vars]  # (B, N, num_target_vars)
             lv_k = log_var_all[:, k] if log_var_all is not None else None
 
-            # k=0 and delta=0: restrict to masked stations — but ONLY if any
-            # station is actually masked.
+            # k=0 (delta=0) is supervised on EVERY station with a present
+            # sensor, exactly like every other horizon — no masked-only
+            # restriction. Copying IS the correct answer at delta=0 for a
+            # station the encoder can see, and supervising it is free: the
+            # target is one of the inputs. Uniform supervision is also what
+            # the LSTM baseline gets, so the two architectures are compared
+            # like-for-like.
             #
-            # At mask_ratio=0 masked_idx has shape (B, 0): not None, so the
-            # gather below yields empty tensors, sensor_ok.sum() == 0, and the
-            # delta=0 term contributes EXACTLY ZERO gradient. The model would
-            # then never be trained to emit delta=0 at all, while the LSTM
-            # baseline is supervised there for every station — which silently
-            # invalidates any no-masking comparison.
+            # History: v15-v20 restricted delta=0 to masked stations only, on
+            # the reasoning that a visible station could trivially copy its
+            # own last input, so supervising it would "teach nothing." The
+            # actual effect was that a visible station's delta=0 output
+            # received ZERO gradient and became an untrained free parameter:
+            # on v20's test dump those rows scored 0.389 against 0.263 for
+            # the masked ones — an unsupervised output masquerading as a
+            # measured defect, and it also made sanity/ctx_ratio meaningless
+            # (an unsupervised quantity divided by a supervised one). It also
+            # would have silently broken any mask_ratio=0 run, since with
+            # nothing masked the delta=0 term would then contribute exactly
+            # zero gradient. Reverted for every checkpoint that survives in
+            # checkpoints/.
             #
-            # With nothing masked there is no shortcut to protect against
-            # (the "trivial copy" concern only applies when some stations are
-            # visible and others hidden), so supervise all stations, exactly as
-            # the LSTM does.
-            # EVERY horizon is supervised on EVERY station with a present
-            # sensor, delta=0 included.
-            #
-            # v15-v20 restricted delta=0 to masked stations, on the reasoning
-            # that a visible station could trivially copy its own last input.
-            # The effect was that a visible station's delta=0 output received
-            # ZERO gradient and was an untrained free parameter. On v20's test
-            # dump those rows scored 0.389 against 0.263 for the masked ones,
-            # which read as a residual-head defect; it was an unsupervised
-            # output behaving like one, and it also made sanity/ctx_ratio
-            # meaningless (an unsupervised quantity divided by a supervised one).
-            #
-            # Copying IS the correct answer at delta=0 for a station the encoder
-            # can see, and supervising it is free — the target is one of the
-            # inputs. Uniform supervision is also what the LSTM baseline gets,
-            # so the comparison is like-for-like.
-            _has_masked = masked_idx is not None and masked_idx.shape[1] > 0
+            # masked_only_loss can restore the old masked-only behaviour but
+            # was never enabled for a trained run — see tab:scenarios.
             _midx_k = None    # masked_only_loss was never enabled
 
             loss_acc = loss_acc + h_weights[k] * self._supervised_loss(
@@ -680,6 +681,103 @@ class StationMAE(nn.Module):
             preds = preds + (base.unsqueeze(1) if preds.dim() == 4 else base)
         return preds
 
+    @torch.no_grad()
+    def predict_with_attn(
+        self,
+        x:           torch.Tensor,
+        x_mask:      torch.Tensor,
+        spatial:     torch.Tensor,
+        x_hours:     torch.Tensor,
+        y_hours:     torch.Tensor,
+        delta_steps: torch.Tensor,
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]":
+        """
+        Diagnostic-only twin of predict() that also returns the encoder's
+        per-layer spatial attention weights. Used to answer "which visible
+        stations does a masked station's prediction actually attend to?" —
+        NOT part of the trained forward/predict path, and only meaningful
+        for a factorised, spatial_attn=True encoder (raises otherwise; see
+        StationMAEEncoder.forward_with_attn). The Spatially Blind Transformer
+        has no spatial attention by design, so there is nothing to extract
+        for it — that absence is itself the result of that ablation.
+
+        Args:
+            (same shapes as predict())
+        Returns:
+            preds:          (B, N, num_target_vars)
+            masked_indices: (B, N_masked)
+            visible_indices:(B, N_vis)
+            attn_per_layer: list of (B*W, N_vis, N_vis) spatial attention
+                             tensors, one per encoder block (see
+                             StationMAEEncoder.forward_with_attn).
+        """
+        self.eval()
+        encoded, masked_idx, visible_idx, attn_per_layer = \
+            self.encoder.forward_with_attn(x, x_mask, spatial, x_hours)
+        if self.station_local_decoder and masked_idx is not None \
+                and masked_idx.numel() > 0:
+            raise RuntimeError(
+                f"station_local_decoder needs every station present, but "
+                f"{masked_idx.shape[-1]} of {x.shape[2]} stations were masked "
+                f"(encoder.mask_ratio={self.encoder.mask_ratio}). Set "
+                f"mask_ratio=0 for this model.")
+
+        decoder_out = self.decoder(
+            encoded, spatial, y_hours, delta_steps,
+            station_masked=self._station_masked(
+                masked_idx, x.shape[0], x.shape[2], x.device),
+            )
+        preds = decoder_out[0] if self.use_nll_loss else decoder_out
+        base  = self._persistence_base(x, x_mask, masked_idx)
+        if base is not None:
+            preds = preds + (base.unsqueeze(1) if preds.dim() == 4 else base)
+        return preds, masked_idx, visible_idx, attn_per_layer
+
+    @torch.no_grad()
+    def predict_with_decoder_attn(
+        self,
+        x:           torch.Tensor,
+        x_mask:      torch.Tensor,
+        spatial:     torch.Tensor,
+        x_hours:     torch.Tensor,
+        y_hours:     torch.Tensor,   # (B,) — single lead-time only
+        delta_steps: torch.Tensor,   # (B,) — single lead-time only
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]":
+        """
+        Diagnostic-only twin of predict() that also returns the DECODER's
+        cross-attention weights — the actual mechanism through which a masked
+        station's prediction depends on visible neighbours (masked stations
+        contribute no encoder token; see StationMAEEncoder._mask_stations).
+        This is the right extraction point for "contribution of surrounding
+        stations to a masked station's forecast", as opposed to
+        predict_with_attn()'s encoder self-attention, which only covers
+        visible-to-visible mixing before the station axis is even decoded.
+
+        Requires a plain cross-attention decoder (station_local=False) — see
+        StationMAEDecoder.forward_with_attn for which checkpoints qualify.
+
+        Returns:
+            preds:          (B, N, num_target_vars)
+            masked_indices: (B, N_masked)
+            visible_indices:(B, N_vis)
+            attn_per_layer: (L, B, N, W*N_vis) — see
+                             StationMAEDecoder.forward_with_attn. Reshape the
+                             last axis to (W, N_vis) and index N_vis with
+                             visible_indices to recover per-station-ID
+                             contributions.
+        """
+        self.eval()
+        encoded, masked_idx, visible_idx = self.encoder(x, x_mask, spatial, x_hours)
+        mean, attn_per_layer = self.decoder.forward_with_attn(
+            encoded, spatial, y_hours, delta_steps,
+            station_masked=self._station_masked(
+                masked_idx, x.shape[0], x.shape[2], x.device),
+        )
+        base = self._persistence_base(x, x_mask, masked_idx)
+        if base is not None:
+            mean = mean + base
+        return mean, masked_idx, visible_idx, attn_per_layer
+
     # ------------------------------------------------------------------
     # Loss
     # ------------------------------------------------------------------
@@ -699,16 +797,25 @@ class StationMAE(nn.Module):
         Two modes, selected by whether log_var is passed:
 
         Huber mode (log_var=None, default):
-          Weights (default [1.0, 1.0, 0.7, 0.5, 0.5] = temp, pressure,
-          humidity, wind_u, wind_v; override with --var_weights):
+          Weights default to uniform [1.0, 1.0, 1.0, 1.0, 1.0] (temp, pressure,
+          humidity, wind_u, wind_v; override with --var_weights). This is what
+          every current checkpoint trains with — run_full_cloud.sh and
+          run_lstm_cloud.sh both pass --var_weights 1.0 1.0 1.0 1.0 1.0
+          explicitly, and train_lstm.py's own default is identical.
             • Huber(δ=1.0) applied to every variable in per-station-normalised space.
               Below δ=1σ the loss is L2 (standard MSE gradient); above δ it is L1
               (capped gradient), preventing extreme meteorological events from
               dominating parameter updates.
-            • Weights correct for predictability imbalance: pressure is easy to
-              predict (0.5×), wind is hard (1.5×), others at intermediate levels.
-            • Per-station normalisation already handles raw scale (std≈1), so these
-              weights target the gradient imbalance from residual difficulty alone.
+            • An earlier default down-weighted humidity and wind as "noisy"
+              ([1.0, 1.0, 0.7, 0.5, 0.5]), but this made the per-variable
+              comparison against the LSTM baseline invalid — the transformer
+              got reduced gradient on exactly the two variables it was losing
+              on. Removed 2026-08-02; no surviving checkpoint used it (see
+              EXPERIMENTS.md). Weights affect the loss only, never the
+              predictions, so this does not change anything already dumped.
+            • Per-station normalisation already handles raw scale (std≈1), so any
+              non-uniform weights would target gradient imbalance from residual
+              difficulty alone, not raw units.
 
         NLL mode (log_var provided, --nll_loss):
           Heteroscedastic Gaussian NLL for all variables:

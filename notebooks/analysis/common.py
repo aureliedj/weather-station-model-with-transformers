@@ -117,19 +117,24 @@ def data_root(verbose: bool = False) -> str:
 # Model registry — verified against checkpoints / training scripts
 # ---------------------------------------------------------------------------
 MODELS = {
-    # run dir            label                       colour     notes
-    "lstm-baseline-v1": ("LSTM",                    "#7B5EA7",
+    # run dir            label                              colour     notes
+    "lstm-baseline-v1": ("LSTM Baseline",                  "#7B5EA7",
                          "per-station recurrence, spatially blind, no masking"),
-    "v27":              ("v27 Huber",               "#1F5F6B",
-                         "MAE transformer, trained mask_ratio 0.5, Huber loss"),
-    "v30-nll":          ("v30 NLL",                 "#E1A730",
-                         "v27 + heteroscedastic Gaussian NLL head (log_var saved)"),
-    "v31":              ("v31 mr0",                 "#D9663D",
-                         "v27 trained at mask_ratio 0"),
-    "v32-blind":        ("v32 station-blind",       "#5FAF5F",
+    "v27":              ("MAE Transformer",                "#1F5F6B",
+                         "spatial attention, trained mask_ratio 0.5, Huber loss"),
+    "v30-nll":          ("Probabilistic MAE Transformer",  "#E1A730",
+                         "MAE Transformer + heteroscedastic Gaussian NLL head (log_var saved)"),
+    "v31":              ("Dense Transformer",               "#D9663D",
+                         "MAE Transformer trained at mask_ratio 0"),
+    "v32-blind":        ("Spatially Blind Transformer",     "#5FAF5F",
                          "no encoder spatial attn + station-local decoder, mr0"),
 }
 BASELINE_COLORS = {"persistence": "#888888", "clim": "#CCCCCC"}
+# Display names for the non-learned baselines. "clim" is the code's internal
+# name (see CLIM_LAG_STEPS below) for what is actually a 24h-lagged
+# observation, not a multi-year climatological average - the label reflects
+# what it measures, not the variable name.
+BASELINE_LABELS = {"persistence": "Last-Value Persistence", "clim": "24h Persistence"}
 
 EXCLUDE = ["PFA"]                       # dropped from the network entirely
 DROP_SV = {"GES": ["pressure"], "LAE": ["wind_u", "wind_v"]}

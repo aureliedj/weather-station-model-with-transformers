@@ -166,7 +166,9 @@ TEMPORAL_WAVELENGTHS_H = (
 )
 assert 2 * len(TEMPORAL_WAVELENGTHS_H) == TEMPORAL_FOURIER_DIM
 
-# ── v18 value embedding (PLR — Gorishniy et al., NeurIPS 2022) ───────────────
+# ── Fourier value embedding (PLR — Gorishniy et al., NeurIPS 2022) ──────────
+# NEVER SELECTED: every surviving run used value_embedding="mlp". Kept because
+# the option is live in main.py; the constants below are calibrated and unused.
 # Observations are per-station z-scored, so the value axis is in sigma units.
 # lambda_min 0.25 resolves an eighth of a standard deviation; lambda_max 10
 # spans the bulk of the distribution. Values outside that range do occur
@@ -184,12 +186,12 @@ VALUE_LAMBDA_MAX  = 10.0                     # sigma
 # metadata branches: ~0.58).
 VALUE_INIT_GAIN   = 2.2
 
-# ── v18 value embedding, MLP variant (PLE-like — the DEFAULT v18 choice) ─────
+# ── MLP value embedding (PLE-like) — what every surviving run used ──────────
 # scalar -> Linear(1, H) -> GELU -> Linear(H, d).  Each hidden unit is a GELU
 # threshold at x = -b_i/a_i, so the H units form a piecewise basis over the
 # value axis.  Measured against the Fourier variant on held-out targets:
 #
-#     target              v17 linear   MLP   Fourier
+#     target                 linear    MLP   Fourier
 #     |x|                     0.000   1.000    0.000
 #     1[x > 1] threshold      0.499   0.950    0.000
 #     x^2 / sin(3x)           0.000   1.000    1.000
@@ -215,7 +217,9 @@ VALUE_MLP_GAIN    = 1.47
 # than merely small.
 ABSENT_INIT_STD   = 0.5
 
-# ── v21: static features INSIDE the variable block (Aurora-style) ────────────
+# ── Static features INSIDE the variable block (Aurora-style) ────────────────
+# NEVER ENABLED: static_in_token=False in all four checkpoints. The constant
+# below is the default the flag would use.
 # Aurora "incorporate[s] static variables (orography, land-sea mask, and
 # soil-type mask) by treating them as extra surface-level variables", so terrain
 # is scaled by the same per-variable mechanism as the weather instead of forming
@@ -229,7 +233,7 @@ ABSENT_INIT_STD   = 0.5
 #     one slot per static feature   21 slots    9.6%   <- WORSE than today
 #     position + topography          8 slots   25.1%   <- default
 #     all 15 in one slot             7 slots   28.7%
-#     (current v18, separate branches)         18.3%
+#     separate branches (what every run used)  18.3%
 #
 # Column groups of the 15-D spatial vector. Mirrors the existing p1/p2 split:
 # 0:2 easting/northing, 2:15 topography.
@@ -707,7 +711,7 @@ class _CenteredMLP(nn.Module):
     the constant. Measured on the real observations, uncentred:
 
         RMS 0.543 = constant 0.493 + signal 0.293   ->  content fraction 6.5%
-        (v17 linear, for comparison: constant 0.000, signal 0.528, 18.9%)
+        (linear, for comparison: constant 0.000, signal 0.528, 18.9%)
 
     Subtracting GELU(b) removes the constant exactly and costs nothing in
     expressiveness: span{GELU(a_i x + b_i) - c_i} + bias = span{GELU(a_i x +
@@ -734,7 +738,7 @@ class _CenteredPLR(nn.Module):
     at x = 0 the PLR features are [x=0, cos(0)=1 ... , sin(0)=0 ...], so
     GELU(lin(·)) of that fixed vector was added identically to EVERY token —
     the third instance of the uncentred-constant defect in this project,
-    after var_type_embedding and the uncentred v18 MLP.
+    after var_type_embedding and the uncentred MLP.
 
     feat₀ is independent of the wavelengths (cos(0) = 1 for any λ), so it is
     a fixed non-persistent buffer. Subtracting a constant does not change the
@@ -815,19 +819,19 @@ class VariableProjection(nn.Module):
         num_vars:        int  = NUM_VARIABLES,
         d_model:         int  = 256,
         value_embedding: str  = "linear",       # "linear" | "mlp" | "fourier"
-        wind_pair:       "tuple | None" = None, # e.g. (3, 4) -> encode u,v jointly
+        wind_pair:       "tuple | None" = None, # e.g. (3, 4); never used in any run
         static_slots:    "tuple | None" = None, # column groups of `spatial`
         static_dim:      int  = 15,
     ):
         """
         value_embedding
-            "linear"  — v17: e_v = x_v * var_weights[v] + var_biases[v].
+            "linear"  — e_v = x_v * var_weights[v] + var_biases[v].
                         Rank 1 per variable, no nonlinearity. DEFAULT, unchanged.
-            "mlp"     — v18: e_v = Linear_H->d( GELU( Linear_1->H(x_v) ) ).
+            "mlp"     — e_v = Linear_H->d( GELU( Linear_1->H(x_v) ) ).
                         A piecewise basis over the value axis; best on kinks
                         and thresholds, which is what meteorological structure
-                        looks like. The recommended v18 setting.
-            "fourier" — v18: PLR (Gorishniy et al., NeurIPS 2022):
+                        looks like. Used by every surviving run.
+            "fourier" — PLR (Gorishniy et al., NeurIPS 2022); never selected:
                         e_v = GELU( Linear( [x_v, cos(2*pi*x_v/lam), sin(...)] ) ).
                         The raw value is kept alongside the periodic code so the
                         map stays monotone and injective outside the wavelength
@@ -889,7 +893,7 @@ class VariableProjection(nn.Module):
         # per-variable map and needs no Python loop — see forward().
         self.batched = all(len(s) == 1 for s in slots)
 
-        # ── v21: static slots — extra "variables" that never change in time ──
+        # ── Static slots — extra "variables" that never change in time ──────
         # Their contribution is computed ONCE on (N, static_dim) and broadcast
         # over the B*W leading dimension, so they cost nothing per timestep.
         self.static_slots = tuple(tuple(g) for g in static_slots) if static_slots else None
@@ -935,7 +939,7 @@ class VariableProjection(nn.Module):
             # of 2, and — worse under --compile — dynamic attribute access by
             # formatted string and ModuleList indexing inside a loop are classic
             # graph-break causes, so the compiled graph was repeatedly falling
-            # back to eager. Measured effect on the v18 run: ~20 min/epoch.
+            # back to eager. Measured effect: ~20 min/epoch.
             # The FLOPs are unchanged (3.3 GMAC either way, against ~48 GFLOP
             # for the encoder); the cost was launch overhead and recompilation.
             H = VALUE_MLP_HIDDEN
@@ -1061,7 +1065,7 @@ class VariableProjection(nn.Module):
         Returns:
             (B, N, d_model)
         """
-        # ── v17 fast path: byte-identical to the released implementation ───
+        # ── Linear fast path: byte-identical to the released implementation ─
         if self.value_embedding == "linear" and self.wind_pair is None:
             proj   = x.unsqueeze(-1) * self.var_weights + self.var_biases
             m      = mask.unsqueeze(-1)
@@ -1072,7 +1076,7 @@ class VariableProjection(nn.Module):
             # std(obs) = sigma_x * sigma_w, independent of the slot count.
             return self._finish(mixed.sum(dim=-2), static)
 
-        # ── v18 batched MLP: no Python loop, two fused ops ──────────────────
+        # ── Batched MLP: no Python loop, two fused ops ──────────────────────
         if self.value_embedding == "mlp" and self.batched:
             m = mask.unsqueeze(-1)                                # (B, N, V, 1)
             # h = GELU(a*x + b) - GELU(b), centred so e(0) = 0 exactly and the
@@ -1083,7 +1087,7 @@ class VariableProjection(nn.Module):
             e = e * m + self.var_absent_embedding * (1.0 - m)
             return self._finish(e.sum(dim=-2), static)
 
-        # ── v18 general path: one map per SLOT (used only for wind pairing) ─
+        # ── General path: one map per SLOT (wind pairing only; never used) ──
         # A slot is one variable, or the wind pair. A slot counts as present
         # only when every member is present (u and v always agree in this
         # dataset, but the rule is enforced rather than assumed).
@@ -1110,7 +1114,7 @@ class VariableProjection(nn.Module):
     def _finish(self, acc: torch.Tensor,
                 static: "torch.Tensor | None") -> torch.Tensor:
         """
-        Add the static slots (v21) and divide by sqrt(total slot count).
+        Add the static slots and divide by sqrt(total slot count).
 
         The static contribution depends only on the station, so it is computed
         ONCE on (N, static_dim) and broadcast over the leading B*W dimension —
@@ -1148,16 +1152,17 @@ class VariableProjection(nn.Module):
         Setting
             w' = w / sqrt(V)      b' = (b + t) / sqrt(V)      a' = (a + t) / sqrt(V)
         makes out_new == out_old identically, for every x and every mask.  So an
-        existing v15 checkpoint keeps its exact behaviour and stays evaluable;
+        existing pre-rebalance checkpoint keeps its exact behaviour and stays
+        evaluable;
         only FRESH runs get the rebalanced initialisation.
 
         This is deliberately loud about what it did: a silent strict=False is
-        what invalidated every test number from v9 to v13 in this project.
+        what invalidated the test numbers of several early runs in this project.
         """
         t_key = prefix + "var_type_embedding.weight"
         if t_key in state_dict and not (self.value_embedding == "linear"
                                         and self.wind_pair is None):
-            # A pre-rebalance checkpoint cannot be folded into a v18 layout:
+            # A pre-rebalance checkpoint cannot be folded into the new layout:
             # the parameter set is different (slot_maps vs var_weights) and the
             # value map is no longer linear, so no algebraic rewrite exists.
             raise RuntimeError(

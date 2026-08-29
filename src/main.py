@@ -431,8 +431,8 @@ class OverfitEarlyStop(object):
         self.best_epoch   = -1
         # Do not count non-improving epochs while the LR is still warming up.
         # Without this, patience=5 against warmup_epochs=15 stops training
-        # before the learning rate has even reached its peak — which is what
-        # invalidated v12.
+        # before the learning rate has even reached its peak, which invalidated
+        # an early run.
         self.warmup_epochs = int(warmup_epochs)
 
     def _is_improvement(self, value: float) -> bool:

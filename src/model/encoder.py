@@ -326,6 +326,53 @@ class FactorisedTransformerBlock(nn.Module):
         x = x + self.drop_path(self.ffn(self.norm_ff(x)))
         return x
 
+    def forward_with_attn(
+        self, x: torch.Tensor
+    ) -> "tuple[torch.Tensor, torch.Tensor | None]":
+        """
+        Diagnostic-only twin of forward() that also returns spatial attention
+        weights. NOT on the trained path — forward() is what training and
+        evaluation call, and it keeps need_weights=False so PyTorch can route
+        through the fused SDPA kernel. This method exists purely so an
+        analysis notebook/script can inspect which visible stations a masked
+        station's prediction actually attends to (e.g. "contribution of
+        surrounding stations" for a masked-station forecast).
+
+        Because it duplicates forward()'s body with need_weights=True on the
+        spatial sub-layer, it is slower and must be kept in sync by hand if
+        forward() changes — acceptable here since drift would only make a
+        diagnostic stale, not break training.
+
+        Args:
+            x: (B, W, N, d_model)
+        Returns:
+            x:    (B, W, N, d_model) — identical to forward()'s output
+            attn: (B*W, N, N) spatial attention weights (averaged over heads,
+                  query=key=station axis), or None if spatial_attn=False —
+                  a station-independent block (e.g. the Spatially Blind
+                  Transformer) has no cross-station attention to return.
+        """
+        B, W, N, D = x.shape
+
+        xt   = x.permute(0, 2, 1, 3).reshape(B * N, W, D)
+        xt_n = self.norm_t(xt)
+        xt   = xt + self.drop_path(self._temporal_attn(xt_n))
+        x    = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)
+
+        attn = None
+        if self.spatial_attn:
+            xs   = x.reshape(B * W, N, D)
+            xs_n = self.norm_s(xs)
+            as_, attn = self.attn_s(
+                xs_n, xs_n, xs_n,
+                need_weights=True, average_attn_weights=True,
+            )
+            xs   = xs + self.drop_path(as_)
+            x    = xs.reshape(B, W, N, D)
+
+        x = x + self.drop_path(self.ffn(self.norm_ff(x)))
+        return x, attn
+
 
 # ---------------------------------------------------------------------------
 # Encoder
@@ -623,6 +670,23 @@ class StationMAEEncoder(nn.Module):
         tokens = self.token_norm(tokens)                        # (B, W, N, d_model)
         return tokens
 
+    def set_fixed_eval_mask(
+        self,
+        masked_indices: "torch.Tensor | None",   # (N_masked,) sorted
+        visible_indices: "torch.Tensor | None",  # (N_vis,) sorted
+    ) -> None:
+        """Set a fixed station mask for evaluation.
+
+        When set, ``_mask_stations`` replays this mask for every batch instead
+        of drawing a new one.  Pass ``None`` to both arguments to clear and
+        revert to the default random-draw behaviour.
+        """
+        if masked_indices is None and visible_indices is None:
+            self._fixed_eval_mask = None
+        else:
+            assert masked_indices is not None and visible_indices is not None
+            self._fixed_eval_mask = (masked_indices, visible_indices)
+
     def _mask_stations(
         self,
         tokens: torch.Tensor,   # (B, W, N, d_model)
@@ -631,7 +695,9 @@ class StationMAEEncoder(nn.Module):
         Randomly mask a fraction of stations uniformly across all timesteps.
 
         The same stations are masked for the entire window — masking is
-        per-station, not per-token.
+        per-station, not per-token.  If ``set_fixed_eval_mask`` was called
+        with a fixed assignment, that assignment is replayed for every batch
+        instead of drawing a new one.
 
         Args:
             tokens: (B, W, N, d_model)
@@ -642,6 +708,18 @@ class StationMAEEncoder(nn.Module):
             visible_indices : (B, N_vis)                — visible station indices
         """
         B, W, N, D = tokens.shape
+
+        # ── Fixed evaluation mask (set by test.py --fixed_eval_mask) ───────
+        _fixed = getattr(self, "_fixed_eval_mask", None)
+        if _fixed is not None:
+            masked_indices  = _fixed[0].to(tokens.device).unsqueeze(0).expand(B, -1)
+            visible_indices = _fixed[1].to(tokens.device).unsqueeze(0).expand(B, -1)
+            num_visible = visible_indices.shape[1]
+            vis_idx_exp = visible_indices \
+                .unsqueeze(1).unsqueeze(-1).expand(B, W, num_visible, D)
+            visible_tokens = tokens.gather(2, vis_idx_exp)
+            return visible_tokens, masked_indices, visible_indices
+
         num_masked  = int(N * self.mask_ratio)
         num_visible = N - num_masked
 
@@ -752,3 +830,61 @@ class StationMAEEncoder(nn.Module):
 
         h = self.norm(h)                                           # (B, W*N_vis, d_model)
         return h, masked_idx, visible_idx
+
+    def forward_with_attn(
+        self,
+        x:       torch.Tensor,   # (B, W, N, V)
+        x_mask:  torch.Tensor,   # (B, W, N, V)
+        spatial: torch.Tensor,   # (N, 15) or (B, N, 15)
+        x_hours: torch.Tensor,   # (B, W)
+    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]":
+        """
+        Diagnostic-only twin of forward() that also returns per-layer spatial
+        attention weights, so a masked station's prediction can be traced back
+        to which VISIBLE stations it actually attended to (e.g. notebooks/
+        analysis/14_ablation_loss_and_attention.ipynb's "contribution of
+        surrounding stations" section).
+
+        Only implemented for the factorised path (self.factorised=True),
+        which is what every surviving checkpoint uses — the flat
+        TransformerBlock path attends over W*N_vis tokens jointly (no
+        separable station-only attention matrix to extract) and is not
+        instrumented here. Raises if called on a flat-path encoder or one
+        with spatial_attn=False (nothing to extract — that IS the point of
+        the Spatially Blind Transformer's ablation).
+
+        Not on the trained path; forward() is unchanged and still what
+        training/eval call. See FactorisedTransformerBlock.forward_with_attn
+        for the need_weights=True caveat (slower, not fused-SDPA).
+
+        Returns:
+            encoded         : (B, W * N_vis, d_model)  — identical to forward()
+            masked_indices  : (B, N_masked)
+            visible_indices : (B, N_vis)
+            attn_per_layer  : list of (B*W, N_vis, N_vis) tensors, one per
+                              transformer block, spatial attention only
+                              (station axis, averaged over heads). Empty list
+                              if no block has spatial_attn=True.
+        """
+        if not self.factorised:
+            raise NotImplementedError(
+                "forward_with_attn only supports the factorised encoder path "
+                "(--factorised_encoder); the flat TransformerBlock path has no "
+                "separable station-attention matrix to extract."
+            )
+
+        tokens = self._build_tokens(x, x_mask, spatial, x_hours)
+        visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
+        visible_tokens = self._patchify(visible_tokens)
+        B_sz, W_sz, N_vis, D = visible_tokens.shape
+
+        h = visible_tokens
+        attn_per_layer = []
+        for block in self.blocks:
+            h, attn = block.forward_with_attn(h)
+            if attn is not None:
+                attn_per_layer.append(attn)
+        h = h.reshape(B_sz, W_sz * N_vis, D)
+
+        h = self.norm(h)
+        return h, masked_idx, visible_idx, attn_per_layer
