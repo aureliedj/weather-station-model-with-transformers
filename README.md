@@ -92,19 +92,3 @@ the layer-by-layer summary of both models, `Station_MAE_Map.ipynb` and
 `Test_Results_Exploration.ipynb` the per-station maps. The map notebooks need
 the swissBOUNDARIES3D shapefile (`SWISSSHAPE` environment variable).
 
-## Citation
-
-If you use this code, please cite the repository (see `CITATION.cff`) and the
-PeakWeather dataset:
-
-```
-@misc{zambon2025peakweather,
-  title={PeakWeather: MeteoSwiss Weather Station Measurements for Spatiotemporal Deep Learning},
-  author={Zambon, Daniele and Cattaneo, Michele and Marisca, Ivan and Bhend, Jonas and Nerini, Daniele and Alippi, Cesare},
-  year={2025},
-  eprint={2506.13652},
-  archivePrefix={arXiv},
-  primaryClass={cs.LG},
-  url={https://arxiv.org/abs/2506.13652},
-}
-```
