@@ -2,22 +2,20 @@ cff-version: 1.2.0
 message: "If you use this code, please cite it as below."
 title: "Station-MAE: weather station modelling with transformers"
 abstract: >-
-  A Masked AutoEncoder over MeteoSwiss SwissMetNet station data (PeakWeather).
-  Given a 12-hour window of observations from 155 Swiss weather stations, the
-  model forecasts five variables at 13 lead times from 0 to 6 hours, with a
-  configurable fraction of stations hidden from the encoder so that forecasting
-  and spatial gap-filling are learned in one objective. A spatially blind LSTM
-  and two temporal baselines are included as references.
+  A masked-autoencoder Transformer for the MeteoSwiss station network
+  (PeakWeather). From a 12-hour window of observations at 155 stations it
+  forecasts temperature, pressure, humidity and wind at 13 lead times from 0
+  to 6 hours; whole stations are hidden during training so that forecasting
+  and the reconstruction of missing stations are learned in one objective.
+  Includes the station-local ablations and the per-station LSTM baseline
+  reported in the accompanying capstone report.
 type: software
 authors:
   - family-names: "de Jong"
     given-names: "Aurélie"
     email: aurelie.dejong@live.com
-    # orcid: "https://orcid.org/0000-0000-0000-0000"   # [VERIFY] add if you have one
-# Supervisors and affiliation are intentionally left blank rather than guessed.
-# [VERIFY] Add supervisor(s) as additional authors or in `contact:` before handover.
 version: "1.0.0"
-date-released: "2026-08-25"   # [VERIFY] set to the handover date
+date-released: "2026-09-02"
 keywords:
   - masked autoencoder
   - transformer

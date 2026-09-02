@@ -1,225 +1,133 @@
-# Station-MAE — weather station modelling with transformers
+# Station-MAE: masked-autoencoder Transformers for the Swiss weather-station network
 
-DAS capstone, SDSC / ETH Zürich. A Masked AutoEncoder over MeteoSwiss
-SwissMetNet station data
-([PeakWeather](https://huggingface.co/datasets/MeteoSwiss/PeakWeather)),
-with a spatially-blind LSTM and two temporal baselines as references.
+Code for the capstone project *Weather station modelling with Transformers*
+(Certificate of Advanced Studies in Data Science, ETH Zürich / Swiss Data Science
+Center, in collaboration with MeteoSwiss), built on the
+[PeakWeather](https://huggingface.co/datasets/MeteoSwiss/PeakWeather) dataset
+of [Zambon et al. (2025)](https://arxiv.org/abs/2506.13652).
 
-**The task.** Given a 12-hour window of observations from 155 Swiss weather
-stations, forecast five variables (temperature, pressure, humidity, wind_u,
-wind_v) at 13 lead times from 0 to 6 hours. A configurable fraction of stations
-is hidden from the encoder, so the model must also reconstruct them from their
-neighbours — forecasting and spatial gap-filling in one objective.
+**Task.** Given a 12-hour window of 10-minute observations from 155 MeteoSwiss
+stations, predict temperature, pressure, humidity and the two wind components
+at every station for lead times from 0 to 6 hours in 30-minute steps. During
+training, a fraction of the stations is hidden from the encoder, so the same
+model learns to forecast and to reconstruct a missing station from its
+neighbours.
 
-**Start here:** [`EXPERIMENTS.md`](EXPERIMENTS.md) maps every checkpoint to its
-configuration and its results.
+**Model.** A Transformer with alternating temporal and cross-station attention
+over a (time step × station) token grid; each station is embedded by its LV95
+coordinates and 13 topographic descriptors rather than by an identity table;
+a decoder conditioned on the lead time produces all lead times in one pass;
+the output is added to the station's last observation (persistence residual).
 
----
+## Repository layout
 
-## Setup
+```
+src/
+  main.py                 train the Transformer (all variants)
+  test.py                 write test-set predictions of a Transformer checkpoint
+  train_lstm.py           train the per-station LSTM baseline
+  test_lstm.py            write test-set predictions of the LSTM
+  download.py             fetch PeakWeather
+  inspect_checkpoints.py  print the configuration stored in a checkpoint
+  data/dataset.py         PeakWeather loading, normalisation, windowing, station exclusion
+  model/embeddings.py     value, position, topography, time, step and lead-time embeddings
+  model/encoder.py        station masking, temporal patching, factorised attention blocks
+  model/decoder.py        lead-time-conditioned cross-attention decoder
+  model/mae.py            full model, residual head, Huber / Gaussian-NLL loss
+  model/lightning_module.py
+  model/lstm_baseline.py
+  engine/evaluate.py      prediction collector used by test.py
+scripts/                  the exact configurations of the reported runs
+notebooks/analysis/       figures and tables of the report (41-50) + common.py
+notebooks/                data exploration, model summary, result maps
+```
+
+## Getting started
+
+Tested with Python 3.10, PyTorch 2.x and PyTorch Lightning 2.x on a single GPU.
 
 ```bash
 pip install -r requirements.txt
-python src/scripts/verify_env.py      # ALWAYS run this: a CUDA/driver mismatch
-                                      # does not raise, it silently uses CPU
+python src/download.py            # -> ./PeakWeatherDataset (~4 GB)
+export DATA_ROOT=$PWD/PeakWeatherDataset
 ```
 
-Fetch the dataset (~4 GB):
+Weights & Biases is optional: set `WANDB_PROJECT` to log there, otherwise
+Lightning writes CSV logs next to the checkpoints.
+
+## Training and evaluation
+
+The four Transformer variants and the LSTM baseline of the report:
+
+| variant | script argument | training mask ratio | objective | cross-station attention | run directory |
+|---|---|---|---|---|---|
+| MAE Transformer | `mae` | 0.5 | Huber | yes | `checkpoints/full_run_cloud_v27` |
+| Probabilistic MAE | `prob` | 0.5 | Gaussian NLL | yes | `checkpoints/full_run_cloud_v30-nll` |
+| Dense | `dense` | 0.0 | Huber | yes | `checkpoints/full_run_cloud_v31` |
+| Spatially Blind | `blind` | 0.0 | Huber | no | `checkpoints/full_run_cloud_v32-blind` |
+| LSTM | – | – | Huber | no | `checkpoints/lstm-baseline-v1` |
+
+All Transformer variants share `d_model=384`, 8 encoder blocks, 2 decoder
+blocks, 8 heads, temporal patch 3, dropout and drop-path 0.1, 12-hour window,
+lead grid 0–6 h every 30 min (K = 13) and 24.99 M trainable parameters
+(20.25 M for the Spatially Blind variant, 21.11 M for the LSTM). Station PFA
+is excluded from every split.
 
 ```bash
-python src/download.py                       # -> ./PeakWeatherDataset
-DATA_ROOT=/somewhere python src/download.py  # or elsewhere
+# Transformers
+bash scripts/train_transformer.sh mae        # or prob | dense | blind
+bash scripts/test_transformer.sh  mae 0.0 0.5  # evaluation mask ratios; dense/blind: 0.0 only
+
+# LSTM baseline
+bash scripts/train_lstm.sh
+bash scripts/test_lstm.sh
 ```
 
-Every launcher reads `DATA_ROOT` from the environment and falls back to the
-Renku path, so nothing needs editing to run on a different machine:
+`test.py` writes one `predictions.pt` per (checkpoint, evaluation mask ratio)
+under `test_results/<run>/best_mr<R>/` with the normalised predictions,
+targets, sensor masks, hidden-station indices, lead times, timestamps and
+static station features (plus `log_var` for the probabilistic model). The
+evaluation protocol of every reported number is: sliding test windows with a
+90-minute stride over 2023–2024 (11,684 windows), seed 42, batch size 4; at
+mask ratio 0.5 a new random set of 77 hidden stations is drawn for every
+window.
 
-```bash
-export DATA_ROOT=/path/to/PeakWeatherDataset
-```
+All entry points accept `--help`; `python src/inspect_checkpoints.py` prints
+the configuration saved in each checkpoint.
 
-Weights & Biases is optional. Set `WANDB_API_KEY` or run `wandb login`; without
-it the run logs offline and no metric is lost from the checkpoints.
+## Data
 
----
+`src/data/dataset.py` loads the meteo stations of PeakWeather at 10-minute
+frequency with wind as (u, v) components, splits the years into train
+(2017–2021), validation (2022) and test (2023–2024), standardises every
+(station, variable) pair with training-year statistics (sparse pairs borrow
+the statistics of the most similar station), and builds gap-free windows.
+The first run builds a tensor cache next to the data (several minutes);
+later runs start in seconds.
 
-## The two models
+## Analysis notebooks
 
-| | Transformer MAE | LSTM baseline |
-|---|---|---|
-| code | `src/model/mae.py`, `encoder.py`, `decoder.py`, `embeddings.py` | `src/model/lstm_baseline.py` |
-| idea | axial-attention encoder over (time × station) tokens; Δ-query cross-attention decoder; station-level masking | per-station recurrence, no cross-station information |
-| purpose | the model under study | isolates what spatial context is worth |
+`notebooks/analysis/41_…50_*.ipynb` produce the figures and tables of the
+report from the `predictions.pt` dumps; `common.py` holds the shared loading,
+aggregation and caching code (results are cached under `analysis_outputs/`).
+`notebooks/Train_Test_Exploration.ipynb` covers the data, `Model_Architecture.ipynb`
+the layer-by-layer summary of both models, `Station_MAE_Map.ipynb` and
+`Test_Results_Exploration.ipynb` the per-station maps. The map notebooks need
+the swissBOUNDARIES3D shapefile (`SWISSSHAPE` environment variable).
 
-Both share the dataset, splits, per-station normalisation, lead grid and loss,
-so every comparison is like-for-like. Architecture details are in
-`analysis_outputs/figures/v27_architecture.svg`.
+## Citation
 
----
-
-## Workflows
-
-Always launch through `src/scripts/`. Each script locates itself, `cd`s into
-`src/`, and writes to the project root, so it works from any directory.
-
-### Transformer MAE
-
-```bash
-# TRAIN — edit the config block at the top, or override by environment
-SANITY=1 bash src/scripts/run_full_cloud.sh     # ~minutes, smoke test
-bash src/scripts/run_full_cloud.sh              # full run -> checkpoints/<SAVE_DIR>/
-
-# EVALUATE / PREDICT — writes test_results/<RUN_NAME>/best_mr<R>/predictions.pt
-RUN_NAME=v27 MASK_RATIOS="0.0 0.5" bash src/scripts/run_test_cloud.sh
-```
-
-`run_test_cloud.sh` accepts `RUN_NAME`, `MASK_RATIOS`, `SEED`, `BATCH_SIZE` and
-`DATA_ROOT` from the environment. Architecture is read from the checkpoint's
-saved config, so the model is always rebuilt exactly as trained.
-
-### LSTM baseline
-
-```bash
-bash src/scripts/run_lstm_cloud.sh          # trains, then chains into evaluation
-bash src/scripts/run_lstm_test_cloud.sh     # evaluate an existing LSTM checkpoint
-```
-
-### Reproducing an existing result
-
-```bash
-RUN_NAME=v27 MASK_RATIOS="0.5" SEED=42 BATCH_SIZE=4 \
-  bash src/scripts/run_test_cloud.sh
-```
-
-Reproducing the *masked set* additionally requires the same `SEED`,
-`BATCH_SIZE`, `INDEX_MODE` and `STRIDE` — the mask is drawn from the global RNG,
-and those four determine how much randomness each pass consumes.
-
----
-
-## Repository structure
+If you use this code, please cite the repository (see `CITATION.cff`) and the
+PeakWeather dataset:
 
 ```
-weather-station-model-with-transformers/
-├── EXPERIMENTS.md          ← checkpoint → config → results mapping. Read first.
-├── README.md
-├── CITATION.cff            how to cite this work
-├── LICENSING.md            licence not yet chosen — see the file
-├── requirements.txt
-│
-├── src/
-│   ├── data/dataset.py       windowing, splits, per-station normalisation
-│   ├── engine/evaluate.py    prediction collection (metrics live in notebooks/)
-│   ├── model/                MAE (encoder/decoder/embeddings) + LSTM baseline
-│   ├── main.py               train the transformer
-│   ├── test.py               evaluate a transformer → predictions.pt
-│   ├── train_lstm.py         train the LSTM
-│   ├── test_lstm.py          evaluate the LSTM
-│   ├── download.py           fetch PeakWeather
-│   ├── inspect_checkpoints.py  print the saved config of every checkpoint
-│   └── scripts/              launchers — run these, not the .py directly
-│
-├── notebooks/
-│   ├── analysis/           ← the structured suite; start at 01
-│   │   ├── common.py         shared loaders, station table, caching, metrics
-│   │   └── 01…13_*.ipynb     audit → baselines → stations → ablations → terrain
-│   ├── Test_Results_Exploration.ipynb   main results notebook
-│   ├── Station_MAE_Map.ipynb            per-station maps on Swiss topography
-│   ├── Train_Test_Exploration.ipynb     dataset QC
-│   └── …                                supporting exploration
-│
-├── analysis_outputs/       generated figures, tables and caches
-├── archive/                superseded code, kept for provenance (see its README)
-├── docs/, report/          written material
-├── meetings/               supervisor decks, by date
-│
-├── checkpoints/            ┐ NOT in git, and not synchronised.
-├── test_results/           ├ Kept locally; ~1.6–2 GB per predictions.pt.
-└── PeakWeatherDataset/     ┘
+@misc{zambon2025peakweather,
+  title={PeakWeather: MeteoSwiss Weather Station Measurements for Spatiotemporal Deep Learning},
+  author={Zambon, Daniele and Cattaneo, Michele and Marisca, Ivan and Bhend, Jonas and Nerini, Daniele and Alippi, Cesare},
+  year={2025},
+  eprint={2506.13652},
+  archivePrefix={arXiv},
+  primaryClass={cs.LG},
+  url={https://arxiv.org/abs/2506.13652},
+}
 ```
-
----
-
-## Tests
-
-**The pytest suite is not in this copy of the repository.** It lives on the
-Renku session box and has to be copied across; `requirements.txt` still installs
-pytest so it runs as soon as `tests/` is restored. Source comments reference the
-individual files it contains — `test_station_order.py`,
-`test_shared_embeddings.py`, `test_station_local_decoder.py`,
-`test_embedding_numerics.py`, `test_token_balance.py` — which is a reasonable
-inventory of what to look for. **[VERIFY]** before handover.
-
-Once restored:
-
-```bash
-python -m pytest tests/ -v
-```
-
----
-
-## Notebooks
-
-`notebooks/analysis/` is the structured suite and shares one module,
-`common.py`, which owns dataset discovery, the station table, caching and the
-metric helpers. Run **01 first** — it asserts every structural assumption
-(station ordering against the dumps, bit-identical targets across runs, mask
-recovery, the normalisation round-trip) and stops if any fails.
-
-Then 02 (builds the aggregation cache, a few minutes), and 03–13 in any order.
-Results are cached under `analysis_outputs/cache/`, so only the first run is
-slow.
-
-`Test_Results_Exploration.ipynb` is the standalone main results notebook and
-does not depend on the suite.
-
-Notebooks never import from each other, and `src/` never imports a notebook.
-
-### Import convention
-
-**No package re-exports anything.** `data/__init__.py`, `model/__init__.py` and
-`engine/__init__.py` hold a docstring and nothing else, so always import from
-the module:
-
-```python
-from data.dataset import load_peakweather      # yes
-from data import load_peakweather              # no — not exported
-```
-
-A package `__init__.py` runs on *every* import of any of its submodules, so a
-re-export there is paid by every process. Before this rule was enforced,
-`data/__init__.py` pulled geopandas and rioxarray into every training run, and
-`model/__init__.py` pulled pytorch_lightning into `test.py`, which never uses
-it. Module layering is documented in `model/__init__.py`; there are no import
-cycles.
-
----
-
-## Checkpoints and results
-
-Both directories are gitignored and were **not** synchronised to GitHub. They
-are present locally and must be copied by hand when moving machines.
-
-```
-checkpoints/<run>/best.ckpt              trained weights + the config used
-test_results/<run>/best_mr<R>/predictions.pt   raw tensors, no metrics
-```
-
-`predictions.pt` holds normalised predictions and targets only. Every metric is
-derived downstream in the notebooks, so there is one source of truth and the
-script cannot disagree with the analysis. Contents and verified properties are
-documented in [`EXPERIMENTS.md`](EXPERIMENTS.md).
-
----
-
-## Scientific conventions worth knowing
-
-* **Δ=0 is not a forecast.** The target is the last observation, so for a
-  visible station the answer is an input. It is excluded from forecast averages
-  and reported separately as reconstruction.
-* **Normalisation is per station and per variable**, fitted on the training
-  years only. Errors are converted to physical units with the same statistics.
-* **Baselines are computed from raw observations**, not by denormalising —
-  persistence carries `x(t0)` forward, the 24h-lag uses `x(t−24h)`.
-* **Time-of-day analyses bin in UTC.** Civil local time aliases against the
-  90-minute origin stride via DST and produces spurious structure.

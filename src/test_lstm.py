@@ -1,77 +1,44 @@
 """
 test_lstm.py
 
-Dump the LSTM baseline's predictions for the WHOLE test split — nothing else.
-All metrics and plots are produced in the Jupyter notebook from this file.
+Run the LSTM baseline over the test split and write its predictions in the
+same predictions.pt format as src/test.py, under
 
-Saves (same schema as the transformer's collect_predictions, so it drops straight
-into Test_Results_Exploration.ipynb):
+    <save_dir>/<run_name>/best_mr0.00/predictions.pt
 
-    <save_dir>/<run>/best_mr0.00/predictions.pt
-        preds        (M, K, N, V_target)   — normalised predictions
-        targets      (M, K, N, V)          — normalised ground truth
-        masks        (M, K, N, V)          — sensor availability
-        delta_steps  (M, K)                — lead-times (10-min steps)
-        window_hours (M,)                  — hours-since-epoch of window start
-        target_hours (M, K)                — hours-since-epoch of each target
-        spatial      (N, 15)               — static station features
-        var_names, n_windows
+The LSTM has no station masking, so only the mask-ratio-0 dump exists.
 
-The LSTM has no station masking → pure forecaster → results live under best_mr0.00
-(compare against the transformer's mr0.00). Persistence is derivable in the notebook
-from targets[:, 0] (the Δ=0 value = last observation), so it is NOT saved here.
-
-A one-line persistence-collapse sanity is printed so a broken run is caught early.
-
-Usage
------
-    python test_lstm.py --data_root /path/to/PeakWeatherDataset \
-        --checkpoint checkpoints/lstm-baseline-v1/best.ckpt \
-        --exclude_stations PFA --save_dir test_results --run_name lstm-baseline-v1
+    python src/test_lstm.py --data_root /path/to/PeakWeatherDataset \\
+        --checkpoint checkpoints/lstm-baseline-v1/best.ckpt \\
+        --save_dir test_results --run_name lstm-baseline-v1
 """
 
 import argparse
 import os
+import sys
 
-import numpy as np
 import torch
-import torch.multiprocessing as mp
 from torch.utils.data import DataLoader
 
-# Renku session containers give /dev/shm a small fixed quota (often 64 MB), which
-# the default "file_descriptor" sharing strategy can exhaust when DataLoader workers
-# pass batch tensors back to the main process. "file_system" routes that handoff
-# through temp files instead of /dev/shm, avoiding "No space left on device" crashes.
-mp.set_sharing_strategy("file_system")
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+torch.multiprocessing.set_sharing_strategy("file_system")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="LSTM baseline — dump all test predictions")
-    p.add_argument("--data_root",  type=str, required=True)
-    p.add_argument("--cache_dir",  type=str, default=None)
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--exclude_stations", type=str, nargs="+", default=None)
-    p.add_argument("--batch_size", type=int, default=16,
-                   help="Windows per step. Effective sequences = batch_size × N (~155); "
-                        "keep modest on small-VRAM GPUs (16 fits a 20 GB MIG).")
+    p = argparse.ArgumentParser(description="LSTM baseline test-set prediction dump")
+    p.add_argument("--data_root",   type=str, required=True)
+    p.add_argument("--cache_dir",   type=str, default=None)
+    p.add_argument("--checkpoint",  type=str, required=True)
+    p.add_argument("--exclude_stations", type=str, nargs="+", default=None,
+                   help="Default: the checkpoint's own exclusion list")
+    p.add_argument("--index_mode",  type=str, default="sliding", choices=["blocks", "sliding"])
+    p.add_argument("--stride",      type=int, default=9,
+                   help="Window stride in 10-min steps for --index_mode sliding (9 = 90 min)")
+    p.add_argument("--batch_size",  type=int, default=8, help="Windows; x N stations folded in")
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--index_mode", type=str, default="sliding", choices=["blocks", "sliding"])
-    p.add_argument("--stride", type=int, default=9,
-                   help="Sliding forecast-origin spacing in 10-min steps (9 = 90 min = "
-                        "1h30). Only used with --index_mode sliding; ignored for blocks.")
-    p.add_argument("--max_windows", type=int, default=0,
-                   help="Cap on saved windows (0 = ALL — the default). blocks over "
-                        "2023-2024 is ~1,460 windows ≈ 200 MB.")
-    p.add_argument("--save_dir",  type=str, default="test_results")
-    p.add_argument("--run_name",  type=str, default="lstm-baseline-v1")
-    p.add_argument("--compare_stride", type=int, default=3,
-                   help="Horizon grid to WRITE, in 10-min steps (3 = the "
-                        "transformer's 13-horizon grid). A dense (K=37) model is "
-                        "subselected onto it so the dump is a drop-in for the "
-                        "paired comparison. No effect on a K=13 model.")
-    p.add_argument("--save_dense", action="store_true",
-                   help="Skip subselection and write the model's native grid "
-                        "(K=37 for a dense model) — for the 10-min error curve.")
+    p.add_argument("--max_windows", type=int, default=0, help="0 = all windows")
+    p.add_argument("--save_dir",    type=str, default="test_results")
+    p.add_argument("--run_name",    type=str, default="lstm-baseline-v1")
     return p.parse_args()
 
 
@@ -79,182 +46,95 @@ def main() -> None:
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available()
                           else "mps" if torch.backends.mps.is_available() else "cpu")
-    print("Device:", device)
+    print(f"[test_lstm.py] device={device}")
 
-    # map_location="cpu", NOT `device` — see test.py for why: torch.load's
-    # deserializer restores each tensor directly on `map_location` during
-    # unpickling, a different path from an ordinary `.to(device)` call, and
-    # some virtualised CUDA profiles (e.g. NVIDIA vGPU/GRID slices) reject it
-    # with "CUDA driver error: operation not supported" even though normal
-    # CUDA ops work. The model is moved to `device` after construction below.
     ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg  = ckpt.get("hyper_parameters", {}).get("cfg", {})
-    def g(k, d): return cfg.get(k, d)
 
     from data.dataset import load_peakweather, StationMAEDataset
     from model.embeddings import NUM_VARIABLES, NUM_TARGET_VARIABLES, TARGET_VARIABLE_NAMES
-    Vt = NUM_TARGET_VARIABLES
-    cache_dir = args.cache_dir or args.data_root
-    window    = g("window", 72)
-    max_delta = g("max_delta", 36)
-    exclude   = g("exclude_stations", None) or args.exclude_stations
+    from model.lstm_baseline import StationLSTM
 
-    print("Loading PeakWeather …")
+    Vt      = NUM_TARGET_VARIABLES
+    exclude = args.exclude_stations or cfg.get("exclude_stations") or None
+
+    print("Loading PeakWeather dataset ...")
     ds = load_peakweather(root=args.data_root)
-    common = dict(window_size=window, delta_steps=max_delta, max_delta_steps=max_delta,
-                  cache_dir=cache_dir, exclude_stations=exclude, delta_mode="fixed_grid",
-                  delta_grid_stride=g("delta_grid_stride", 3))
-    # train_ds only supplies the normalisation stats used for the test split
+    common = dict(window_size=int(cfg.get("window", 72)),
+                  max_delta_steps=int(cfg.get("max_delta", 36)),
+                  delta_grid_stride=int(cfg.get("delta_grid_stride", 3)),
+                  cache_dir=args.cache_dir or args.data_root, exclude_stations=exclude)
     train_ds = StationMAEDataset(ds, split="train", **common)
     test_ds  = StationMAEDataset(ds, split="test", obs_stats=train_ds.obs_stats,
                                  index_mode=args.index_mode, train_stride=args.stride, **common)
     loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False,
                         num_workers=args.num_workers)
     K = len(test_ds.delta_grid)
+    print(f"  {len(test_ds):,} test windows, K={K} leads, N={test_ds.spatial.shape[0]} stations")
 
-    from model.lstm_baseline import StationLSTM
     model = StationLSTM(num_vars=NUM_VARIABLES, num_target_vars=Vt,
-                        hidden=g("hidden", 256), num_layers=g("lstm_layers", 3),
-                        dropout=0.0, num_horizons=g("num_horizons", K),
-                        horizon_steps=g("horizon_steps", None) or list(test_ds.delta_grid),
-                        use_mask_feature=g("use_mask_feature", False))
-    sd = {k.removeprefix("model."): v for k, v in ckpt["state_dict"].items()
-          if k.startswith("model.")}
-    # `horizon_steps` is a persistent buffer added after some checkpoints were
-    # trained (see lstm_baseline.py) — older checkpoints simply don't have it.
-    # `model` above was already constructed with the correct horizon grid
-    # (from the checkpoint's cfg, or the test dataset's delta_grid as a
-    # fallback), so backfill it from there rather than loosening strict=True.
-    if "horizon_steps" not in sd:
-        print("  [compat] checkpoint predates the horizon_steps buffer — "
-              f"filling it in as {model.horizon_steps.tolist()}")
+                        hidden=cfg.get("hidden", 256), num_layers=cfg.get("lstm_layers", 3),
+                        dropout=0.0, horizon_steps=cfg.get("horizon_steps") or test_ds.delta_grid,
+                        use_mask_feature=cfg.get("use_mask_feature", False))
+    sd = {k[len("model."):]: v for k, v in ckpt["state_dict"].items() if k.startswith("model.")}
+    if "horizon_steps" not in sd:                     # older checkpoint without the buffer
         sd["horizon_steps"] = model.horizon_steps.clone()
     model.load_state_dict(sd, strict=True)
     model = model.to(device).eval()
-    print(f"Loaded LSTM: {model.count_parameters():,} params  "
-          f"(hidden={g('hidden',256)}, layers={g('lstm_layers',3)}, K={K})")
-    print(f"  output_mode={g('output_mode','grid')} | native Δ = {model.horizon_steps.tolist()}")
+    print(f"StationLSTM: {model.count_parameters():,} parameters, "
+          f"epoch {ckpt.get('epoch', '?')}, leads {model.horizon_steps.tolist()} steps")
+    assert model.horizon_steps.tolist() == test_ds.delta_grid, \
+        "checkpoint lead grid differs from the test dataset grid"
 
-    # ── Evaluation grid ──────────────────────────────────────────────────
-    # Mode A (grid, K=13): native == comparison grid, nothing to do.
-    # Mode C (dense, K=37): all 37 slots were supervised during training; here we
-    # select the 13 that coincide with the transformer's grid so the dump is a
-    # drop-in for the paired comparison. --save_dense keeps the full 37 instead.
-    native  = model.horizon_steps.tolist()
-    compare = list(range(0, max_delta + 1, args.compare_stride))
-    if args.save_dense or native == compare:
-        sel_idx = None
-        out_grid = native
-        print(f"  saving native grid: K={len(native)}")
-    else:
-        pos = {s: i for i, s in enumerate(native)}
-        missing = [s for s in compare if s not in pos]
-        if missing:
-            raise SystemExit(
-                f"model predicts Δ={native}; comparison grid needs {missing}. "
-                f"Use --compare_stride matching the trained grid, or --save_dense."
-            )
-        sel_idx = torch.tensor([pos[s] for s in compare], dtype=torch.long)
-        out_grid = compare
-        print(f"  selecting {len(compare)} of {len(native)} horizons for comparison: Δ={compare}")
-    K_out = len(out_grid)
+    limit = args.max_windows if args.max_windows > 0 else len(test_ds)
+    keep = {k: [] for k in ("preds", "targets", "masks", "delta_steps", "window_hours", "target_hours")}
+    spatial_saved, collected = None, 0
 
-    limit = args.max_windows if args.max_windows > 0 else float("inf")
-    keep = {k: [] for k in ("preds", "targets", "masks", "delta_steps",
-                            "window_hours", "target_hours")}
-    spatial_saved = None
-    collected = 0
-
-    print(f"Dumping predictions for {len(test_ds):,} test windows "
-          f"(index_mode={args.index_mode}, K_out={K_out}) …")
     try:
         from tqdm import tqdm
-        _n_batches = (len(loader) if limit == float("inf")
-                      else min(len(loader), -(-int(limit) // args.batch_size)))
-        _iter = tqdm(loader, total=_n_batches, desc="predict", unit="batch")
+        it = tqdm(loader, total=min(len(loader), -(-limit // args.batch_size)),
+                  desc="predict", unit="batch")
     except ImportError:
-        _iter = loader
+        it = loader
+
     with torch.no_grad():
-        for batch in _iter:
+        for batch in it:
             if collected >= limit:
                 break
-            x  = batch["x"].to(device)
-            xm = batch["x_mask"].to(device)
-            y  = batch["y"]
-            ym = batch["y_mask"]
+            x, xm = batch["x"].to(device), batch["x_mask"].to(device)
             B, W, N, V = x.shape
             xf  = x.permute(0, 2, 1, 3).reshape(B * N, W, V)
             xmf = xm.permute(0, 2, 1, 3).reshape(B * N, W, V)
             if device.type == "cuda":
                 with torch.autocast("cuda", dtype=torch.bfloat16):
-                    _p = model(xf, xmf)
-                _p = _p.float()
+                    p = model(xf, xmf)
             else:
-                _p = model(xf, xmf)
-            preds = _p.view(B, N, K, Vt).permute(0, 2, 1, 3).cpu()        # (B,K,N,Vt)
+                p = model(xf, xmf)
+            preds = p.float().view(B, N, K, Vt).permute(0, 2, 1, 3).cpu()   # (B, K, N, Vt)
 
-            # Mode C: drop to the comparison grid. Targets/masks/lead-times are
-            # sliced identically so every saved tensor stays aligned on axis K.
-            _ds_ = batch["delta_steps"]
-            _yh_ = batch["y_hours"]
-            if sel_idx is not None:
-                preds = preds.index_select(1, sel_idx)                     # (B,K_out,N,Vt)
-                y     = y.index_select(1, sel_idx)
-                ym    = ym.index_select(1, sel_idx)
-                _ds_  = _ds_.index_select(1, sel_idx)
-                _yh_  = _yh_.index_select(1, sel_idx)
-
-            take = B if limit == float("inf") else min(B, int(limit - collected))
-            # .clone() the CPU batch tensors before keeping them: with the
-            # file_system sharing strategy each worker batch is backed by a
-            # mapped temp file that stays open as long as any VIEW of it lives.
-            # Keeping raw slices across all ~1.5k batches pins thousands of
-            # mapped files → "Too many open files" in _new_shared mid-run.
-            # clone() copies into process memory and releases the shared file.
-            keep["preds"].append(preds[:take])                   # already a fresh tensor (.cpu() of GPU output)
-            keep["targets"].append(y[:take].clone())
-            keep["masks"].append(ym[:take].clone())
-            keep["delta_steps"].append(_ds_[:take].clone())
+            take = min(B, limit - collected)
+            keep["preds"].append(preds[:take])
+            keep["targets"].append(batch["y"][:take].clone())
+            keep["masks"].append(batch["y_mask"][:take].clone())
+            keep["delta_steps"].append(batch["delta_steps"][:take].clone())
             keep["window_hours"].append(batch["x_hours"][:take, 0].clone())
-            keep["target_hours"].append(_yh_[:take].clone())
+            keep["target_hours"].append(batch["y_hours"][:take].clone())
             if spatial_saved is None:
                 sp = batch["spatial"]
                 spatial_saved = (sp[0] if sp.dim() == 3 else sp).cpu().clone()
             collected += take
 
+    result = {k: torch.cat(v, dim=0) for k, v in keep.items()}
+    result["masked_idx"] = torch.empty(collected, 0, dtype=torch.long)
+    result["spatial"]    = spatial_saved
+    result["var_names"]  = list(TARGET_VARIABLE_NAMES)
+    result["n_windows"]  = collected
+
     out_dir = os.path.join(args.save_dir, args.run_name, "best_mr0.00")
     os.makedirs(out_dir, exist_ok=True)
-    result = {k: torch.cat(v, dim=0) for k, v in keep.items()}
-    result["spatial"] = spatial_saved
-    result["var_names"] = list(TARGET_VARIABLE_NAMES)
-    result["n_windows"] = collected
-    # Provenance: what the model emits vs what this file contains.
-    result["output_mode"]        = g("output_mode", "grid")
-    result["native_horizons"]    = list(native)
-    result["saved_horizons"]     = list(out_grid)
-    result["horizons_selected"]  = sel_idx is not None
-    pred_path = os.path.join(out_dir, "predictions.pt")
-    torch.save(result, pred_path)
-    size_mb = os.path.getsize(pred_path) / 1e6
-    print(f"Saved {collected:,} windows → {pred_path}  ({size_mb:.0f} MB)")
-
-    # ── one-line persistence-collapse sanity (persistence = targets[:, 0]) ──
-    P = result["preds"].numpy()
-    T = result["targets"].numpy()[..., :Vt]
-    M = result["masks"].numpy()[..., :Vt] > 0.5
-    fc = slice(1, K)                                  # forecast horizons Δ>0
-    persist = np.repeat(T[:, :1], K, axis=1)          # repeat Δ=0 value
-    both = M & M[:, :1]                               # present at Δ=0 AND horizon
-    e  = (P[:, fc] - T[:, fc])[both[:, fc]]
-    ep = (persist[:, fc] - T[:, fc])[both[:, fc]]
-    m  = float(np.sqrt(np.mean(e ** 2)))
-    q  = float(np.sqrt(np.mean(ep ** 2)))
-    skill = 1 - m / q if q > 0 else float("nan")
-    print(f"\nSanity — forecast (Δ>0) normalised RMSE: LSTM {m:.4f} vs persistence {q:.4f} "
-          f"→ skill {skill:+.3f}")
-    print("✓ not collapsed" if skill > 0.02 else
-          "⚠️ LSTM ≈ persistence — check training (lr / grad_clip / epochs).")
-    print("\nAll metrics & plots: open Test_Results_Exploration.ipynb.")
+    path = os.path.join(out_dir, "predictions.pt")
+    torch.save(result, path)
+    print(f"Saved {collected:,} windows to {path} ({os.path.getsize(path) / 1e6:.0f} MB)")
 
 
 if __name__ == "__main__":

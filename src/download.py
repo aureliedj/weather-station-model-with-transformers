@@ -1,7 +1,6 @@
-"""Fetch the PeakWeather dataset used by this project.
+"""Download the PeakWeather dataset.
 
-Usage:
-    python src/download.py                    # -> ./PeakWeatherDataset
+    python src/download.py                       # -> <repo>/PeakWeatherDataset
     DATA_ROOT=/somewhere python src/download.py
 """
 import os
@@ -15,6 +14,6 @@ DATA_ROOT = os.environ.get(
 )
 
 if __name__ == "__main__":
-    print(f"Downloading PeakWeather to: {DATA_ROOT}")
+    print(f"Downloading PeakWeather to {DATA_ROOT}")
     PeakWeatherDataset(root=DATA_ROOT)
-    print("Done. Point the launchers at it with:  export DATA_ROOT=" + DATA_ROOT)
+    print(f"Done. Use it with:  export DATA_ROOT={DATA_ROOT}")

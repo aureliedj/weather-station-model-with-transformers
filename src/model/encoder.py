@@ -1,32 +1,21 @@
 """
 model/encoder.py
 
-Transformer encoder for Station-MAE.
+Station-MAE encoder.
 
-Input:
-    A multi-step window of station observations, with spatial and temporal
-    embeddings already summed into token representations.
+    tokens (B, W, N, d)  ->  mask whole stations  ->  merge P steps per token
+        ->  L factorised blocks (temporal attention, spatial attention, FFN)
+        ->  (B, W/P * N_vis, d)
 
-Design:
-    - Tokens are shaped (B, W, N, d_model) on entry
-    - Flattened to (B, W*N, d_model) for self-attention
-    - Standard Transformer encoder blocks (MSA + FFN + LayerNorm)
-    - A random subset of tokens is masked before encoding (MAE-style)
-    - Only visible tokens are processed by the encoder
-    - Returns encoded visible tokens + indices needed by the decoder
-
-Masking strategy:
-    Masking is applied per station across all timesteps — if station s is
-    masked, it is masked for the entire window. This is more meaningful than
-    random token masking because:
-      1. It simulates realistic missing station scenarios (gap-filling task)
-      2. It prevents the encoder from trivially reconstructing a station
-         from its own recent history
+Masking is per station: a masked station is hidden for the whole input
+window and contributes no token, so the decoder can only reconstruct it from
+the other stations.
 """
 
 import torch
 import torch.nn as nn
 from torch.utils.checkpoint import checkpoint as _cp_checkpoint
+
 from .embeddings import (
     PositionalEmbedding,
     StationEmbedding,
@@ -37,31 +26,15 @@ from .embeddings import (
     STATION_CHAR_DIM,
     TEMPORAL_FOURIER_DIM,
     NUM_VARIABLES,
-    SPATIAL_INPUT_DIM,
-    STATIC_SLOTS_DEFAULT,
 )
 
 
 # ---------------------------------------------------------------------------
-# Stochastic depth (DropPath)
+# Stochastic depth
 # ---------------------------------------------------------------------------
 
 class DropPath(nn.Module):
-    """
-    Stochastic depth regularisation (Huang et al., 2016; used in DeiT, Swin, etc.).
-
-    During training, the *entire* residual path is dropped with probability
-    ``drop_prob`` and the output is replaced by the unchanged residual input.
-    At test time the path is always kept and the output is scaled by
-    ``1 - drop_prob`` implicitly via the per-sample binary mask approach
-    (no separate rescaling required — the mask already divides by keep_prob).
-
-    Drop decisions are independent per sample in the batch, so information
-    can still flow through via other samples during gradient accumulation.
-
-    Args:
-        drop_prob: Probability of dropping the residual path (0 = never drop).
-    """
+    """Drop the whole residual branch per sample with probability ``drop_prob``."""
 
     def __init__(self, drop_prob: float = 0.0):
         super().__init__()
@@ -70,308 +43,89 @@ class DropPath(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if not self.training or self.drop_prob == 0.0:
             return x
-        keep_prob    = 1.0 - self.drop_prob
-        # Shape: (B, 1, 1, …) — broadcasts over all token/feature dimensions
-        shape        = (x.shape[0],) + (1,) * (x.ndim - 1)
-        # float32, NOT x.dtype. Under --amp --bf16 x is bfloat16, which carries
-        # an 8-bit mantissa: near 1.0 the representable values are spaced ~1/256.
-        # `rand + keep_prob` then ROUNDS before the floor, so with drop_prob=0.1
-        # a sample at rand=0.0999 becomes 0.9999 -> 1.0 -> kept, when it should
-        # have been dropped. The realised drop rate drifts below the nominal one
-        # by roughly half the bf16 spacing, i.e. the regulariser is quietly
-        # weaker than configured. Draw in float32 and cast after the threshold.
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        # Draw in float32: in bfloat16 the rounding of rand + keep_prob near 1.0
+        # lowers the realised drop rate below the nominal one.
         random_tensor = torch.rand(shape, dtype=torch.float32, device=x.device)
-        # Floor to 0/1; divide by keep_prob to maintain expected value = 1
         random_tensor = torch.floor(random_tensor + keep_prob) / keep_prob
         return x * random_tensor.to(x.dtype)
 
 
+def _ffn(d_model: int, mlp_ratio: float, dropout: float) -> nn.Sequential:
+    return nn.Sequential(
+        nn.Linear(d_model, int(d_model * mlp_ratio)),
+        nn.GELU(),
+        nn.Dropout(dropout),
+        nn.Linear(int(d_model * mlp_ratio), d_model),
+        nn.Dropout(dropout),
+    )
+
+
 # ---------------------------------------------------------------------------
-# Transformer blocks
+# Factorised (axial) transformer block
 # ---------------------------------------------------------------------------
-
-class TransformerBlock(nn.Module):
-    """
-    Standard Pre-LN Transformer block: LayerNorm → MSA → residual,
-    LayerNorm → FFN → residual.
-
-    Pre-LN (normalisation before attention) is more stable to train than
-    the original post-LN formulation, especially at larger depths.
-
-    Args:
-        d_model:     Model dimension.
-        num_heads:   Number of attention heads.
-        mlp_ratio:   FFN hidden dim = d_model * mlp_ratio (default 4).
-        dropout:     Dropout rate applied in attention and FFN (default 0.1).
-        drop_path:   Stochastic depth drop probability (default 0.0 = disabled).
-                     Each residual branch is dropped independently with this
-                     probability during training, acting as a strong regulariser.
-    """
-
-    def __init__(
-        self,
-        d_model:   int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout:   float = 0.1,
-        drop_path: float = 0.0,
-    ):
-        super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
-        self.attn  = nn.MultiheadAttention(
-            d_model,
-            num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm2 = nn.LayerNorm(d_model)
-        self.ffn   = nn.Sequential(
-            nn.Linear(d_model, int(d_model * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(d_model * mlp_ratio), d_model),
-            nn.Dropout(dropout),
-        )
-        self.drop_path = DropPath(drop_path)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, L, d_model)
-        Returns:
-            (B, L, d_model)
-        """
-        # Self-attention with residual
-        # need_weights=False lets PyTorch route through F.scaled_dot_product_attention
-        # (Flash Attention on CUDA), avoiding materialising the full O(seq²) matrix.
-        x_norm = self.norm1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
-        x = x + self.drop_path(attn_out)
-
-        # FFN with residual
-        x = x + self.drop_path(self.ffn(self.norm2(x)))
-        return x
-
 
 class FactorisedTransformerBlock(nn.Module):
     """
-    Factorised (axial) attention block operating on 4-D token grids (B, W, N, d).
+    Pre-LN block on a (B, T, N, d) token grid with three residual sub-layers:
 
-    Instead of attending jointly over all W×N tokens (O((W·N)²) pairs), this
-    block alternates two cheaper operations:
+      1. temporal attention: each station attends over its T time steps
+         (reshape to (B*N, T, d));
+      2. spatial attention: all N stations attend to each other at each time
+         step (reshape to (B*T, N, d)); omitted when ``spatial_attn=False``,
+         which makes the block station-independent;
+      3. shared FFN.
 
-      1. Temporal attention  — each station independently attends over its W
-         timesteps → reshape to (B·N, W, d), run MHA, reshape back.
-
-         Optionally uses *local windowed attention* (``temporal_window`` > 0):
-         the W-step sequence is split into non-overlapping chunks of size tw,
-         and attention runs only within each chunk.  Complexity drops from
-         O(N·W²) to O(N·(W/tw)·tw²) = O(N·W·tw) — e.g. tw=6, W=72 → 12×
-         cheaper.  Adjacent layers use a Swin-style half-window shift so that
-         information can propagate across chunk boundaries after 2 layers.
-
-      2. Spatial attention   — all N stations attend to each other at every
-         timestep → reshape to (B·W, N, d), run MHA, reshape back.
-         Always active (the ``spatial_attn=False`` switch was removed
-         purely temporal (station-independent).  Spatial reasoning is then
-         left entirely to the decoder's cross- or self-attention.
-
-      3. Shared FFN applied element-wise over the last dimension.
-
-    Complexity with both sub-layers: O(N·W² + W·N²)  vs  O((W·N)²) for flat.
-    Complexity with temporal_window=tw: O(N·W·tw + W·N²) — local temporal.
-    At W=288, N_vis≈100: ~8.3M vs ~830M attention pairs — roughly 100× cheaper.
-
-    Args:
-        d_model:         Model dimension.
-        num_heads:       Attention heads (shared across both sub-layers).
-        mlp_ratio:       FFN hidden-dim ratio (default 4.0).
-        dropout:         Dropout in attention and FFN (default 0.1).
-                         Reduces encoder cost from O(N·W²+W·N²) to O(N·W²).
-        temporal_window: Local attention window size in timesteps (0 = full).
-                         W must be exactly divisible by temporal_window.
-                         Example: W=72, temporal_window=6 → 12 chunks of 6
-                         steps (1-hour windows at 10-min resolution).
-        shift:           If True, apply a half-window circular shift before
-                         chunking (Swin-style).  Alternate layers should have
-                         shift=True so tokens across chunk boundaries can
-                         communicate after two layers.
-        drop_path:       Stochastic depth drop probability (default 0.0 = disabled).
-                         Applied independently to each of the three residual
-                         branches (temporal attn, spatial attn, FFN).
+    Cost O(N*T^2 + T*N^2) instead of O((T*N)^2) for joint attention.
     """
 
     def __init__(
         self,
-        d_model:          int,
-        num_heads:        int,
-        mlp_ratio:        float = 4.0,
-        dropout:          float = 0.1,
-        spatial_attn:     bool  = True,
-        temporal_window:  int   = 0,
-        shift:            bool  = False,
-        drop_path:        float = 0.0,
+        d_model:      int,
+        num_heads:    int,
+        mlp_ratio:    float = 4.0,
+        dropout:      float = 0.1,
+        spatial_attn: bool  = True,
+        drop_path:    float = 0.0,
     ):
         super().__init__()
+        self.spatial_attn = spatial_attn
 
-        self.spatial_attn    = spatial_attn
-        self.temporal_window = temporal_window
-        # shift only makes sense when windowing is active
-        self.shift           = shift and (temporal_window > 0)
-
-        # ── Temporal sub-layer (each station over W timesteps) ────────────
         self.norm_t = nn.LayerNorm(d_model)
-        self.attn_t = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True
-        )
+        self.attn_t = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
 
-        # ── Spatial sub-layer (all N stations at each timestep) ──────────
-        # spatial_attn=False makes the encoder STATION-INDEPENDENT: each station
-        # is encoded from its own temporal window with no cross-station mixing.
-        # That is the controlled study against the LSTM — if the error curves
-        # coincide, neighbouring stations are not contributing.
         if spatial_attn:
             self.norm_s = nn.LayerNorm(d_model)
-            self.attn_s = nn.MultiheadAttention(
-                d_model, num_heads, dropout=dropout, batch_first=True
-            )
+            self.attn_s = nn.MultiheadAttention(d_model, num_heads, dropout=dropout,
+                                                batch_first=True)
 
-        # ── Shared FFN ────────────────────────────────────────────────────
-        self.norm_ff = nn.LayerNorm(d_model)
-        self.ffn     = nn.Sequential(
-            nn.Linear(d_model, int(d_model * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(d_model * mlp_ratio), d_model),
-            nn.Dropout(dropout),
-        )
-
-        # ── Stochastic depth — one DropPath shared across all residuals ───
+        self.norm_ff   = nn.LayerNorm(d_model)
+        self.ffn       = _ffn(d_model, mlp_ratio, dropout)
         self.drop_path = DropPath(drop_path)
 
-    def _temporal_attn(self, xt: torch.Tensor) -> torch.Tensor:
-        """
-        Self-attention along the temporal axis, full or windowed.
-
-        Args:
-            xt: (B·N, W, d_model)
-        Returns:
-            (B·N, W, d_model)  — residual NOT yet added (caller adds it)
-        """
-        BN, W, D = xt.shape
-        tw = self.temporal_window
-
-        if tw == 0 or tw >= W:
-            # ── Full temporal attention ───────────────────────────────────
-            at, _ = self.attn_t(xt, xt, xt, need_weights=False)
-            return at
-
-        # ── Local windowed temporal attention ────────────────────────────
-        # Each station's W-step sequence is split into non-overlapping chunks
-        # of size tw.  Attention runs only within each chunk → O(W·tw) instead
-        # of O(W²).  Swin-style half-window shift (when self.shift=True) lets
-        # adjacent layers bridge chunk boundaries.
-        assert W % tw == 0, (
-            f"temporal_window={tw} must divide W={W} exactly.  "
-            f"Choose a value that divides your --window size."
-        )
-        shift_size = tw // 2 if self.shift else 0
-
-        if shift_size > 0:
-            xt = torch.roll(xt, shifts=-shift_size, dims=1)
-
-        num_chunks = W // tw
-        # (BN, W, D) → (BN·num_chunks, tw, D)
-        xt_c = xt.reshape(BN * num_chunks, tw, D)
-        at_c, _ = self.attn_t(xt_c, xt_c, xt_c, need_weights=False)
-        # (BN·num_chunks, tw, D) → (BN, W, D)
-        at = at_c.reshape(BN, W, D)
-
-        if shift_size > 0:
-            at = torch.roll(at, shifts=shift_size, dims=1)
-
-        return at
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: (B, W, N, d_model)
-        Returns:
-            (B, W, N, d_model)
-        """
-        B, W, N, D = x.shape
+        """x: (B, T, N, d) -> (B, T, N, d)."""
+        B, T, N, D = x.shape
 
-        # ── 1. Temporal attention: (B·N, W, D) ───────────────────────────
-        # Permute so N is before W, then merge B and N into a single batch dim.
-        # Each of the B·N sequences has length W (the temporal axis).
-        xt    = x.permute(0, 2, 1, 3).reshape(B * N, W, D)    # (B·N, W, D)
-        xt_n  = self.norm_t(xt)
-        xt    = xt + self.drop_path(self._temporal_attn(xt_n))
-        x     = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)    # (B, W, N, D)
+        # 1. temporal attention over T, per station
+        xt   = x.permute(0, 2, 1, 3).reshape(B * N, T, D)
+        xt_n = self.norm_t(xt)
+        at, _ = self.attn_t(xt_n, xt_n, xt_n, need_weights=False)
+        xt   = xt + self.drop_path(at)
+        x    = xt.reshape(B, N, T, D).permute(0, 2, 1, 3)
 
-        # ── 2. Spatial attention: (B·W, N, D) ────────────────────────────
-        # Merge B and W into a single batch dim.
-        # Each of the B·W sequences has length N (the station axis).
-        # Attention here is FULL over the station axis — the windowing options
-        # apply to the temporal axis only. That is what makes the station axis
-        # permutation-equivariant, and why sorting the mask indices is free.
+        # 2. spatial attention over N, per time step
         if self.spatial_attn:
-            xs     = x.reshape(B * W, N, D)                    # (B·W, N, D)
-            xs_n   = self.norm_s(xs)
+            xs   = x.reshape(B * T, N, D)
+            xs_n = self.norm_s(xs)
             as_, _ = self.attn_s(xs_n, xs_n, xs_n, need_weights=False)
-            xs     = xs + self.drop_path(as_)
-            x      = xs.reshape(B, W, N, D)                    # (B, W, N, D)
+            xs   = xs + self.drop_path(as_)
+            x    = xs.reshape(B, T, N, D)
 
-        # ── 3. FFN (applied over last dim, works on any leading shape) ────
+        # 3. FFN
         x = x + self.drop_path(self.ffn(self.norm_ff(x)))
         return x
-
-    def forward_with_attn(
-        self, x: torch.Tensor
-    ) -> "tuple[torch.Tensor, torch.Tensor | None]":
-        """
-        Diagnostic-only twin of forward() that also returns spatial attention
-        weights. NOT on the trained path — forward() is what training and
-        evaluation call, and it keeps need_weights=False so PyTorch can route
-        through the fused SDPA kernel. This method exists purely so an
-        analysis notebook/script can inspect which visible stations a masked
-        station's prediction actually attends to (e.g. "contribution of
-        surrounding stations" for a masked-station forecast).
-
-        Because it duplicates forward()'s body with need_weights=True on the
-        spatial sub-layer, it is slower and must be kept in sync by hand if
-        forward() changes — acceptable here since drift would only make a
-        diagnostic stale, not break training.
-
-        Args:
-            x: (B, W, N, d_model)
-        Returns:
-            x:    (B, W, N, d_model) — identical to forward()'s output
-            attn: (B*W, N, N) spatial attention weights (averaged over heads,
-                  query=key=station axis), or None if spatial_attn=False —
-                  a station-independent block (e.g. the Spatially Blind
-                  Transformer) has no cross-station attention to return.
-        """
-        B, W, N, D = x.shape
-
-        xt   = x.permute(0, 2, 1, 3).reshape(B * N, W, D)
-        xt_n = self.norm_t(xt)
-        xt   = xt + self.drop_path(self._temporal_attn(xt_n))
-        x    = xt.reshape(B, N, W, D).permute(0, 2, 1, 3)
-
-        attn = None
-        if self.spatial_attn:
-            xs   = x.reshape(B * W, N, D)
-            xs_n = self.norm_s(xs)
-            as_, attn = self.attn_s(
-                xs_n, xs_n, xs_n,
-                need_weights=True, average_attn_weights=True,
-            )
-            xs   = xs + self.drop_path(as_)
-            x    = xs.reshape(B, W, N, D)
-
-        x = x + self.drop_path(self.ffn(self.norm_ff(x)))
-        return x, attn
 
 
 # ---------------------------------------------------------------------------
@@ -380,46 +134,19 @@ class FactorisedTransformerBlock(nn.Module):
 
 class StationMAEEncoder(nn.Module):
     """
-    MAE encoder for multi-step weather station windows.
-
-    Builds token representations by summing:
-        variable_projection(x, mask)   — what was measured
-        spatial_embedding(spatial)     — where the station is
-        temporal_embedding(t)          — when the measurement was taken
-
-    Then masks a fraction of stations and runs the visible tokens through
-    a stack of Transformer blocks.
-
     Args:
-        d_model:              Model dimension (default 128).
-        num_heads:            Attention heads (default 4).
-        num_layers:           Number of Transformer blocks (default 4).
-        mlp_ratio:            FFN expansion ratio (default 4.0).
-        dropout:              Dropout rate (default 0.1).
-        mask_ratio:           Fraction of stations to mask (default 0.5).
-        num_vars:             Number of meteorological variables (default 6).
-        station_char_dim:     Dimension of station characteristic features p2 (default 13).
-        fourier_dim:          Fourier dimension for TemporalEmbedding (default 32).
-        position_fourier_dim: Fourier features per coordinate for PositionalEmbedding (default 16).
-        use_checkpoint:       If True, use gradient checkpointing on each transformer block.
-                              Trades ~33% extra compute for ~66% less activation memory —
-                              enables larger batches / deeper models on limited GPU VRAM.
-        factorised:           If True, use FactorisedTransformerBlock (axial attention over
-                              the W×N grid) instead of flat self-attention over W·N tokens.
-                              Reduces complexity from O((W·N)²) to O(N·W²+W·N²) — ~100×
-                              cheaper at W=288, N=100.  Tokens remain in (B,W,N,d) shape
-                              through the blocks; flattened to (B,W·N_vis,d) at output to
-                              preserve the decoder interface.
-        temporal_window:      Only used when factorised=True.  Local attention window
-                              size in timesteps (0 = full attention over all W steps).
-                              W must be exactly divisible by temporal_window.
-                              Odd-indexed blocks automatically use a Swin-style
-                              half-window shift so tokens can communicate across
-                              chunk boundaries after two layers.
-                              Example: W=72, temporal_window=6 → 12 one-hour chunks
-                              at 10-min resolution, 12× cheaper temporal attention.
-                              Takes precedence over factorised when both are True.
-                              Strongly recommended with --grad_checkpoint on limited VRAM.
+        d_model, num_heads, num_layers, mlp_ratio, dropout: transformer size.
+        mask_ratio:       fraction of stations hidden per sample (0 .. 1).
+        num_vars:         input variables per station (6).
+        use_checkpoint:   gradient checkpointing on every block.
+        spatial_attn:     False removes the spatial sub-layer from every block
+                          (station-independent encoder).
+        temporal_patch:   P consecutive steps are concatenated into one token
+                          after masking (W must be divisible by P).
+        drop_path_rate:   maximum stochastic-depth rate (linear over depth).
+        step_emb, pos_emb, station_emb, temporal_emb:
+                          embedding modules shared with the decoder; built
+                          locally when None.
     """
 
     def __init__(
@@ -435,13 +162,8 @@ class StationMAEEncoder(nn.Module):
         fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
         use_checkpoint:       bool  = False,
-        factorised:           bool  = False,
         spatial_attn:         bool  = True,
-        temporal_window:      int   = 0,
         temporal_patch:       int   = 1,
-        value_embedding:      str   = "linear",     # "linear" | "mlp" | "fourier"
-        wind_pair:            "tuple | None" = None,  # e.g. (3, 4) for u,v
-        static_in_token:      bool  = False,        # Aurora-style statics
         drop_path_rate:       float = 0.0,
         step_emb:             "nn.Module | None" = None,
         pos_emb:              "nn.Module | None" = None,
@@ -449,237 +171,79 @@ class StationMAEEncoder(nn.Module):
         temporal_emb:         "nn.Module | None" = None,
     ):
         super().__init__()
+        self.d_model        = d_model
+        self.mask_ratio     = mask_ratio
+        self.temporal_patch = int(temporal_patch)
+        self.use_checkpoint = use_checkpoint
 
-        self.d_model         = d_model
-        self.mask_ratio      = mask_ratio
-        self.temporal_patch  = int(temporal_patch)
-        self.use_checkpoint  = use_checkpoint
-        self.factorised      = bool(factorised)
-
-        # --- Learnable sensor mask token (ViT-MAE style) ---
-        # NOTE: the former ``sensor_mask_token`` (learned fill-value for absent
-        # sensors) has been REMOVED. It was a dead parameter: the fill was
-        # applied before var_proj, which then re-multiplied contributions by the
-        # sensor mask — zeroing exactly the entries the fill had written. The
-        # absent-sensor signal now lives where it takes effect:
-        # VariableProjection.var_absent_embedding (learned per-variable absent
-        # embedding, BERT-mask-style). Checkpoints from before this change are
-        # NOT numerically compatible with this encoder (token math changed).
-
-        # --- Embedding modules (four components: p1, p2, v, t) ---
-        # When static_in_token, the 15 static features become extra SLOTS
-        # inside VariableProjection — scaled by the same mechanism as the
-        # weather — and pos_emb / station_emb drop out of the token sum.
-        self.static_in_token = bool(static_in_token)
-        self.var_proj     = VariableProjection(
-            num_vars=num_vars, d_model=d_model,
-            value_embedding=value_embedding, wind_pair=wind_pair,
-            static_slots=(STATIC_SLOTS_DEFAULT if static_in_token else None),
-            static_dim=SPATIAL_INPUT_DIM)
-        # p1/p2/t — shared with the decoder (see mae.py), same rationale as
-        # step_emb below: a station's position, topography and a given
-        # absolute time are the same fact on both sides of cross-attention.
-        # Two independently-constructed modules would only share their fixed
-        # Fourier frequencies, not their trained MLP weights, so "this
-        # station" on the encoder side and "this station" on the decoder side
-        # would drift apart during training instead of being provably the
-        # same vector. Falls back to its own instance when used standalone
-        # (e.g. tests, notebooks). NOT applied to var_proj — the actual
-        # observed VALUE has no decoder-side counterpart to share with.
+        # Token components. pos/station/temporal/step embeddings are shared
+        # with the decoder so that a station's key and its query carry the
+        # same positional vector.
+        self.var_proj     = VariableProjection(num_vars=num_vars, d_model=d_model)
         self.pos_emb      = pos_emb if pos_emb is not None else \
-            PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
-                                dropout=dropout)
+            PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim, dropout=dropout)
         self.station_emb  = station_emb if station_emb is not None else \
-            StationEmbedding(d_model=d_model, input_dim=station_char_dim,
-                             dropout=dropout)
+            StationEmbedding(d_model=d_model, input_dim=station_char_dim, dropout=dropout)
         self.temporal_emb = temporal_emb if temporal_emb is not None else \
-            TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
-                              dropout=dropout)
-
-        # s — Step-index positional embedding (within-window relative order).
-        # Encodes the INTEGER step index 0..W-1 so the model knows WHERE each
-        # token sits inside the 72-step (12 h) input window, independently of
-        # the absolute time encoded by temporal_emb.
-        #
-        # Shared with the decoder: the decoder's forecast horizons only cover a
-        # sparse subset of the unified step timeline (e.g. stride-3 → indices
-        # 74, 77, ..., 107 for W=72), so most step indices past W-1 are never
-        # visited by either side except at the single boundary point W-1
-        # (delta=0). A separate StepIndexEmbedding per module would only share
-        # its fixed Fourier frequencies, not its trained MLP projection weights
-        # — "encoder step k" and "decoder step k" would drift apart during
-        # training despite the docstring's intent. Passing the SAME module
-        # instance in from StationMAE (see mae.py) makes the two genuinely
-        # identical rather than coincidentally similar. Falls back to building
-        # its own instance when used standalone (e.g. tests, notebooks).
-        self.step_emb = step_emb if step_emb is not None else \
+            TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim, dropout=dropout)
+        self.step_emb     = step_emb if step_emb is not None else \
             StepIndexEmbedding(d_model=d_model, dropout=dropout)
+        self.token_norm   = nn.LayerNorm(d_model)
 
-        # --- Post-assembly normalisation ---
-        # Applied after summing var_proj + spatial_emb + temporal_emb to keep
-        # the three independently-initialised components on a common scale
-        # before they enter the first transformer block.
-        self.token_norm = nn.LayerNorm(d_model)
-
-        # --- Transformer blocks ---
-        # FactorisedTransformerBlock (axial attention over the W x N grid) when
-        # factorised=True; otherwise the flat TransformerBlock, kept so older
-        # checkpoints stay loadable.
-        #
-        # temporal_window > 0 enables local windowed temporal attention inside the
-        # factorised block; odd-indexed blocks take a half-window Swin shift so
-        # cross-chunk communication emerges after two layers. Every run uses
-        # temporal_window=0 (patching replaced windowing), but the option is live.
-        #
-        # Stochastic depth: drop_path_rate is the maximum drop probability (applied
-        # to the deepest layer).  Rates increase linearly from 0.0 (layer 0) to
-        # drop_path_rate (layer num_layers-1), following the standard recipe from
-        # Huang et al. (2016) and used in DeiT / Swin Transformer.
-        dp_rates = [
-            drop_path_rate * i / max(num_layers - 1, 1)
+        dp_rates = [drop_path_rate * i / max(num_layers - 1, 1) for i in range(num_layers)]
+        self.blocks = nn.ModuleList([
+            FactorisedTransformerBlock(d_model, num_heads, mlp_ratio, dropout,
+                                       spatial_attn=spatial_attn, drop_path=dp_rates[i])
             for i in range(num_layers)
-        ]
-        if factorised:
-            self.blocks = nn.ModuleList([
-                FactorisedTransformerBlock(
-                    d_model, num_heads, mlp_ratio, dropout,
-                    spatial_attn=spatial_attn,
-                    temporal_window=temporal_window,
-                    shift=(i % 2 == 1),
-                    drop_path=dp_rates[i],
-                )
-                for i in range(num_layers)
-            ])
-        else:
-            # Full flat: standard self-attention over all W·N_vis tokens.
-            self.blocks = nn.ModuleList([
-                TransformerBlock(d_model, num_heads, mlp_ratio, dropout,
-                                 drop_path=dp_rates[i])
-                for i in range(num_layers)
-            ])
-
+        ])
         self.norm = nn.LayerNorm(d_model)
 
-        # ── Temporal patch merging (ViT / PatchTST / Swin patch-merge style) ────
-        # Groups P consecutive timesteps into ONE token, so the encoder sees
-        # W/P temporal positions instead of W.
-        #
-        # Why: with W=72 raw steps and windowed attention (tw=6) the newest token
-        # only reaches 4 h of the 12 h window after 8 layers — measurably too
-        # short. At P=6 the sequence is 12 tokens, and FULL attention over
-        # 12 x N_vis = 936 tokens costs ~0.88M score entries per layer versus
-        # ~2.6M for the windowed setup it replaces. Cheaper AND complete
-        # coverage from layer 1, which is why windowing is retired.
-        #
-        # Each merged token concatenates its P constituent embeddings and
-        # projects back to d_model, so the per-step positional / temporal
-        # embeddings survive the merge rather than being averaged away.
+        # Temporal patch merging: concatenate P step embeddings, LayerNorm, Linear.
         if self.temporal_patch > 1:
             self.patch_norm  = nn.LayerNorm(self.temporal_patch * d_model)
             self.patch_merge = nn.Linear(self.temporal_patch * d_model, d_model)
         else:
             self.patch_norm = self.patch_merge = None
 
+        self._fixed_eval_mask = None
+
+    # ------------------------------------------------------------------
 
     def _patchify(self, t: torch.Tensor) -> torch.Tensor:
-        """
-        (B, W, N, D) → (B, W/P, N, D), one uniform patch size.
-
-        A telescopic mode (per-segment patch sizes, e.g. "48x6,18x3,6x1") was
-        removed: no configuration ever selected it. See archive/README.md.
-
-        Station and batch axes are untouched, so station masking (which runs
-        before this) is unaffected. Per-step positional/temporal embeddings
-        survive inside the concatenation rather than being averaged away.
-        """
+        """(B, W, N, D) -> (B, W/P, N, D)."""
         B, W, N, D = t.shape
         P = self.temporal_patch
         if P <= 1:
             return t
-        assert W % P == 0, (
-            f"temporal_patch={P} must divide the window W={W} exactly. "
-            f"With W=72 the usable values are 1, 2, 3, 4, 6, 8, 9, 12, 18, 24, 36, 72.")
-        t = t.reshape(B, W // P, P, N, D)          # split the time axis
-        t = t.permute(0, 1, 3, 2, 4)               # (B, W/P, N, P, D)
-        t = t.reshape(B, W // P, N, P * D)         # concat the P embeddings
+        assert W % P == 0, f"temporal_patch={P} must divide the window W={W}"
+        t = t.reshape(B, W // P, P, N, D).permute(0, 1, 3, 2, 4).reshape(B, W // P, N, P * D)
         return self.patch_merge(self.patch_norm(t))
 
-    def _build_tokens(
-        self,
-        x:       torch.Tensor,   # (B, W, N, V)
-        x_mask:  torch.Tensor,   # (B, W, N, V)
-        spatial: torch.Tensor,   # (N, 15)  or  (B, N, 15)
-        x_hours: torch.Tensor,   # (B, W)   hours-since-epoch per input step
-    ) -> torch.Tensor:
+    def _build_tokens(self, x, x_mask, spatial, x_hours) -> torch.Tensor:
         """
-        Build full token representations of shape (B, W, N, d_model).
-
-        token[b, w, n] = var_proj(x[b,w,n], x_mask[b,w,n])          v — what
-                       + pos_emb(spatial[n, :2])                      p1 — where (position)
-                       + station_emb(spatial[n, 2:])                  p2 — where (characteristics)
-                       + temporal_emb(x_hours[b,w])                   t  — when
+        token[b, w, n] = var_proj(x[b,w,n], x_mask[b,w,n])
+                       + pos_emb(spatial[n, :2]) + station_emb(spatial[n, 2:])
+                       + temporal_emb(x_hours[b, w]) + step_emb(w)
+        Returns (B, W, N, d_model).
         """
         B, W, N, V = x.shape
+        var_tokens = self.var_proj(x.view(B * W, N, V), x_mask.view(B * W, N, V))
+        var_tokens = var_tokens.view(B, W, N, self.d_model)
 
-        # --- v: Variable projection ---
-        # Absent sensors are handled INSIDE var_proj: present sensors contribute
-        # their projected value, absent ones a learned per-variable absent
-        # embedding (var_absent_embedding). No pre-fill needed here — x carries
-        # zeros at absent slots and var_proj never reads them (mask-gated).
-        x_flat      = x.view(B * W, N, V)
-        mask_flat   = x_mask.view(B * W, N, V)
-        _static     = spatial if self.static_in_token else None
-        var_tokens  = self.var_proj(x_flat, mask_flat, static=_static)
-        var_tokens  = var_tokens.view(B, W, N, self.d_model)       # (B, W, N, d_model)
-
-        # --- p1 + p2: split spatial tensor, embed each independently ---
         if spatial.dim() == 2:
             spatial = spatial.unsqueeze(0)                          # (1, N, 15)
-        # p1 — Fourier positional encoding over easting/northing
-        pos_e     = self.pos_emb(spatial[..., :2])                  # (1/B, N, d_model)
-        pos_e     = pos_e.unsqueeze(1)                              # (1/B, 1, N, d_model)
-        # p2 — MLP over topographic characteristics
-        station_e = self.station_emb(spatial[..., 2:])              # (1/B, N, d_model)
-        station_e = station_e.unsqueeze(1)                          # (1/B, 1, N, d_model)
+        pos_e     = self.pos_emb(spatial[..., :2]).unsqueeze(1)     # (1/B, 1, N, d)
+        station_e = self.station_emb(spatial[..., 2:]).unsqueeze(1) # (1/B, 1, N, d)
+        temp_e    = self.temporal_emb(x_hours).unsqueeze(2)         # (B, W, 1, d)
+        step_e    = self.step_emb(torch.arange(W, device=x.device)).view(1, W, 1, self.d_model)
 
-        # --- t: Temporal embedding (Aurora Fourier): (B, W) → (B, W, d_model) ---
-        temp_emb = self.temporal_emb(x_hours)                       # (B, W, d_model)
-        temp_emb = temp_emb.unsqueeze(2)                            # (B, W, 1, d_model)
+        tokens = var_tokens + pos_e + station_e + temp_e + step_e
+        return self.token_norm(tokens)
 
-        # --- s: Step-index embedding (within-window relative position) ---
-        # Encodes the INTEGER position 0..W-1 of each token in the input window.
-        # Provides explicit ordering information that the absolute temporal
-        # embedding does not cleanly expose at the 10-min step level.
-        # Consistent with the decoder: step indices use the same Fourier basis
-        # so "encoder step w" and "decoder query at delta_step w" are aligned.
-        step_idx = torch.arange(W, device=x.device)                 # (W,)
-        step_e   = self.step_emb(step_idx)                          # (W, d_model)
-        step_e   = step_e.view(1, W, 1, self.d_model)               # (1, W, 1, d_model)
-
-        # Sum five embeddings — all broadcast cleanly over (B, W, N, d_model)
-        if self.static_in_token:
-            # position and topography are already inside var_tokens as slots;
-            # adding them again would double-count and restore the imbalance
-            # this mode exists to remove.
-            tokens = var_tokens + temp_emb + step_e
-        else:
-            tokens = var_tokens + pos_e + station_e + temp_emb + step_e
-
-        # Normalise after summation: prevents any single component from
-        # dominating the scale seen by the first transformer block.
-        tokens = self.token_norm(tokens)                        # (B, W, N, d_model)
-        return tokens
-
-    def set_fixed_eval_mask(
-        self,
-        masked_indices: "torch.Tensor | None",   # (N_masked,) sorted
-        visible_indices: "torch.Tensor | None",  # (N_vis,) sorted
-    ) -> None:
-        """Set a fixed station mask for evaluation.
-
-        When set, ``_mask_stations`` replays this mask for every batch instead
-        of drawing a new one.  Pass ``None`` to both arguments to clear and
-        revert to the default random-draw behaviour.
+    def set_fixed_eval_mask(self, masked_indices, visible_indices) -> None:
+        """
+        Replay one fixed station mask for every batch (evaluation only).
+        Pass ``None, None`` to return to random per-sample masks.
         """
         if masked_indices is None and visible_indices is None:
             self._fixed_eval_mask = None
@@ -687,204 +251,55 @@ class StationMAEEncoder(nn.Module):
             assert masked_indices is not None and visible_indices is not None
             self._fixed_eval_mask = (masked_indices, visible_indices)
 
-    def _mask_stations(
-        self,
-        tokens: torch.Tensor,   # (B, W, N, d_model)
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _mask_stations(self, tokens: torch.Tensor):
         """
-        Randomly mask a fraction of stations uniformly across all timesteps.
-
-        The same stations are masked for the entire window — masking is
-        per-station, not per-token.  If ``set_fixed_eval_mask`` was called
-        with a fixed assignment, that assignment is replayed for every batch
-        instead of drawing a new one.
-
-        Args:
-            tokens: (B, W, N, d_model)
+        Hide int(N * mask_ratio) stations per sample, independently per sample.
 
         Returns:
-            visible_tokens  : (B, W, N_vis, d_model)   — unflattened; forward() flattens after transformer
-            masked_indices  : (B, N_masked)             — masked station indices
-            visible_indices : (B, N_vis)                — visible station indices
+            visible_tokens  (B, W, N_vis, d)
+            masked_indices  (B, N_masked)  sorted
+            visible_indices (B, N_vis)     sorted
         """
         B, W, N, D = tokens.shape
 
-        # ── Fixed evaluation mask (set by test.py --fixed_eval_mask) ───────
-        _fixed = getattr(self, "_fixed_eval_mask", None)
-        if _fixed is not None:
-            masked_indices  = _fixed[0].to(tokens.device).unsqueeze(0).expand(B, -1)
-            visible_indices = _fixed[1].to(tokens.device).unsqueeze(0).expand(B, -1)
-            num_visible = visible_indices.shape[1]
-            vis_idx_exp = visible_indices \
-                .unsqueeze(1).unsqueeze(-1).expand(B, W, num_visible, D)
-            visible_tokens = tokens.gather(2, vis_idx_exp)
-            return visible_tokens, masked_indices, visible_indices
+        if self._fixed_eval_mask is not None:
+            masked_indices  = self._fixed_eval_mask[0].to(tokens.device).unsqueeze(0).expand(B, -1)
+            visible_indices = self._fixed_eval_mask[1].to(tokens.device).unsqueeze(0).expand(B, -1)
+        else:
+            num_masked  = int(N * self.mask_ratio)
+            shuffle_idx = torch.argsort(torch.rand(B, N, device=tokens.device), dim=1)
+            # Sorting keeps the station order canonical: at mask_ratio 0 the
+            # visible sequence is exactly arange(N).
+            masked_indices,  _ = torch.sort(shuffle_idx[:, :num_masked], dim=1)
+            visible_indices, _ = torch.sort(shuffle_idx[:, num_masked:], dim=1)
 
-        num_masked  = int(N * self.mask_ratio)
-        num_visible = N - num_masked
-
-        # Sample a different random mask per batch item.
-        # WHICH stations are hidden is redrawn every forward pass — that is the
-        # masking objective and it stays random.
-        noise           = torch.rand(B, N, device=tokens.device)
-        shuffle_idx     = torch.argsort(noise, dim=1)              # (B, N)
-        visible_indices = shuffle_idx[:, num_masked:]              # (B, N_vis)
-        masked_indices  = shuffle_idx[:, :num_masked]              # (B, N_masked)
-
-        # ── Restore canonical station ORDER within each group ────────────────
-        # argsort returns a permutation, so the two slices above came out in
-        # random order — the sequence handed to the encoder was shuffled even
-        # at mask_ratio 0, where nothing is dropped at all.
-        #
-        # Harmless for the query decoder (the encoder output is only a key/value
-        # set, and attention over the station axis is permutation-equivariant —
-        # spatial attention here is FULL over N, windowing applies to the
-        # temporal axis only). But fatal for any positional readout: a
-        # direct head does encoded.view(B, T, n_stations, d) and treats axis 2
-        # as station index, so a shuffled sequence would train station j's
-        # target against another station's tokens, redrawn every step. The only
-        # learnable solution is a station-independent one — mean collapse, for a
-        # reason that has nothing to do with the architecture.
-        #
-        # Sorting keeps the mask random while making the ORDER deterministic:
-        # at mask_ratio 0 visible_indices is exactly arange(N), and at
-        # mask_ratio > 0 it is a monotone subsequence of it.
-        masked_indices,  _ = torch.sort(masked_indices,  dim=1)    # (B, N_masked)
-        visible_indices, _ = torch.sort(visible_indices, dim=1)    # (B, N_vis)
-
-        # Gather visible tokens across station dimension
-        # visible_indices: (B, N_vis) → expand to (B, W, N_vis, D)
-        vis_idx_exp = visible_indices \
-            .unsqueeze(1) \
-            .unsqueeze(-1) \
-            .expand(B, W, num_visible, D)                          # (B, W, N_vis, D)
-
-        visible_tokens = tokens.gather(2, vis_idx_exp)             # (B, W, N_vis, D)
-
-        # NOTE: returned as (B, W, N_vis, D) — NOT flattened.
-        # forward() flattens to (B, W*N_vis, D) after the transformer blocks so
-        # that both the flat and factorised paths share the same decoder interface.
+        num_visible = visible_indices.shape[1]
+        vis_idx_exp = visible_indices.unsqueeze(1).unsqueeze(-1).expand(B, W, num_visible, D)
+        visible_tokens = tokens.gather(2, vis_idx_exp)
         return visible_tokens, masked_indices, visible_indices
 
-    def forward(
-        self,
-        x:       torch.Tensor,   # (B, W, N, V)
-        x_mask:  torch.Tensor,   # (B, W, N, V)
-        spatial: torch.Tensor,   # (N, 15) or (B, N, 15)  — [:2]=pos, [2:]=characteristics
-        x_hours: torch.Tensor,   # (B, W)  hours-since-epoch per input timestep
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x, x_mask, spatial, x_hours):
         """
-        Encode visible station tokens.
-
         Args:
             x:        (B, W, N, V)  normalised observations
-            x_mask:   (B, W, N, V)  sensor availability mask
-            spatial:  (N, 15)       normalised static station features;
-                                    columns 0:2 → easting/northing (PositionalEmbedding p1)
-                                    columns 2:  → topographic characteristics (StationEmbedding p2)
-            x_hours:  (B, W)        hours since epoch for each input timestep
-                                    (feeds TemporalEmbedding)
-
+            x_mask:   (B, W, N, V)  sensor availability
+            spatial:  (N, 15) or (B, N, 15) normalised static station features
+            x_hours:  (B, W)  hours since epoch per input step
         Returns:
-            encoded         : (B, W * N_vis, d_model)  encoded visible tokens
-            masked_indices  : (B, N_masked)             which stations were masked
-            visible_indices : (B, N_vis)                which stations were visible
+            encoded         (B, T * N_vis, d_model), T = W / temporal_patch
+            masked_indices  (B, N_masked)
+            visible_indices (B, N_vis)
         """
-        # 1. Build full token representations
-        tokens = self._build_tokens(x, x_mask, spatial, x_hours)  # (B, W, N, d_model)
-
-        # 2. Mask stations → visible_tokens: (B, W, N_vis, d_model)  [unflattened]
-        visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
-
-        # 2b. Temporal patch merge.
-        # Done AFTER masking so the station axis is already reduced — the merge
-        # then costs P·d² per surviving token rather than per original station.
-        #
-        # An input_context side-channel used to smuggle raw last-step
-        # information past the patching; it was removed, and the decoder now
-        # reads recency through ordinary attention. Removing it also deleted
-        # the subsystem behind the silent-eval and zero-key attention bugs.
-        visible_tokens = self._patchify(visible_tokens)
-        B_sz, W_sz, N_vis, D = visible_tokens.shape
-
-        # 3. Transformer blocks
-        # ── Factorised path:    keep (B, W, N_vis, d) through FactorisedTransformerBlocks
-        #    then flatten to (B, W*N_vis, d) for the decoder interface.
-        # ── Full flat path:     flatten first to (B, W*N_vis, d) then run TransformerBlocks.
-        # Both paths use gradient checkpointing when use_checkpoint=True.
-        if self.factorised:
-            h = visible_tokens                                     # (B, W, N_vis, d_model)
-            for block in self.blocks:
-                if self.use_checkpoint and torch.is_grad_enabled():
-                    h = _cp_checkpoint(block, h, use_reentrant=False)
-                else:
-                    h = block(h)
-            h = h.reshape(B_sz, W_sz * N_vis, D)                  # (B, W*N_vis, d_model)
-        else:
-            h = visible_tokens.reshape(B_sz, W_sz * N_vis, D)     # (B, W*N_vis, d_model)
-            for block in self.blocks:
-                if self.use_checkpoint and torch.is_grad_enabled():
-                    h = _cp_checkpoint(block, h, use_reentrant=False)
-                else:
-                    h = block(h)
-
-        h = self.norm(h)                                           # (B, W*N_vis, d_model)
-        return h, masked_idx, visible_idx
-
-    def forward_with_attn(
-        self,
-        x:       torch.Tensor,   # (B, W, N, V)
-        x_mask:  torch.Tensor,   # (B, W, N, V)
-        spatial: torch.Tensor,   # (N, 15) or (B, N, 15)
-        x_hours: torch.Tensor,   # (B, W)
-    ) -> "tuple[torch.Tensor, torch.Tensor, torch.Tensor, list]":
-        """
-        Diagnostic-only twin of forward() that also returns per-layer spatial
-        attention weights, so a masked station's prediction can be traced back
-        to which VISIBLE stations it actually attended to (e.g. notebooks/
-        analysis/14_ablation_loss_and_attention.ipynb's "contribution of
-        surrounding stations" section).
-
-        Only implemented for the factorised path (self.factorised=True),
-        which is what every surviving checkpoint uses — the flat
-        TransformerBlock path attends over W*N_vis tokens jointly (no
-        separable station-only attention matrix to extract) and is not
-        instrumented here. Raises if called on a flat-path encoder or one
-        with spatial_attn=False (nothing to extract — that IS the point of
-        the Spatially Blind Transformer's ablation).
-
-        Not on the trained path; forward() is unchanged and still what
-        training/eval call. See FactorisedTransformerBlock.forward_with_attn
-        for the need_weights=True caveat (slower, not fused-SDPA).
-
-        Returns:
-            encoded         : (B, W * N_vis, d_model)  — identical to forward()
-            masked_indices  : (B, N_masked)
-            visible_indices : (B, N_vis)
-            attn_per_layer  : list of (B*W, N_vis, N_vis) tensors, one per
-                              transformer block, spatial attention only
-                              (station axis, averaged over heads). Empty list
-                              if no block has spatial_attn=True.
-        """
-        if not self.factorised:
-            raise NotImplementedError(
-                "forward_with_attn only supports the factorised encoder path "
-                "(--factorised_encoder); the flat TransformerBlock path has no "
-                "separable station-attention matrix to extract."
-            )
-
         tokens = self._build_tokens(x, x_mask, spatial, x_hours)
         visible_tokens, masked_idx, visible_idx = self._mask_stations(tokens)
-        visible_tokens = self._patchify(visible_tokens)
-        B_sz, W_sz, N_vis, D = visible_tokens.shape
+        h = self._patchify(visible_tokens)
+        B, T, N_vis, D = h.shape
 
-        h = visible_tokens
-        attn_per_layer = []
         for block in self.blocks:
-            h, attn = block.forward_with_attn(h)
-            if attn is not None:
-                attn_per_layer.append(attn)
-        h = h.reshape(B_sz, W_sz * N_vis, D)
+            if self.use_checkpoint and torch.is_grad_enabled():
+                h = _cp_checkpoint(block, h, use_reentrant=False)
+            else:
+                h = block(h)
 
-        h = self.norm(h)
-        return h, masked_idx, visible_idx, attn_per_layer
+        h = self.norm(h.reshape(B, T * N_vis, D))
+        return h, masked_idx, visible_idx

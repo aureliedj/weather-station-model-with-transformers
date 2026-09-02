@@ -1,50 +1,26 @@
 """
 model/decoder.py
 
-MAE decoder for Station-MAE.
+Lead-time-conditioned cross-attention decoder.
 
-Design
-------
-The decoder answers a single question per forward pass:
-    "Given what the encoder saw in the input window, what are all N stations
-     doing at the TARGET time t + Δt?"
+For every station n and lead time delta_k a query token is built,
 
-It does so in four steps:
+    q[n, k] = mask_token
+            + pos_emb(spatial[n, :2]) + station_emb(spatial[n, 2:])   where
+            + station_state[hidden(n)]                                 visible / masked
+            + temporal_emb(y_hours[k])                                 when (absolute)
+            + delta_emb(delta_k)                                       lead time
+            + step_emb(W - 1 + delta_k)                                step index
 
-  1. Station queries  —  For each of the N stations build a target-time query
-     vector by summing five positional signals:
+and the N*K queries pass through a small stack of blocks that self-attend
+among the queries and cross-attend to the encoder output. A linear head maps
+each query to the 5 target variables (plus log sigma^2 when
+``predict_uncertainty=True``).
 
-         query[n,k] = mask_token                           (learnable, shared)
-                    + spatial_emb(spatial[n])              — WHERE  (static topo/location)
-                    + temporal_emb(y_hours[k])             — WHEN   (Aurora Fourier absolute time)
-                    + delta_emb(delta_steps[k])            — LEAD   (forecast horizon in hours)
-                    + step_emb(W-1 + delta_steps[k])       — LEAD   (position in unified step-count
-                                                                      timeline shared with encoder)
-
-     The step_emb places each decoder query in the SAME integer coordinate system
-     as the encoder: encoder input tokens use indices 0..W-1, decoder query tokens
-     use indices W-1+Δ (e.g. 74, 77, …, 107 for Δ=3,6,…,36 and W=72).
-     This is semantically clean — no aliasing between encoder and decoder indices —
-     and lets the model learn "I am 3 steps after the last encoder step" rather
-     than just "my lead time is 0.5 h".
-
-  2. Full sequence  —  Concatenate the W·N_vis encoder tokens (context) with
-     the N station queries (targets):
-
-         full_seq = [encoded_vis ‖ station_queries]     shape (B, W·N_vis + N, d_model)
-
-  3. Self-attention  —  A lightweight stack of Transformer blocks attends over
-     the full sequence so every station query can see all encoder context.
-
-  4. Prediction head  —  The last N tokens are projected to (N, V) via a
-     linear layer.  Loss is computed externally (in StationMAE) on masked
-     stations only.
-
-Why concatenate rather than cross-attend?
-    Simple self-attention over the full sequence lets encoder tokens also
-    attend to each other in the decoder, which helps when reconstructing
-    correlated variables.  For longer windows the cross-attention variant
-    saves memory; that extension is straightforward.
+With ``station_local=True`` the station axis is folded into the batch, so
+each station's queries only see that station's own encoder tokens. Together
+with an encoder without spatial attention this gives a model with no
+cross-station pathway.
 """
 
 import torch
@@ -64,185 +40,50 @@ from .embeddings import (
     NUM_VARIABLES,
     NUM_TARGET_VARIABLES,
 )
-from .encoder import TransformerBlock, DropPath   # reuse Pre-LN block and DropPath
+from .encoder import DropPath, _ffn
 
-
-# ---------------------------------------------------------------------------
-# Cross-attention decoder block
-# ---------------------------------------------------------------------------
 
 class CrossAttentionBlock(nn.Module):
-    """
-    Decoder block where query tokens attend to encoder context via cross-attention.
+    """Pre-LN block: self-attention over queries, cross-attention to the encoder, FFN."""
 
-    Structure (Pre-LN throughout):
-      1. Self-attention    — queries attend to each other (captures inter-station
-                             structure within the query set).
-      2. Cross-attention   — queries (Q) attend to encoder output (K, V); lets
-                             every query token directly read from the full encoder
-                             context without concatenating the two sequences.
-      3. FFN
-
-    Why cross-attention instead of concatenated self-attention?
-        The original decoder concatenates [encoder_tokens ‖ query_tokens] and runs
-        joint self-attention.  This forces every encoder token to also attend to
-        every query token — wasting capacity and adding N (or N·K) extra tokens to
-        an already large encoder sequence.  Cross-attention is cleaner:
-
-          Old (self-attn):  sequence length = W·N_vis + N·K   (~29,400 at W=288)
-          New (cross-attn): query length    = N·K             (~600)
-                            context length  = W·N_vis          (~28,800, read-only)
-
-        Memory cost of the cross-attention matrix:
-            O(N·K × W·N_vis) with standard attention
-            O(N·K)           with Flash Attention (need_weights=False)
-
-    Args:
-        d_model:   Model dimension — must match encoder d_model.
-        num_heads: Attention heads (shared across self and cross sub-layers).
-        mlp_ratio: FFN hidden-dim ratio (default 4.0).
-        dropout:   Dropout rate (default 0.1).
-        drop_path: Stochastic depth drop probability (default 0.0 = disabled).
-                   Applied to the residuals of self-attn, cross-attn, and FFN.
-    """
-
-    def __init__(
-        self,
-        d_model:   int,
-        num_heads: int,
-        mlp_ratio: float = 4.0,
-        dropout:   float = 0.1,
-        drop_path: float = 0.0,
-    ):
+    def __init__(self, d_model: int, num_heads: int, mlp_ratio: float = 4.0,
+                 dropout: float = 0.1, drop_path: float = 0.0):
         super().__init__()
-
-        # ── Self-attention on queries ─────────────────────────────────────
         self.norm_sa    = nn.LayerNorm(d_model)
-        self.self_attn  = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True
-        )
+        self.self_attn  = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm_q     = nn.LayerNorm(d_model)
+        self.norm_kv    = nn.LayerNorm(d_model)
+        self.cross_attn = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
+        self.norm_ff    = nn.LayerNorm(d_model)
+        self.ffn        = _ffn(d_model, mlp_ratio, dropout)
+        self.drop_path  = DropPath(drop_path)
 
-        # ── Cross-attention: Q from queries, K/V from encoder context ─────
-        self.norm_q     = nn.LayerNorm(d_model)   # normalise query side
-        self.norm_kv    = nn.LayerNorm(d_model)   # normalise encoder context
-        self.cross_attn = nn.MultiheadAttention(
-            d_model, num_heads, dropout=dropout, batch_first=True
-        )
-
-        # ── FFN ───────────────────────────────────────────────────────────
-        self.norm_ff = nn.LayerNorm(d_model)
-        self.ffn     = nn.Sequential(
-            nn.Linear(d_model, int(d_model * mlp_ratio)),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(int(d_model * mlp_ratio), d_model),
-            nn.Dropout(dropout),
-        )
-
-        # ── Stochastic depth ──────────────────────────────────────────────
-        self.drop_path = DropPath(drop_path)
-
-    def forward(
-        self,
-        q:  torch.Tensor,   # (B, L_q,  d_model) — decoder query tokens
-        kv: torch.Tensor,   # (B, L_kv, d_model) — encoder context (key/value)
-        kv_padding_mask: "torch.Tensor | None" = None,  # (B, L_kv) bool; True = ignore key
-    ) -> torch.Tensor:
-        """
-        Args:
-            kv_padding_mask: optional (B, L_kv) bool mask, True where the K/V
-                token must NOT be attended (softmax logit = −inf).
-                Unused by this project's decoder (the input_context
-                pathway that needed it was removed); kept because
-                CrossAttentionBlock is generic and a zero/degenerate key would
-                otherwise still receive softmax mass — softmax has no native
-                notion of an "empty" key (standard padding-mask practice,
-                cf. Transformer/BERT).
-
-        Returns:
-            (B, L_q, d_model)
-        """
-        # 1. Self-attention among queries
-        q_n  = self.norm_sa(q)
+    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        """q: (B, L_q, d) queries, kv: (B, L_kv, d) encoder output -> (B, L_q, d)."""
+        q_n   = self.norm_sa(q)
         sa, _ = self.self_attn(q_n, q_n, q_n, need_weights=False)
-        q    = q + self.drop_path(sa)
+        q     = q + self.drop_path(sa)
 
-        # 2. Cross-attention: queries read from encoder context
-        kv_n  = self.norm_kv(kv)          # normalise once, reuse for K and V
-        ca, _ = self.cross_attn(
-            self.norm_q(q),               # Q: normalised queries
-            kv_n,                         # K: normalised encoder context
-            kv_n,                         # V: same
-            key_padding_mask=kv_padding_mask,
-            need_weights=False,
-        )
-        q = q + self.drop_path(ca)
+        kv_n  = self.norm_kv(kv)
+        ca, _ = self.cross_attn(self.norm_q(q), kv_n, kv_n, need_weights=False)
+        q     = q + self.drop_path(ca)
 
-        # 3. FFN
         q = q + self.drop_path(self.ffn(self.norm_ff(q)))
         return q
-
-    def forward_with_attn(
-        self,
-        q:  torch.Tensor,   # (B, L_q,  d_model)
-        kv: torch.Tensor,   # (B, L_kv, d_model)
-        kv_padding_mask: "torch.Tensor | None" = None,
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """
-        Diagnostic-only twin of forward() that also returns the CROSS-attention
-        weights (query -> encoder context). This is the mechanism that actually
-        produces a masked station's prediction: a masked station contributes no
-        token to the encoder (see StationMAEEncoder._mask_stations), so
-        everything it "knows" about its neighbours arrives through this
-        cross-attention read of the visible-station encoder context. Not used
-        by the trained forward path — forward() keeps need_weights=False on
-        both sub-layers for the fused SDPA kernel.
-
-        Returns:
-            q:    (B, L_q, d_model) — identical to forward()'s output
-            attn: (B, L_q, L_kv) cross-attention weights, averaged over heads.
-                  Row n, for L_q indexed by station (single-delta path), sums
-                  to 1 over L_kv = the encoder's (timestep, visible-station)
-                  context tokens.
-        """
-        q_n  = self.norm_sa(q)
-        sa, _ = self.self_attn(q_n, q_n, q_n, need_weights=False)
-        q    = q + self.drop_path(sa)
-
-        kv_n = self.norm_kv(kv)
-        ca, attn = self.cross_attn(
-            self.norm_q(q), kv_n, kv_n,
-            key_padding_mask=kv_padding_mask,
-            need_weights=True, average_attn_weights=True,
-        )
-        q = q + self.drop_path(ca)
-
-        q = q + self.drop_path(self.ffn(self.norm_ff(q)))
-        return q, attn
 
 
 class StationMAEDecoder(nn.Module):
     """
-    MAE decoder for weather station reconstruction and forecasting.
-
     Args:
-        d_model:              Model dimension — must match encoder d_model.
-        num_heads:            Attention heads (default 4).
-        num_layers:           Transformer blocks (default 2; lighter than encoder).
-        mlp_ratio:            FFN hidden-dim ratio (default 4.0).
-        dropout:              Dropout rate (default 0.1).
-        num_vars:             Input variables per station (default 6).
-        num_target_vars:      Variables to predict per station (default 5, excludes
-                              precipitation which is used as input only).
-        station_char_dim:     Dimension of station characteristic features p2 (default 13).
-        fourier_dim:          Fourier dimension for TemporalEmbedding (default 32).
-        delta_fourier_dim:    Fourier dimension for DeltaTimeEmbedding (default 16).
-        position_fourier_dim: Fourier features per coordinate for PositionalEmbedding (default 16).
-        use_checkpoint:       If True, use gradient checkpointing on each decoder block.
-        cross_attention:      If True, use CrossAttentionBlock (query tokens cross-attend
-                              to encoder context) instead of concatenated self-attention.
-                              Reduces decoder sequence length from W·N_vis+N·K to just N·K,
-                              which is much cheaper when the encoder context is long.
+        d_model, num_heads, num_layers, mlp_ratio, dropout: transformer size.
+        num_target_vars:      predicted variables per station (5).
+        use_checkpoint:       gradient checkpointing on every block.
+        drop_path_rate:       maximum stochastic-depth rate (linear over depth).
+        predict_uncertainty:  add a second head predicting log sigma^2.
+        window_size:          W; decoder step indices are W - 1 + delta.
+        station_local:        fold the station axis into the batch (see module doc).
+        step_emb, pos_emb, station_emb, temporal_emb:
+                              embedding modules shared with the encoder.
     """
 
     def __init__(
@@ -258,500 +99,95 @@ class StationMAEDecoder(nn.Module):
         fourier_dim:          int   = TEMPORAL_FOURIER_DIM,
         delta_fourier_dim:    int   = DELTA_FOURIER_DIM,
         position_fourier_dim: int   = POSITION_FOURIER_DIM,
-        use_checkpoint:          bool  = False,
-        cross_attention:         bool  = False,
-        drop_path_rate:          float = 0.0,
-        predict_uncertainty:      bool = False,
-        window_size:              int  = 72,
-        step_emb:                 "nn.Module | None" = None,
-        pos_emb:                  "nn.Module | None" = None,
-        station_emb:              "nn.Module | None" = None,
-        temporal_emb:             "nn.Module | None" = None,
-        station_local:            bool = False,
+        use_checkpoint:       bool  = False,
+        drop_path_rate:       float = 0.0,
+        predict_uncertainty:  bool  = False,
+        window_size:          int   = 72,
+        step_emb:             "nn.Module | None" = None,
+        pos_emb:              "nn.Module | None" = None,
+        station_emb:          "nn.Module | None" = None,
+        temporal_emb:         "nn.Module | None" = None,
+        station_local:        bool  = False,
     ):
         super().__init__()
-
         self.d_model             = d_model
         self.num_target_vars     = num_target_vars
         self.use_checkpoint      = use_checkpoint
-        self.use_cross_attention = cross_attention
         self.predict_uncertainty = predict_uncertainty
-        # station_local=True folds the station axis into the batch dimension, so
-        # a station's queries attend only to one another and cross-attend only
-        # to THAT station's encoder tokens. Combined with an encoder built with
-        # spatial_attn=False this yields a genuinely station-independent model,
-        # while keeping the Delta-query decoder intact. Requires mask_ratio 0
-        # (a masked station contributes no encoder tokens to attend to).
         self.station_local       = bool(station_local)
-        # W: input window length.  Decoder step indices = W-1 + delta_steps,
-        # continuing the encoder's 0..W-1 timeline into future positions.
         self.window_size         = window_size
 
-        # ------------------------------------------------------------------
-        # Learnable mask token — shared starting point for all station queries.
-        # Position is injected via the four embeddings below.
-        # ------------------------------------------------------------------
+        # Shared starting point of every query.
         self.mask_token = nn.Parameter(torch.zeros(1, 1, d_model))
         nn.init.trunc_normal_(self.mask_token, std=0.02)
 
-        # ------------------------------------------------------------------
-        # STATION-STATE embedding — "was this station visible to the encoder?"
-        #
-        # Two learned vectors: index 0 = visible, index 1 = masked. Added to the
-        # query for station n according to whether n was hidden in THIS forward
-        # pass.
-        #
-        # Why this is needed. With the residual head the decoder predicts
-        #     y_hat = base + f(.)
-        # where base = the station's last observation if VISIBLE, and 0 if
-        # MASKED (a masked station's last value is hidden information and must
-        # not leak). So f has to emit a small deviation-from-persistence in one
-        # regime and a full absolute value in the other — and the query
-        # previously carried no signal distinguishing them:
-        #     mask_token + position + topography + time + delta + step
-        # is identical for a visible and a hidden station. One head, bimodal
-        # target, unobservable condition. That is why --residual_head degraded
-        # an early sanity run and was switched off.
-        #
-        # This is NOT leakage. Which stations are offline is known at
-        # deployment time; only their VALUES must stay hidden. The embedding
-        # carries one bit per station — availability — not the observation.
+        # Two learned vectors: index 0 = station visible to the encoder,
+        # index 1 = station masked. The decoder needs this bit because with
+        # the residual head it predicts a deviation from the last observation
+        # for visible stations and a full value for masked ones.
         self.station_state = nn.Parameter(torch.zeros(2, d_model))
         nn.init.trunc_normal_(self.station_state, std=0.02)
 
-        # ------------------------------------------------------------------
-        # Positional / contextual embeddings for query token construction
-        # Token = mask_token + p1 + p2 + t + delta
-        # ------------------------------------------------------------------
-        # p1/p2/t — shared with the encoder (see mae.py) rather than built as
-        # separate copies. A station's position, topography and a given
-        # absolute time are the same fact whether the encoder is embedding a
-        # key for that station or the decoder is embedding a query for it —
-        # two independently-constructed modules would only share their fixed
-        # Fourier frequencies, not their trained MLP weights, so the query's
-        # positional fingerprint and the matching key's would drift apart
-        # during training instead of being provably identical. Same rationale
-        # as step_emb below. Falls back to its own instance when used
-        # standalone (e.g. tests, notebooks). NOT applied to the observation
-        # value embedding — the decoder has no observed value to share.
-        #
-        # p1 — WHERE (position): Fourier encoding of easting/northing
         self.pos_emb      = pos_emb if pos_emb is not None else \
-            PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim,
-                                dropout=dropout)
-
-        # p2 — WHERE (characteristics): MLP over topographic features
+            PositionalEmbedding(d_model=d_model, fourier_dim=position_fourier_dim, dropout=dropout)
         self.station_emb  = station_emb if station_emb is not None else \
-            StationEmbedding(d_model=d_model, input_dim=station_char_dim,
-                             dropout=dropout)
-
-        # t  — WHEN: Aurora Fourier temporal encoding for the TARGET timestep
+            StationEmbedding(d_model=d_model, input_dim=station_char_dim, dropout=dropout)
         self.temporal_emb = temporal_emb if temporal_emb is not None else \
-            TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim,
-                                              dropout=dropout)
-
-        # Δt — LEAD: Fourier encoding over continuous lead-time hours
+            TemporalEmbedding(d_model=d_model, fourier_dim=fourier_dim, dropout=dropout)
         self.delta_emb    = DeltaTimeEmbedding(d_model=d_model, fourier_dim=delta_fourier_dim,
                                                dropout=dropout)
-
-        # s  — STEP: integer position in the unified encoder+decoder timeline.
-        #
-        # The encoder assigns step indices 0..W-1 to its input tokens.
-        # The decoder's query tokens at lead Δ are placed at index W-1+Δ,
-        # continuing the same integer coordinate system past the window edge:
-        #
-        #   Encoder  :  0 ──── 1 ──── … ──── W-1          (input steps)
-        #   Decoder  :                              W-1+3  W-1+6  …  W-1+36
-        #              (e.g. W=72 → encoder 0..71, decoder 74, 77, …, 107)
-        #
-        # This guarantees decoder indices are strictly outside the encoder range
-        # (no aliasing: "step 6 in the encoder" ≠ "step 6 in the decoder"),
-        # and gives the model a common positional reference that complements
-        # DeltaTimeEmbedding's continuous-hours signal with a discrete step count
-        # calibrated to the window scale.
-        #
-        # This module instance is shared with the encoder (passed in from
-        # StationMAE, see mae.py) rather than built as a separate copy. The
-        # decoder's fixed_grid horizons only touch a sparse subset of indices
-        # past W-1 (e.g. stride-3 → 74, 77, ..., 107 for W=72), overlapping the
-        # encoder's dense 0..W-1 range at exactly one point (W-1, delta=0).
-        # Two independently-constructed StepIndexEmbedding instances would only
-        # share their fixed Fourier frequencies, not their trained MLP weights,
-        # so "encoder step k" and "decoder step k" would silently diverge during
-        # training. Sharing the instance makes them provably identical instead.
-        # Falls back to its own instance when used standalone.
-        self.step_emb = step_emb if step_emb is not None else \
+        self.step_emb     = step_emb if step_emb is not None else \
             StepIndexEmbedding(d_model=d_model, dropout=dropout)
+        self.query_norm   = nn.LayerNorm(d_model)
 
-        # --- Post-assembly normalisation for station query tokens ---
-        # Applied after summing mask_token + spatial + temporal + delta,
-        # matching the encoder's token_norm for consistent scale at decoder input.
-        self.query_norm = nn.LayerNorm(d_model)
-
-        # ------------------------------------------------------------------
-        # Decoder attention stack
-        # cross_attention=True  → CrossAttentionBlock  (queries cross-attend encoder)
-        # cross_attention=False → TransformerBlock     (concatenated self-attention)
-        #
-        # Stochastic depth rates increase linearly from 0 → drop_path_rate
-        # across decoder layers, matching the encoder convention.
-        # ------------------------------------------------------------------
-        dp_rates = [
-            drop_path_rate * i / max(num_layers - 1, 1)
+        dp_rates = [drop_path_rate * i / max(num_layers - 1, 1) for i in range(num_layers)]
+        self.blocks = nn.ModuleList([
+            CrossAttentionBlock(d_model, num_heads, mlp_ratio, dropout, drop_path=dp_rates[i])
             for i in range(num_layers)
-        ]
-        if cross_attention:
-            self.blocks = nn.ModuleList([
-                CrossAttentionBlock(d_model, num_heads, mlp_ratio, dropout,
-                                    drop_path=dp_rates[i])
-                for i in range(num_layers)
-            ])
-        else:
-            self.blocks = nn.ModuleList([
-                TransformerBlock(d_model, num_heads, mlp_ratio, dropout,
-                                 drop_path=dp_rates[i])
-                for i in range(num_layers)
-            ])
+        ])
         self.norm = nn.LayerNorm(d_model)
 
-        # ------------------------------------------------------------------
-        # v15: the input-context cross-attention block has been REMOVED.
-        # Its job — anchoring short leads to the raw last observation — is
-        # now done structurally: the telescopic patch schedule keeps the last
-        # hour at native resolution in the encoder sequence, and the
-        # persistence-residual head (mae.py) provides the "copy + small
-        # correction" prior directly. Checkpoints containing
-        # decoder.input_cross_attn.* weights predate v15 and must be
-        # evaluated with the code that trained them.
-        # ------------------------------------------------------------------
-
-        # ------------------------------------------------------------------
-        # Prediction head: d_model → num_target_vars
-        # Precipitation is excluded from the output — it is used as input
-        # context only (zero-inflated distribution makes MSE a poor fit).
-        # ------------------------------------------------------------------
         self.head = nn.Linear(d_model, num_target_vars)
-
-        # ------------------------------------------------------------------
-        # Optional log-variance head (heteroscedastic NLL / CRPS mode).
-        #
-        # When predict_uncertainty=True, a second linear layer produces
-        # log σ²_v per variable, enabling the Gaussian heteroscedastic NLL:
-        #
-        #     NLL = 0.5 × (err² / σ² + log σ²)
-        #         = 0.5 × (err² × exp(−log_var) + log_var)
-        #
-        # Initialised with zero weights and bias so that at training start
-        # σ² = exp(log_var) = 1, making the NLL identical in scale to MSE.
-        # The model then learns to widen uncertainty for difficult samples
-        # (large residuals, long horizons, masked stations far from neighbours).
-        #
-        # Only instantiated when predict_uncertainty=True — no overhead when
-        # using the default MSE/Huber loss.
-        # ------------------------------------------------------------------
         if predict_uncertainty:
+            # log sigma^2 head, initialised so that sigma^2 = 1 at the start.
             self.log_var_head = nn.Linear(d_model, num_target_vars)
             nn.init.zeros_(self.log_var_head.weight)
             nn.init.zeros_(self.log_var_head.bias)
 
     # ------------------------------------------------------------------
-    # Forward
-    # ------------------------------------------------------------------
+
+    def _run_blocks(self, h: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
+        for block in self.blocks:
+            if self.use_checkpoint and torch.is_grad_enabled():
+                h = _cp_checkpoint(block, h, kv, use_reentrant=False)
+            else:
+                h = block(h, kv)
+        return h
 
     def forward(
         self,
-        encoded_vis:   torch.Tensor,           # (B, W*N_vis, d_model) — encoder output
-        spatial:       torch.Tensor,           # (N, 15) or (B, N, 15)
-        y_hours:       torch.Tensor,           # (B,) or (B, K)
-        delta_steps:   torch.Tensor,           # (B,) or (B, K)
-        station_masked: "torch.Tensor | None" = None,   # (B, N) bool: hidden from the encoder
-    ) -> torch.Tensor:
+        encoded_vis:    torch.Tensor,                    # (B, T*N_vis, d)
+        spatial:        torch.Tensor,                    # (N, 15) or (B, N, 15)
+        y_hours:        torch.Tensor,                    # (B,) or (B, K)
+        delta_steps:    torch.Tensor,                    # (B,) or (B, K)
+        station_masked: "torch.Tensor | None" = None,    # (B, N) bool
+    ):
         """
-        Predict variables for all N stations at one or K target times.
-
-        Supports two calling conventions depending on the shape of ``y_hours``
-        and ``delta_steps``:
-
-        Single-delta  (K=1):
-            y_hours:     (B,)
-            delta_steps: (B,)
-            Returns:     (B, N, num_target_vars)
-
-        Multi-delta  (K>1):
-            y_hours:     (B, K)
-            delta_steps: (B, K)
-            Returns:     (B, K, N, num_target_vars)
-
-            All K lead-times are processed in a **single** transformer pass.
-            N×K query tokens are built — one per (station, lead-time) pair —
-            and concatenated with the encoder context before self-attention.
-            This avoids K separate decoder forward passes while giving every
-            lead-time query its own distinct temporal and delta embedding.
-
-        Args:
-            encoded_vis:  (B, W*N_vis, d_model)  encoder output (visible tokens)
-            spatial:      (N, 15) or (B, N, 15)  static features for ALL N stations;
-                          columns 0:2 → easting/northing (PositionalEmbedding p1)
-                          columns 2:  → topographic characteristics (StationEmbedding p2)
-            y_hours:      (B,) or (B, K)          target time(s) as hours since epoch
-            delta_steps:  (B,) or (B, K)          forecast horizon(s) in 10-min steps
-
-        Returns:
-            preds: (B, N, num_target_vars)        — single-delta
-                or (B, K, N, num_target_vars)     — multi-delta
+        Returns (B, N, V_t) for single-delta inputs or (B, K, N, V_t) for
+        multi-delta inputs; a tuple (mean, log_var) when predict_uncertainty.
         """
         B = encoded_vis.size(0)
-
-        # --- Resolve spatial shape → (B, N, 15) ---
         if spatial.dim() == 2:
-            N         = spatial.size(0)
-            spatial_b = spatial.unsqueeze(0).expand(B, -1, -1)   # (B, N, 15)
+            N, spatial_b = spatial.size(0), spatial.unsqueeze(0).expand(B, -1, -1)
         else:
-            N         = spatial.size(1)
-            spatial_b = spatial                                   # (B, N, 15)
+            N, spatial_b = spatial.size(1), spatial
 
-        # Detect single- vs multi-delta from y_hours dimensionality
-        is_multi = (y_hours.dim() == 2)   # True → (B, K);  False → (B,)
-        K        = y_hours.shape[1] if is_multi else 1
-
-        # ------------------------------------------------------------------
-        # 1. Spatial query base (shared across all K lead-times)
-        #    spatial_q[b,n] = mask_token
-        #                   + p1: pos_emb(spatial[n, :2])     — WHERE (position)
-        #                   + p2: station_emb(spatial[n, 2:]) — WHERE (topo)
-        # ------------------------------------------------------------------
-        # Every query starts from the shared mask_token. (The v23 "anchor"
-        # variant, which started VISIBLE queries from their own encoder token,
-        # was never enabled in any run and has been removed; station_state
-        # below still carries the visible/masked distinction.)
-        spatial_q = self.mask_token.expand(B, N, -1).contiguous()   # (B, N, d_model)
-        spatial_q = spatial_q + self.pos_emb(spatial_b[..., :2])   # (B, N, d_model)
-        spatial_q = spatial_q + self.station_emb(spatial_b[..., 2:])  # (B, N, d_model)
-
-        # Station state: index 1 where the encoder could not see this station.
-        # Defaults to "all visible" when the caller passes nothing, which is
-        # what evaluation at mask_ratio 0 wants.
-        if station_masked is None:
-            spatial_q = spatial_q + self.station_state[0]
-        else:
-            spatial_q = spatial_q + self.station_state[station_masked.long()]
-
+        is_multi = (y_hours.dim() == 2)
         if not is_multi:
-            # ── Single-delta path ─────────────────────────────────────────
-            temp_emb = self.temporal_emb(y_hours)                   # (B, d_model)
-            delt_emb = self.delta_emb(delta_steps)                  # (B, d_model)
-            # Step index in the unified encoder+decoder timeline: W-1 + Δ
-            # e.g. delta_steps=3 → step_idx=74 for W=72
-            step_idx = (self.window_size - 1) + delta_steps         # (B,) long
-            step_emb = self.step_emb(step_idx)                      # (B, d_model)
+            y_hours, delta_steps = y_hours.unsqueeze(1), delta_steps.unsqueeze(1)
+        K = y_hours.shape[1]
 
-            queries = spatial_q \
-                    + temp_emb.unsqueeze(1) \
-                    + delt_emb.unsqueeze(1) \
-                    + step_emb.unsqueeze(1)                         # (B, N, d_model)
-            queries = self.query_norm(queries)                      # (B, N, d_model)
-
-            if self.use_cross_attention and self.station_local:
-                # Same fold as the multi-delta path, with K = 1: each station
-                # becomes its own attention problem. Without this branch the
-                # single-delta path would still mix stations while the
-                # multi-delta path did not.
-                # NOTE: divisibility alone is NOT a sufficient check. With
-                # N_vis = N/2 the token count T*N_vis can still divide by N,
-                # and the reshape then silently uses a wrong temporal length
-                # (T/2) while mixing stations. StationMAE therefore rejects any
-                # masked station BEFORE calling the decoder, using masked_idx.
-                # This check remains only as a last-resort shape guard for
-                # callers that use the decoder directly.
-                _WN = encoded_vis.shape[1]
-                if _WN % N != 0:
-                    raise RuntimeError(
-                        f"station_local decoder needs every station present: "
-                        f"encoder returned {_WN} tokens which is not divisible "
-                        f"by N={N}. Train and evaluate with --mask_ratio 0.")
-                _W = _WN // N
-                kv_local = (encoded_vis
-                            .view(B, _W, N, self.d_model)
-                            .permute(0, 2, 1, 3)
-                            .reshape(B * N, _W, self.d_model))
-                h = queries.reshape(B * N, 1, self.d_model)
-                for block in self.blocks:
-                    if self.use_checkpoint and torch.is_grad_enabled():
-                        h = _cp_checkpoint(block, h, kv_local, use_reentrant=False)
-                    else:
-                        h = block(h, kv_local)
-                h = h.reshape(B, N, self.d_model)
-
-            elif self.use_cross_attention:
-                h = queries
-                for block in self.blocks:
-                    if self.use_checkpoint and torch.is_grad_enabled():
-                        h = _cp_checkpoint(block, h, encoded_vis, use_reentrant=False)
-                    else:
-                        h = block(h, encoded_vis)
-            else:
-                full_seq = torch.cat([encoded_vis, queries], dim=1)
-                h = full_seq
-                for block in self.blocks:
-                    if self.use_checkpoint and torch.is_grad_enabled():
-                        h = _cp_checkpoint(block, h, use_reentrant=False)
-                    else:
-                        h = block(h)
-                h = h[:, -N:, :]                                    # (B, N, d_model)
-
-            h = self.norm(h)
-            mean = self.head(h)                                     # (B, N, num_target_vars)
-            if self.predict_uncertainty:
-                return mean, self.log_var_head(h)                   # (mean, log_var)
-            return mean
-
-        else:
-            # ── Multi-delta path ──────────────────────────────────────────
-            temp_emb = self.temporal_emb(y_hours)                   # (B, K, d_model)
-            delt_emb = self.delta_emb(delta_steps)                  # (B, K, d_model)
-            # Step index in the unified encoder+decoder timeline: W-1 + Δ
-            # delta_steps: (B, K) long  →  step_idx: (B, K)
-            step_idx = (self.window_size - 1) + delta_steps         # (B, K) long
-            step_emb = self.step_emb(step_idx)                      # (B, K, d_model)
-
-            spatial_exp = spatial_q.unsqueeze(2).expand(B, N, K, -1)   # (B, N, K, d_model)
-            temp_exp    = temp_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
-            delt_exp    = delt_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
-            step_exp    = step_emb.unsqueeze(1).expand(B, N, K, -1)    # (B, N, K, d_model)
-
-            queries_NK  = spatial_exp + temp_exp + delt_exp + step_exp  # (B, N, K, d_model)
-            queries_NK  = self.query_norm(queries_NK)
-            queries_seq = queries_NK.reshape(B, N * K, self.d_model)   # (B, N*K, d_model)
-
-            if self.use_cross_attention and self.station_local:
-                # ── Station-independent decoding ────────────────────────────
-                # Fold the station axis into the batch so each station is a
-                # separate attention problem: its K queries attend only to one
-                # another, and cross-attend only to its OWN W encoder tokens.
-                #
-                # Layouts (verified against encoder.py and the head below):
-                #   encoded_vis : (B, W*N, d)  W-major, station fastest
-                #   queries_NK  : (B, N, K, d) station-major, lead fastest
-                #
-                # Requires every station present: a masked station has no
-                # encoder tokens, so there would be nothing to attend to.
-                # NOTE: divisibility alone is NOT a sufficient check. With
-                # N_vis = N/2 the token count T*N_vis can still divide by N,
-                # and the reshape then silently uses a wrong temporal length
-                # (T/2) while mixing stations. StationMAE therefore rejects any
-                # masked station BEFORE calling the decoder, using masked_idx.
-                # This check remains only as a last-resort shape guard for
-                # callers that use the decoder directly.
-                _WN = encoded_vis.shape[1]
-                if _WN % N != 0:
-                    raise RuntimeError(
-                        f"station_local decoder needs every station present: "
-                        f"encoder returned {_WN} tokens which is not divisible "
-                        f"by N={N}. Train and evaluate with --mask_ratio 0.")
-                _W = _WN // N
-                kv_local = (encoded_vis
-                            .view(B, _W, N, self.d_model)   # (B, W, N, d)
-                            .permute(0, 2, 1, 3)            # (B, N, W, d)
-                            .reshape(B * N, _W, self.d_model))
-                h = queries_NK.reshape(B * N, K, self.d_model)
-                for block in self.blocks:
-                    if self.use_checkpoint and torch.is_grad_enabled():
-                        h = _cp_checkpoint(block, h, kv_local, use_reentrant=False)
-                    else:
-                        h = block(h, kv_local)
-                # Back to (B, N*K, d) — station-major, lead fastest, exactly the
-                # layout the head and its reshape below already expect.
-                h = h.reshape(B, N * K, self.d_model)
-
-            elif self.use_cross_attention:
-                h = queries_seq
-                for block in self.blocks:
-                    if self.use_checkpoint and torch.is_grad_enabled():
-                        h = _cp_checkpoint(block, h, encoded_vis, use_reentrant=False)
-                    else:
-                        h = block(h, encoded_vis)
-            else:
-                full_seq = torch.cat([encoded_vis, queries_seq], dim=1)
-                h = full_seq
-                for block in self.blocks:
-                    if self.use_checkpoint and torch.is_grad_enabled():
-                        h = _cp_checkpoint(block, h, use_reentrant=False)
-                    else:
-                        h = block(h)
-                h = h[:, -N * K:, :]                               # (B, N*K, d_model)
-
-            h = self.norm(h)                                       # (B, N*K, d_model)
-
-            mean = self.head(h)                                    # (B, N*K, num_target_vars)
-            mean = mean.reshape(B, N, K, self.num_target_vars)
-            mean = mean.permute(0, 2, 1, 3).contiguous()          # (B, K, N, num_target_vars)
-            if self.predict_uncertainty:
-                log_var = self.log_var_head(h)                     # (B, N*K, num_target_vars)
-                log_var = log_var.reshape(B, N, K, self.num_target_vars)
-                log_var = log_var.permute(0, 2, 1, 3).contiguous()  # (B, K, N, num_target_vars)
-                return mean, log_var
-            return mean
-
-    def forward_with_attn(
-        self,
-        encoded_vis:   torch.Tensor,   # (B, W*N_vis, d_model)
-        spatial:       torch.Tensor,   # (N, 15) or (B, N, 15)
-        y_hours:       torch.Tensor,   # (B,) — single-delta only
-        delta_steps:   torch.Tensor,   # (B,) — single-delta only
-        station_masked: "torch.Tensor | None" = None,
-    ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """
-        Diagnostic-only twin of forward(), single-delta path only, that also
-        returns the decoder's cross-attention weights — i.e. for every query
-        station (masked or visible), how much of its prediction's attention
-        mass went to each (timestep, visible-station) encoder token. This is
-        the only place a masked station's prediction "sees" its neighbours,
-        since masked stations contribute no token to the encoder at all.
-
-        Only supports use_cross_attention=True, station_local=False — the
-        configuration every surviving checkpoint with cross_attn_decoder=True
-        (v27, v30-nll, v31) uses. station_local decoders (v32-blind) have no
-        cross-station attention by construction — nothing to extract, which
-        is the point of that ablation. The plain concatenated-self-attention
-        decoder (use_cross_attention=False) is not instrumented; no surviving
-        checkpoint uses it.
-
-        Raises:
-            NotImplementedError if y_hours/delta_steps are multi-delta (B,K),
-            or if this decoder is not a plain cross-attention decoder.
-
-        Returns:
-            preds: (B, N, num_target_vars) — identical to forward()'s mean
-                   output (log_var, if any, is discarded here; this method is
-                   for attention inspection, not calibrated-uncertainty use)
-            attn_per_layer: (num_layers, B, N, W*N_vis) cross-attention
-                   weights, one slice per decoder block, averaged over heads.
-                   attn_per_layer[l, b, n] sums to 1 over the W*N_vis context
-                   tokens; reshape the last axis to (W, N_vis) and sum over W
-                   to get "contribution per visible station."
-        """
-        if y_hours.dim() != 1 or delta_steps.dim() != 1:
-            raise NotImplementedError(
-                "forward_with_attn only supports the single-delta calling "
-                "convention (y_hours, delta_steps both (B,)). Call once per "
-                "lead-time of interest rather than passing the full K-grid."
-            )
-        if not (self.use_cross_attention and not self.station_local):
-            raise NotImplementedError(
-                "forward_with_attn only supports use_cross_attention=True, "
-                "station_local=False (v27 / v30-nll / v31's decoder). "
-                "station_local decoders have no cross-station attention to "
-                "extract; the plain self-attention decoder is not instrumented."
-            )
-
-        B = encoded_vis.size(0)
-        if spatial.dim() == 2:
-            N         = spatial.size(0)
-            spatial_b = spatial.unsqueeze(0).expand(B, -1, -1)
-        else:
-            N         = spatial.size(1)
-            spatial_b = spatial
-
+        # Station part of the query, shared over lead times: (B, N, d)
         spatial_q = self.mask_token.expand(B, N, -1).contiguous()
         spatial_q = spatial_q + self.pos_emb(spatial_b[..., :2])
         spatial_q = spatial_q + self.station_emb(spatial_b[..., 2:])
@@ -760,22 +196,36 @@ class StationMAEDecoder(nn.Module):
         else:
             spatial_q = spatial_q + self.station_state[station_masked.long()]
 
-        temp_emb = self.temporal_emb(y_hours)
-        delt_emb = self.delta_emb(delta_steps)
-        step_idx = (self.window_size - 1) + delta_steps
-        step_emb = self.step_emb(step_idx)
+        # Time part, shared over stations: (B, K, d)
+        time_q = (self.temporal_emb(y_hours)
+                  + self.delta_emb(delta_steps)
+                  + self.step_emb((self.window_size - 1) + delta_steps))
 
-        queries = spatial_q + temp_emb.unsqueeze(1) + delt_emb.unsqueeze(1) \
-                + step_emb.unsqueeze(1)
-        queries = self.query_norm(queries)                       # (B, N, d_model)
+        queries = spatial_q.unsqueeze(2) + time_q.unsqueeze(1)      # (B, N, K, d)
+        queries = self.query_norm(queries)
 
-        h = queries
-        attn_per_layer = []
-        for block in self.blocks:
-            h, attn = block.forward_with_attn(h, encoded_vis)    # attn: (B, N, W*N_vis)
-            attn_per_layer.append(attn)
-        attn_per_layer = torch.stack(attn_per_layer, dim=0)      # (L, B, N, W*N_vis)
+        if self.station_local:
+            # Each station attends only to its own T encoder tokens.
+            L = encoded_vis.shape[1]
+            if L % N != 0:
+                raise RuntimeError(
+                    f"station_local decoder needs every station present: encoder "
+                    f"returned {L} tokens, not divisible by N={N}. Use mask_ratio=0.")
+            T = L // N
+            kv = encoded_vis.view(B, T, N, self.d_model).permute(0, 2, 1, 3) \
+                            .reshape(B * N, T, self.d_model)
+            h = self._run_blocks(queries.reshape(B * N, K, self.d_model), kv)
+            h = h.reshape(B, N * K, self.d_model)
+        else:
+            h = self._run_blocks(queries.reshape(B, N * K, self.d_model), encoded_vis)
 
         h = self.norm(h)
-        mean = self.head(h)                                      # (B, N, num_target_vars)
-        return mean, attn_per_layer
+
+        def _out(lin):
+            o = lin(h).reshape(B, N, K, self.num_target_vars).permute(0, 2, 1, 3).contiguous()
+            return o if is_multi else o[:, 0]
+
+        mean = _out(self.head)
+        if self.predict_uncertainty:
+            return mean, _out(self.log_var_head)
+        return mean

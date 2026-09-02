@@ -26,7 +26,7 @@ wandb/
 analysis_outputs/
 
 # Private working material (report sources, drafts, archived code)
-/report/
+/archive/report/
 /docs/
 /archive/
 /Capstone_Project_ADJ/
