@@ -33,15 +33,6 @@ analysis_outputs/
 /meetings/
 
 # Notebooks that are not part of the release
-notebooks/*.ipynb
-!notebooks/Train_Test_Exploration.ipynb
-!notebooks/Station_MAE_Map.ipynb
-!notebooks/Test_Results_Exploration.ipynb
-!notebooks/Model_Architecture.ipynb
-notebooks/analysis/*
-!notebooks/analysis/common.py
-!notebooks/analysis/4[1-9]_*.ipynb
-!notebooks/analysis/50_results_summary.ipynb
 
 # Superseded notebooks and scratch files
 notebooks/archive/
