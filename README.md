@@ -19,29 +19,6 @@ coordinates and 13 topographic descriptors rather than by an identity table;
 a decoder conditioned on the lead time produces all lead times in one pass;
 the output is added to the station's last observation (persistence residual).
 
-## Repository layout
-
-```
-src/
-  main.py                 train the Transformer (all variants)
-  test.py                 write test-set predictions of a Transformer checkpoint
-  train_lstm.py           train the per-station LSTM baseline
-  test_lstm.py            write test-set predictions of the LSTM
-  download.py             fetch PeakWeather
-  inspect_checkpoints.py  print the configuration stored in a checkpoint
-  data/dataset.py         PeakWeather loading, normalisation, windowing, station exclusion
-  model/embeddings.py     value, position, topography, time, step and lead-time embeddings
-  model/encoder.py        station masking, temporal patching, factorised attention blocks
-  model/decoder.py        lead-time-conditioned cross-attention decoder
-  model/mae.py            full model, residual head, Huber / Gaussian-NLL loss
-  model/lightning_module.py
-  model/lstm_baseline.py
-  engine/evaluate.py      prediction collector used by test.py
-scripts/                  the exact configurations of the reported runs
-notebooks/analysis/       figures and tables of the report (41-50) + common.py
-notebooks/                data exploration, model summary, result maps
-```
-
 ## Getting started
 
 Tested with Python 3.10, PyTorch 2.x and PyTorch Lightning 2.x on a single GPU.
