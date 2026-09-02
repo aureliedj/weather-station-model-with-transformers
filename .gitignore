@@ -1,32 +1,48 @@
-# ── OS / editor ──────────────────────────────────────────────────────────────
+# OS / editors
 .DS_Store
 .idea/
 .vscode/
 
-# ── Python ───────────────────────────────────────────────────────────────────
+# Python
 __pycache__/
 *.py[cod]
 .ipynb_checkpoints/
 .venv/
 venv/
+.ruff_cache/
+.pytest_cache/
 
-# ── Data, artefacts and logs (large, regenerable, machine-specific) ──────────
+# Data, checkpoints, predictions and logs (large; regenerate with the scripts)
 PeakWeatherDataset/
 checkpoints/
-checkpoints_mini/
 test_results/
 wandb/
-archive/_junk/
 *.ckpt
-*.log
-
-# ── Bulk artefacts now at the repo root ──────────────────────────────────────
-analysis_outputs/cache/
 *.pt
-/meetings/
-/docs/
-/Capstone_Project_ADJ/
-/archive/
-/analysis_outputs/
-/report/
+*.log
+*.whl
 
+# Notebook outputs
+analysis_outputs/
+
+# Private working material (report sources, drafts, archived code)
+/report/
+/docs/
+/archive/
+/Capstone_Project_ADJ/
+/meetings/
+
+# Notebooks that are not part of the release
+notebooks/*.ipynb
+!notebooks/Train_Test_Exploration.ipynb
+!notebooks/Station_MAE_Map.ipynb
+!notebooks/Test_Results_Exploration.ipynb
+!notebooks/Model_Architecture.ipynb
+notebooks/analysis/*
+!notebooks/analysis/common.py
+!notebooks/analysis/4[1-9]_*.ipynb
+!notebooks/analysis/50_results_summary.ipynb
+
+# Superseded notebooks and scratch files
+notebooks/archive/
+notebooks/station_order.json
